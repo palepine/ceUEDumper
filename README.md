@@ -1,6 +1,6 @@
 # Unreal Engine Dumper
 
-A standalone, portable Unreal Engine reflection dumper for Cheat Engine with Lua API inspired by GDDumper.
+A standalone, portable Unreal Engine reflection dumper for Cheat Engine with Lua API inspired by [GDDumper](https://github.com/palepine/GDDumper/tree/main).
 
 
 ## Functionality
