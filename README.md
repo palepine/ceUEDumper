@@ -27,7 +27,7 @@ Copy and merge the `autorun` folder into the root Cheat Engine directory.
 An embedded copy can be loaded using this Lua script (lua script table or via a memrec AutoAssemble script)
 ```lua
 local function loadScriptFromTable(fileName)
-  if isNullOrNil(fileName) then error('Filename invalid') end
+  if not fileName then error('Filename invalid') end
   local tableFile = findTableFile( fileName )
   if tableFile == nil then error('No script file found') end
   local fileStream = tableFile.getData()
