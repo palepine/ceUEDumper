@@ -302,57 +302,17 @@ function Dumper.Offsets.registerProperties(properties, objectName, propertyNames
   return result
 end
 
--- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// STRUCT OFFSET REGISTRATION
-
---- Register offsets including dotted embedded-struct paths
--- @param typeNameOrAddress string|number @ reflected class or script struct
--- @param propertyNames table|nil @ selected paths, nil for all fields
--- @param namespace string|nil @ symbol namespace
--- @return table|nil @ registered offsets
--- @return string|nil @ error
-function Dumper.Offsets.ue_registerStructOffsets(typeNameOrAddress, propertyNames, namespace)
-
-  local properties, err = Dumper.Structures.ue_enumFlattenedProperties(typeNameOrAddress)
-  if not properties then return nil, err end
-
-  local typeAddress = Dumper.Helpers.resolveType(typeNameOrAddress)
-
-  local typeName = Backend.objectName(typeAddress) or ('Struct_%X'):format(typeAddress) -- not wanted though
-
-  return Dumper.Offsets.registerProperties( properties, typeName, propertyNames, namespace or '' )
-end
-
---- Register cumulative inline-struct offsets relative to UObject
--- @param objectAddress number @ containing UObject instance
--- @param propertyNames table|nil @ readable dotted paths, nil for all
--- @param symbolPrefix string|nil @ exact symbol prefix; defaults to runtime class name
--- @return table|nil @ registered symbol offsets (not addresses)
--- @return string|nil @ metadata/alias error
-function Dumper.Offsets.ue_registerObjectStructOffsets(objectAddress, propertyNames, symbolPrefix)
-
-  local typeAddress = Backend.objectClass(objectAddress)
-  if not typeAddress or typeAddress == 0 then return nil, 'Runtime UObject class unavailable' end
-
-  local properties, err = Dumper.Structures.ue_enumFlattenedProperties(typeAddress)
-  if not properties then return nil, err end
-
-  local prefix = symbolPrefix or Backend.objectName(typeAddress) or ('Class_%X'):format(typeAddress)
-  assert( type(prefix) == 'string' and prefix ~= '', 'symbol prefix must be non-empty' )
-
-  return Dumper.Offsets.registerProperties( properties, prefix, propertyNames, '' )
-end
-
---- Resolve one reflected class property offset
--- @param classNameOrAddress string|number @ reflected name or UClass address
--- @param propertyName string @ reflected property name
+--- Resolve one direct or embedded-struct property offset
+-- @param typeNameOrAddress string|number @ reflected class/struct name or descriptor address
+-- @param propertyName string @ reflected property name or dotted inline-struct path
 -- @return number|nil @ offset to the property
 -- @return string|nil @ error
-function Dumper.Offsets.ue_getPropertyOffset(classNameOrAddress, propertyName)
+function Dumper.Offsets.ue_getPropertyOffset(typeNameOrAddress, propertyName)
   assert( type(propertyName) == 'string' and propertyName ~= '' ,  'property name must be a non-empty string' )
   local enumProperties = Dumper.Reflection.ue_enumProperties
   local resolveProperty = Dumper.Helpers.resolveProperty
 
-  local typeAddress = Dumper.Helpers.resolveType(classNameOrAddress)
+  local typeAddress = Dumper.Helpers.resolveType(typeNameOrAddress)
   if not typeAddress then return nil, 'Unreal type not found' end
 
   local segments = {}
@@ -390,9 +350,9 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// OBJECT OFFSET AND PATH QUERIES
 
---- Resolve a property offset using UObject addr
+--- Resolve a direct or embedded-struct property offset using a UObject addr
 -- @param objectAddress number @ UObject instance addr
--- @param propertyName string @ reflected property name
+-- @param propertyName string @ reflected property name or dotted inline-struct path
 -- @return number|nil @ field offset
 -- @return string|nil error
 function Dumper.Offsets.ue_getObjectPropertyOffset(objectAddress, propertyName)
@@ -509,34 +469,69 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// OFFSET SYMBOL REGISTRY
 
---- Register selected offsets as CE symbol by a class name
--- @param className string @ reflected class name
--- @param propertyNames string[]|nil @ selected names, nil for every field
+--- Selectively get property offsets.
+-- @param typeAddress number @ UClass or UScriptStruct descriptor address
+-- @param propertyNames string[]|nil @ selected names/paths, nil for every field
+-- @return table<string, table>|nil @ registration-ready property metadata
+-- @return string|nil @ error
+function Dumper.Offsets.collectRegistrationProperties(typeAddress, propertyNames)
+  assert( propertyNames == nil or type(propertyNames) == 'table', 'property names must be an array or nil' )
+
+  if propertyNames == nil then
+    return Dumper.Structures.ue_enumFlattenedProperties( typeAddress, true )
+  end
+
+  local properties = {}
+
+  for _, propertyName in ipairs(propertyNames) do
+    local offset, offsetError = Dumper.Offsets.ue_getPropertyOffset( typeAddress, propertyName )
+    if offset == nil then return nil, offsetError end
+
+    properties[propertyName] =
+    {
+      offset = offset,
+      rawPath = propertyName,
+      displayPath = propertyName,
+    }
+  end
+
+  return properties
+end
+
+--- Register selected direct or embedded-struct offsets for a reflected type
+-- Dotted embedded-struct paths are registered as added offsets
+-- @param typeNameOrAddress string|number @ reflected class/struct name or descriptor address
+-- @param propertyNames string[]|nil @ selected names/paths, nil for every field
 -- @param namespace string|nil @ optional symbol namespace
 -- @return table<string, number>|nil @ registered symbol-to-offset map
 -- @return string|nil @ error
-function Dumper.Offsets.ue_registerClassOffsets(className, propertyNames, namespace)
-  assert( type(className) == 'string' and className ~= '' , 'class name must be a non-empty string' )
+function Dumper.Offsets.ue_registerClassOffsets(typeNameOrAddress, propertyNames, namespace)
+  local typeAddress = Dumper.Helpers.resolveType(typeNameOrAddress)
+  if not typeAddress then return nil, 'Unreal class or script struct not found' end
 
-  local properties, errorMessage = Dumper.Reflection.ue_enumProperties(className)
+  local properties, errorMessage = Dumper.Offsets.collectRegistrationProperties( typeAddress, propertyNames )
   if not properties then return nil, errorMessage end
 
-  return Dumper.Offsets.registerProperties( properties, className, propertyNames, namespace or '')
+  local typeName = Backend.objectName(typeAddress) or ('Type_%X'):format(typeAddress)
+
+  return Dumper.Offsets.registerProperties( properties, typeName, propertyNames, namespace or '' )
 end
 
---- Register selected offsets as CE symbol using a UObject addr
+--- Register selected direct or embedded-struct offsets using a UObject instance
 -- @param objectAddress number @ UObject instance addr
--- @param propertyNames string[]|nil @ selected names, nil for every field
+-- @param propertyNames string[]|nil @ selected names/paths, nil for every field
 -- @param namespace string|nil @ optional namespace
+-- @param symbolPrefix string|nil @ optional type-name (class name) replacement in generated symbols
 -- @return table<string, number>|nil @ registered symbol-to-offset map
 -- @return string|nil @ error
-function Dumper.Offsets.ue_registerObjectOffsets(objectAddress, propertyNames, namespace)
+function Dumper.Offsets.ue_registerObjectOffsets(objectAddress, propertyNames, namespace, symbolPrefix)
   local classAddress = Backend.objectClass(objectAddress)
-  if not classAddress then return nil, 'Runtime UObject class wasnt found' end
+  if not classAddress or classAddress == 0 then return nil, 'Runtime UObject class unavailable' end
 
-  local className = Backend.objectName(classAddress) or ('Class_%X'):format(classAddress) -- a fallback for class name, unwanted
+  local className = symbolPrefix or Backend.objectName(classAddress) or ('Class_%X'):format(classAddress)
+  assert( type(className) == 'string' and className ~= '', 'symbol prefix must be non-empty' )
 
-  local properties, errorMessage = Dumper.Reflection.ue_enumProperties(classAddress)
+  local properties, errorMessage = Dumper.Offsets.collectRegistrationProperties( classAddress, propertyNames )
   if not properties then return nil, errorMessage end
 
   return Dumper.Offsets.registerProperties( properties, className, propertyNames, namespace or '' )
@@ -687,11 +682,12 @@ function Dumper.Reflection.ue_findClass(className)
   return Dumper.Helpers.resolveType( className, 'Class' )
 end
 
---- Enumerate reflected properties of a class (inherited fields included)
--- @param classNameOrAddress string|number @ reflected name or UClass address
+--- Enumerate reflected properties of a class or script struct
+-- Inherited fields are included when the supplied type has a superclass
+-- @param typeNameOrAddress string|number @ reflected name or type descriptor address
 -- @return table<string, table>|nil @ property metadata keyed by name
 -- @return string|nil @ error
-function Dumper.Reflection.ue_enumProperties(classNameOrAddress)
+function Dumper.Reflection.ue_enumProperties(typeNameOrAddress)
 
   -- are we good?
   local status = Backend.status()
@@ -699,7 +695,7 @@ function Dumper.Reflection.ue_enumProperties(classNameOrAddress)
     return nil, 'Unreal reflection unavailable; FName issue'
   end
 
-  local address = Dumper.Helpers.resolveType(classNameOrAddress)
+  local address = Dumper.Helpers.resolveType(typeNameOrAddress)
 
   if not address then return nil, 'Unreal class or script struct not found' end
 
@@ -1244,7 +1240,7 @@ function Dumper.Structures.ue_createStructureFromType(typeNameOrAddress, baseAdd
 end
 
 --- Build structure using the instance's actual runtime class
--- @param objectAddress number @ live UObject pointer
+-- @param objectAddress number @ UObject instance
 -- @return userdata|nil @ CE structure
 -- @return string|nil @ error
 function Dumper.Structures.ue_createStructureFromObject(objectAddress)
@@ -1962,8 +1958,6 @@ Dumper.API =
   ue_findClass = Dumper.Reflection.ue_findClass,
   ue_findStruct = Dumper.Reflection.ue_findStruct,
   ue_enumFlattenedProperties = Dumper.Structures.ue_enumFlattenedProperties,
-  ue_registerStructOffsets = Dumper.Offsets.ue_registerStructOffsets,
-  ue_registerObjectStructOffsets = Dumper.Offsets.ue_registerObjectStructOffsets,
   ue_createStructureFromType = Dumper.Structures.ue_createStructureFromType,
   ue_createStructureFromObject = Dumper.Structures.ue_createStructureFromObject,
   ue_enumProperties = Dumper.Reflection.ue_enumProperties,
