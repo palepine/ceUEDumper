@@ -73,6 +73,7 @@ local Core =
 }
 
 local debugUEInfoScanner = false
+local PTR_SIZE = 0x8
 
 Core.State.lastScannerError = nil
 Core.State.scannerRunning = false
@@ -1355,12 +1356,16 @@ end
 
 --- Test whether an engine member points to a GameInstance-derived object
 -- @param objectOffset number @ candidate offset within UGameEngine
+-- @param ownerObjectAddress number|nil @ containing UObject; defaults to UGameEngine
 -- @return boolean @ true when the object's ancestry includes GameInstance
-function Core.PropertyLayout.isGameInstanceObjectOffset(objectOffset)
+function Core.PropertyLayout.isGameInstanceObjectOffset(objectOffset, ownerObjectAddress)
   if objectOffset <= 8 or objectOffset >= 0x9000 then return false end
   if (objectOffset & 7) ~= 0 then return false end
 
-  local objectAddress = readPointer( CUEDEFS.UGameEngine + objectOffset )
+  ownerObjectAddress = ownerObjectAddress or CUEDEFS.UGameEngine -- UWorld is fine too
+  if not ownerObjectAddress or ownerObjectAddress == 0 then return false end
+
+  local objectAddress = readPointer( ownerObjectAddress + objectOffset )
   if not Core.Reflection.UObject_getName(objectAddress) then return false end
 
   --at least it has a name, check if it inherits from GameInstance
@@ -1453,12 +1458,13 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--/// PROPERTY MEMBER RESOLUTION
 
---- Inspect the GameInstance property for names, offsets, and pointer members
+--- Inspect GameInstance property for names, offsets, pointer members
 -- @param gameInstancePropertyAddress number @ GameInstance property address
 -- @param nameIndex number @ GameInstance FName index
+-- @param ownerObjectAddress number|nil @ object containing the GameInstance pointer
 -- @return number[]|nil @ candidate property-list link offsets
 -- @return string|nil @ error
-function Core.PropertyLayout.inspectGameInstanceProperty(gameInstancePropertyAddress, nameIndex)
+function Core.PropertyLayout.inspectGameInstanceProperty(gameInstancePropertyAddress, nameIndex, ownerObjectAddress)
   local isVTable = Core.Memory.isVTable
   local isGameInstanceObjectOffset = Core.PropertyLayout.isGameInstanceObjectOffset
   local findPropertyClassMember = Core.PropertyLayout.findPropertyClassMember
@@ -1480,7 +1486,7 @@ function Core.PropertyLayout.inspectGameInstanceProperty(gameInstancePropertyAdd
       FPropertyLayout.Name = memberOffset
     end
 
-    if FPropertyLayout.Offset == nil and isGameInstanceObjectOffset(memberLowDword) then
+    if FPropertyLayout.Offset == nil and isGameInstanceObjectOffset( memberLowDword, ownerObjectAddress ) then
       FPropertyLayout.Offset = memberOffset
     end
 
@@ -1852,6 +1858,97 @@ function Core.PropertyLayout.findPropertyMetadata()
   return true
 end
 
+--- Find owner-member offset of a reflected property descriptor
+-- Modern FFieldVariant owners may use low bits as tags
+-- remove them before comparing stored owner with the expected UClass
+-- @param propertyAddress number @ FProperty/UProperty descriptor address
+-- @param ownerClassAddress number|number[] @ accepted owning UClass address(es)
+-- @return number|nil @ owner-member byte offset
+function Core.PropertyLayout.findPropertyOwnerOffset(propertyAddress, ownerClassAddress)
+  local acceptedOwnerAddresses = {}
+
+  if type(ownerClassAddress) == 'table' then
+    for _, classAddress in ipairs(ownerClassAddress) do acceptedOwnerAddresses[classAddress] = true end
+  else
+    acceptedOwnerAddresses[ownerClassAddress] = true
+  end
+
+  for ownerOffset = 8, 0x100, 8 do
+    local ownerValue = readPointer( propertyAddress + ownerOffset )
+    local untaggedOwnerAddress = ownerValue and (ownerValue & 0xFFFFFFFFFFFFFFF8)
+
+    if acceptedOwnerAddresses[untaggedOwnerAddress] then return ownerOffset end
+  end
+
+  return nil
+end
+
+--- UWorld::OwningGameInstance resolution
+-- @return number|nil @ OwningGameInstance property descriptor
+-- @return number|nil @ descriptor owner-member offset
+-- @return number|nil @ live UWorld instance
+-- @return string|nil @ diagnostic when no direct anchor is available
+function Core.PropertyLayout.findWorldGameInstanceProperty()
+  if not CUEDEFS.GWorld or CUEDEFS.GWorld == 0 then return nil, nil, nil, 'GWorld is unavailable' end
+
+  local worldObjectAddress = readPointer(CUEDEFS.GWorld)
+  if not worldObjectAddress or worldObjectAddress == 0 then return nil, nil, nil, 'GWorld instance is null' end
+
+  local worldClassAddress = readPointer( worldObjectAddress + CUEDEFS.UObject.Class )
+  if not worldClassAddress or worldClassAddress == 0 then return nil, nil, nil, 'UWorld class is unreadable' end
+
+  local classHierarchy = Core.Reflection.selectProbeClassHierarchy(worldClassAddress)
+  local probePropertyLayout = Core.Reflection.probePropertyLayout
+  local findOwnerOffset = Core.PropertyLayout.findPropertyOwnerOffset
+
+  for _, candidateLayout in ipairs(PROPERTY_LAYOUTS) do
+    local probe = probePropertyLayout( classHierarchy, candidateLayout )
+    local property = probe.propertiesByName.OwningGameInstance
+    local ownerOffset
+
+    if property then
+      local isObjectProperty = property.propertyType == 'ObjectProperty' or property.propertyType == 'ObjectPtrProperty'
+
+      if isObjectProperty then
+        ownerOffset = findOwnerOffset( property.propertyAddress, classHierarchy )
+      end
+    end
+
+    if ownerOffset then
+      Core.Runtime.log( ('Property layout: UWorld.OwningGameInstance selected through %s'):format(candidateLayout.label) )
+
+      return property.propertyAddress, ownerOffset, worldObjectAddress
+    end
+  end
+
+  return nil, nil, nil, 'No UWorld.OwningGameInstance descriptor with a matching class owner was found'
+end
+
+--- Complete reflection-layout discovery from one known GameInstance property
+-- @param propertyAddress number @ GameInstance/OwningGameInstance descriptor
+-- @param propertyNameIndex number @ exact descriptor FName comparison index
+-- @param ownerOffset number @ descriptor owner-member offset
+-- @param ownerObjectAddress number @ live object containing the property value
+-- @return boolean|nil @ true when the complete property layout is ready
+-- @return string|nil @ error
+function Core.PropertyLayout.resolveFromGameInstanceProperty(propertyAddress, propertyNameIndex, ownerOffset, ownerObjectAddress)
+  CUEDEFS.FProperty = { Owner = ownerOffset }
+  CUEDEFS.FFieldClass = nil
+
+  local candidateLinks, inspectionError = Core.PropertyLayout.inspectGameInstanceProperty( propertyAddress, propertyNameIndex, ownerObjectAddress )
+
+  if not candidateLinks then return nil, inspectionError end
+  if not Core.PropertyLayout.hasRequiredPropertyLayout() then return nil, 'Not all needed fields were found' end
+
+  local listsReady, listError = Core.PropertyLayout.findPropertyLists( propertyAddress, candidateLinks )
+  if not listsReady then return nil, listError end
+
+  local metadataReady, metadataError = Core.PropertyLayout.findPropertyMetadata()
+  if not metadataReady then return nil, metadataError end
+
+  return true
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--/// RESOLUTION ENTRY POINT
 
 --- Find the FField/FProperty layout using the GameInstance property
@@ -1864,7 +1961,32 @@ function Core.PropertyLayout.findGameInstanceFPropertyAndFields(cancellationThre
   if not CUEDEFS.UGameEngine then return nil, 'Find UGameEngine and GameEngineClass first' end
   if not CUEDEFS.GameEngineClass then return nil, 'Find the GameEngineClass first' end
 
-  local gameInstanceNameIndex = CUEDEFS.NameToIndex['GameInstance']
+  local owningGameInstanceNameIndex = CUEDEFS.NameToIndex.OwningGameInstance
+
+  if owningGameInstanceNameIndex then
+    local worldPropertyAddress, worldOwnerOffset, worldObjectAddress, worldAnchorError =
+      Core.PropertyLayout.findWorldGameInstanceProperty()
+
+    if worldPropertyAddress then
+      local ready, layoutError = Core.PropertyLayout.resolveFromGameInstanceProperty(
+        worldPropertyAddress,
+        owningGameInstanceNameIndex,
+        worldOwnerOffset,
+        worldObjectAddress
+      )
+
+      if ready then return true, 'success through UWorld.OwningGameInstance' end
+
+      Core.Runtime.log(
+        'Property layout: UWorld.OwningGameInstance anchor was incomplete; using GameInstance scan fallback: '
+        .. tostring(layoutError)
+      )
+    elseif worldAnchorError then
+      Core.Runtime.log('Property layout: direct UWorld anchor unavailable: ' .. worldAnchorError)
+    end
+  end
+
+  local gameInstanceNameIndex = CUEDEFS.NameToIndex.GameInstance
 
   if gameInstanceNameIndex == nil then
     Core.Runtime.log('GameInstance name is unavailable; trying the modern structural field layout')
@@ -1878,26 +2000,12 @@ function Core.PropertyLayout.findGameInstanceFPropertyAndFields(cancellationThre
 
   if not gameInstancePropertyAddress then return nil, 'Failed finding GameInstanceFProperty' end
 
-  CUEDEFS.FProperty = { Owner = propertyOwnerOffset }
-
-  local candidateLinks, inspectionError = Core.PropertyLayout.inspectGameInstanceProperty( gameInstancePropertyAddress, gameInstanceNameIndex )
-
-  if not candidateLinks then return nil, inspectionError end
-
-  if not Core.PropertyLayout.hasRequiredPropertyLayout() then return nil, 'Not all needed fields were found' end
-  
-  --now process the potentialPropertyLists. We have enough FProperty field info to determine if it's validish or not
-  -- Some of them are meh, and some of them contain everything including super class properties
-  local listsReady, listError = Core.PropertyLayout.findPropertyLists( gameInstancePropertyAddress, candidateLinks )
-
-  if not listsReady then return nil, listError end
-
-  --find some property specific info (Property size field, and for BoolProperty the bitfields (01 00 bitmask bitmask for properties that have the same offset)
-  local metadataReady, metadataError = Core.PropertyLayout.findPropertyMetadata()
-  if not metadataReady then return nil, metadataError end
-
-  --Obtained everything needed
-  return true, 'success'
+  return Core.PropertyLayout.resolveFromGameInstanceProperty(
+    gameInstancePropertyAddress,
+    gameInstanceNameIndex,
+    propertyOwnerOffset,
+    CUEDEFS.UGameEngine
+  )
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CORE.MEMORY
@@ -2638,17 +2746,35 @@ function Core.Objects.collectUObjectSamples(firstItemAddress, objectItemSize)
   return objectAddresses
 end
 
---- Select name offset with the most matching samples
--- Equal counts retain the earlier candidate
+--- Select UObject::NamePrivate using UClass metaclass as anchor
 -- @param objectAddresses number[] @ sampled UObject addresses
+-- @param classOffset number @ selected UObject::ClassPrivate offset
 -- @param minimumMatches number @ required match count
 -- @return number|nil @ selected FName offset
-function Core.Objects.selectUObjectNameOffset(objectAddresses, minimumMatches)
+function Core.Objects.selectUObjectNameOffset(objectAddresses, classOffset, minimumMatches)
   local writeLog = Core.Runtime.log
-  local selectedOffset
-  local highestMatchCount = 0
+  local fallbackOffset
+  local highestFallbackMatchCount = 0
+  local anchoredOffset
+  local highestAnchoredMatchCount = 0
+
+  local firstObjectAddress = objectAddresses[1]
+  local firstClassAddress = firstObjectAddress and readPointer( firstObjectAddress + classOffset )
+
+  if firstClassAddress then firstClassAddress = firstClassAddress & 0xFFFFFFFFFFFFFFF8 end
+
+  local metaClassAddress = firstClassAddress and readPointer( firstClassAddress + classOffset )
+
+  if metaClassAddress then metaClassAddress = metaClassAddress & 0xFFFFFFFFFFFFFFF8 end
 
   for candidateOffset = 0x8, 0x40, 4 do
+
+    local overlapsClassPointer = candidateOffset < classOffset + PTR_SIZE and candidateOffset + 8 > classOffset
+
+    if overlapsClassPointer then
+      writeLog( ('Core.Objects.FindObjectArray: UObject name offset 0x%X rejected; overlaps ClassPrivate at 0x%X'):format( candidateOffset, classOffset ) )
+      goto continue
+    end
 
     -- count name matches
     local matchCount = 0
@@ -2661,26 +2787,40 @@ function Core.Objects.selectUObjectNameOffset(objectAddresses, minimumMatches)
 
     writeLog( ('Core.Objects.FindObjectArray: UObject name offset 0x%X scored %d/%d'):format( candidateOffset, matchCount, #objectAddresses ) )
 
-    if matchCount > highestMatchCount then
-      selectedOffset = candidateOffset
-      highestMatchCount = matchCount
+    if matchCount > highestFallbackMatchCount then
+      fallbackOffset = candidateOffset
+      highestFallbackMatchCount = matchCount
     end
 
+    local metaClassNameIndex = metaClassAddress and readInteger( metaClassAddress + candidateOffset )
+    local metaClassName = metaClassNameIndex and CUEDEFS.IndexToName[ metaClassNameIndex ]
+
+    if metaClassName == 'Class' and matchCount >= minimumMatches and matchCount > highestAnchoredMatchCount then
+      anchoredOffset = candidateOffset
+      highestAnchoredMatchCount = matchCount
+    end
+
+    ::continue::
   end
 
-  if highestMatchCount < minimumMatches then return nil end
+  if anchoredOffset then
+    writeLog( ('Core.Objects.FindObjectArray: UObject name offset 0x%X anchored by metaclass name Class'):format(anchoredOffset) )
+    return anchoredOffset
+  end
 
-  return selectedOffset
+  if highestFallbackMatchCount < minimumMatches then return nil end
+
+  writeLog('Core.Objects.FindObjectArray: metaclass name anchor unavailable; using aggregate name-match fallback')
+  return fallbackOffset
 end
 
---- Sum class-pointer confidence across sampled objects
--- One point for nonzero class pointer, one for resolved class name,
--- and 4 when metaclass's class pointer refers back to itself
+--- Sum structural class-pointer confidence across sampled objects
+-- 1 point for a readable UClass vtable,
+-- 4 points when the candidate reaches the self-referential UClass metaclass
 -- @param objectAddresses number[] @ sampled UObject addresses
 -- @param classOffset number @ candidate UObject::Class offset
--- @param nameOffset number @ selected UObject::Name offset
 -- @return number @ total confidence score
-function Core.Objects.scoreUObjectClassOffset(objectAddresses, classOffset, nameOffset)
+function Core.Objects.scoreUObjectClassOffset(objectAddresses, classOffset)
   local totalConfidence = 0
 
   for _, objectAddress in ipairs(objectAddresses) do
@@ -2689,12 +2829,12 @@ function Core.Objects.scoreUObjectClassOffset(objectAddresses, classOffset, name
     if not classAddress or classAddress == 0 then goto continue end
 
     classAddress = classAddress & 0xFFFFFFFFFFFFFFF8
-    totalConfidence = totalConfidence + 1
 
-    local classNameIndex = readInteger( classAddress + nameOffset )
-    if classNameIndex and CUEDEFS.IndexToName[classNameIndex] then -- has name
-      totalConfidence = totalConfidence + 1
-    end
+    local classVTableAddress = readPointer(classAddress)
+    local firstClassFunctionAddress = classVTableAddress and readPointer(classVTableAddress)
+    if not firstClassFunctionAddress or readByte(firstClassFunctionAddress) == nil then goto continue end
+
+    totalConfidence = totalConfidence + 1
 
     local metaClassAddress = readPointer( classAddress + classOffset )
     if not metaClassAddress or metaClassAddress == 0 then goto continue end
@@ -2717,13 +2857,12 @@ function Core.Objects.scoreUObjectClassOffset(objectAddresses, classOffset, name
   return totalConfidence
 end
 
---- Select the highest-scoring class-pointer offset
+--- Select highest-scoring structurally valid class-pointer offset
 -- Equal scores retain the earlier candidate
 -- @param objectAddresses number[] @ sampled UObject addresses
--- @param nameOffset number @ selected FName offset
 -- @param minimumConfidence number @ required confidence score
 -- @return number|nil @ selected class-pointer offset
-function Core.Objects.selectUObjectClassOffset( objectAddresses, nameOffset, minimumConfidence )
+function Core.Objects.selectUObjectClassOffset(objectAddresses, minimumConfidence)
   local scoreClassOffset = Core.Objects.scoreUObjectClassOffset
   local writeLog = Core.Runtime.log
   local selectedOffset
@@ -2731,7 +2870,7 @@ function Core.Objects.selectUObjectClassOffset( objectAddresses, nameOffset, min
 
   for candidateOffset = 0x8, 0x40, 8 do
     
-    local confidence = scoreClassOffset( objectAddresses, candidateOffset, nameOffset )
+    local confidence = scoreClassOffset( objectAddresses, candidateOffset )
 
     writeLog( ('Core.Objects.FindObjectArray: UObject class offset 0x%X scored %d'):format( candidateOffset, confidence ) )
 
@@ -2758,13 +2897,13 @@ function Core.Objects.ue_inferUObjectOffsetsInternal(firstItemAddress, objectIte
 
   local acceptanceThreshold = math.min( 8, #objectAddresses )
 
-  local nameOffset = Core.Objects.selectUObjectNameOffset( objectAddresses, acceptanceThreshold )
-
-  if not nameOffset then return nil, nil end
-
-  local classOffset = Core.Objects.selectUObjectClassOffset( objectAddresses, nameOffset, acceptanceThreshold )
+  local classOffset = Core.Objects.selectUObjectClassOffset( objectAddresses, acceptanceThreshold )
 
   if not classOffset then return nil, nil end
+
+  local nameOffset = Core.Objects.selectUObjectNameOffset( objectAddresses, classOffset, acceptanceThreshold )
+
+  if not nameOffset then return nil, nil end
 
   Core.Runtime.log( ('Core.Objects.FindObjectArray: selected UObject Class=0x%X Name=0x%X'):format( classOffset, nameOffset ) )
 
