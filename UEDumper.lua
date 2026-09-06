@@ -294,13 +294,8 @@ function Dumper.Offsets.registerProperties(properties, objectName, propertyNames
 
   end
 
-  -- validate the complete selection before replacing any registered symbols
-  for name in pairs(result) do
-    if not Backend.canRegisterSymbol(name) then return nil, 'Symbol is already owned by another tool: ' .. name end
-  end
-
   for name, offset in pairs(result) do
-    Backend.registerOwnedSymbol(name, offset)
+    Backend.registerSymbol(name, offset)
     registeredSymbols[name] = true
   end
 
@@ -570,12 +565,8 @@ function Dumper.Offsets.ue_registerObjectPath(rootObject, propertyPath, namespac
     result[name] = step.offset
   end
 
-  for name in pairs(result) do
-    if not Backend.canRegisterSymbol(name) then return nil, 'Symbol is already owned by another tool: ' .. name end
-  end
-
   for name, offset in pairs(result) do
-    Backend.registerOwnedSymbol(name, offset)
+    Backend.registerSymbol(name, offset)
     registeredSymbols[name] = true
   end
 
@@ -584,7 +575,7 @@ end
 
 --- remove every CE registered symbol created by the script
 function Dumper.Offsets.ue_unregisterAllOffsets()
-  for name in pairs(registeredSymbols) do Backend.unregisterOwnedSymbol(name) end
+  for name in pairs(registeredSymbols) do Backend.unregisterSymbol(name) end
   Dumper.State.registeredSymbols = {}
   registeredSymbols = Dumper.State.registeredSymbols
 end
@@ -973,7 +964,7 @@ function Dumper.Structures.addScriptDelegateEntry(structure, entryName, entryOff
   functionNameElement.Offset = entryOffset + 8
   functionNameElement.Vartype = vtQword
 
-  if Backend.ownsCustomType('FName') then
+  if Backend.hasCustomType('FName') then
     functionNameElement.Vartype = vtCustom
     functionNameElement.CustomTypeName = 'FName'
   end
@@ -1048,7 +1039,7 @@ function Dumper.Structures.configurePropertyElement(element, property)
 
   if element.Vartype == vtByteArray then element.ByteSize = property.size or 1 end
 
-  if property.propertyType == 'NameProperty' and Backend.ownsCustomType('FName') then
+  if property.propertyType == 'NameProperty' and Backend.hasCustomType('FName') then
     element.Vartype = vtCustom
     element.CustomTypeName = 'FName'
   end
@@ -1284,7 +1275,7 @@ function Dumper.Structures.ue_createStructureFromObject(objectAddress)
     local element = structure.addElement()
     element.Name, element.Offset, element.Vartype = header[1], header[2], header[3]
 
-    if header[1] == 'Name' and Backend.ownsCustomType('FName') then
+    if header[1] == 'Name' and Backend.hasCustomType('FName') then
       element.Vartype = vtCustom
       element.CustomTypeName = 'FName'
     end
@@ -1352,7 +1343,7 @@ function Dumper.MetadataViews.getClassMetadataStructure()
         return Dumper.MetadataViews.getFieldMetadataStructure(address)
       end
 
-    elseif field[4] == 'name' and Backend.ownsCustomType('FName') then
+    elseif field[4] == 'name' and Backend.hasCustomType('FName') then
       element.Vartype = vtCustom
       element.CustomTypeName = 'FName'
 
@@ -1451,7 +1442,7 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
     element.Name, element.Offset, element.Vartype = field[1], field[2], field[3]
 
     if field[4] == 'class' then element.ChildStruct = Dumper.MetadataViews.getClassMetadataStructure()
-    elseif field[4] == 'name' and Backend.ownsCustomType('FName') then element.Vartype, element.CustomTypeName = vtCustom, 'FName'
+    elseif field[4] == 'name' and Backend.hasCustomType('FName') then element.Vartype, element.CustomTypeName = vtCustom, 'FName'
     elseif field[4] == 'property' then element.ChildStruct = Dumper.MetadataViews.getPropertyMetadataStructure()
     elseif field[4] == 'field' then element.OnCreateChild = function(_, address) return Dumper.MetadataViews.getFieldMetadataStructure(address) end
     end
@@ -1487,7 +1478,7 @@ function Dumper.MetadataViews.getFieldMetadataStructure(fieldAddress)
       local element = structure.addElement()
       element.Name, element.Offset, element.Vartype = field[1], field[2], field[3]
 
-      if field[1] == 'Name' and Backend.ownsCustomType('FName') then
+      if field[1] == 'Name' and Backend.hasCustomType('FName') then
 
         element.Vartype, element.CustomTypeName = vtCustom, 'FName'
       elseif field[1] == 'Next' then
@@ -1535,7 +1526,7 @@ function Dumper.MetadataViews.getPropertyMetadataStructure()
     if field[4] == 'property' then
       element.ChildStruct = structure
       
-    elseif field[4] == 'name' and Backend.ownsCustomType('FName') then
+    elseif field[4] == 'name' and Backend.hasCustomType('FName') then
       element.Vartype = vtCustom
       element.CustomTypeName = 'FName'
     end

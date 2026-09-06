@@ -82,8 +82,8 @@ local CUEDEFS -- UEDEFS
 
 local UObjectArray_Verifier_Type
 
-local ownedResources = ceUEDumperResources or { customTypes = {} }
-ownedResources.options = ownedResources.options or { showReflectionMetadata = false }
+local resources = ceUEDumperResources or { customTypes = {} }
+resources.options = resources.options or { showReflectionMetadata = false }
 
 local PROPERTY_LAYOUTS =
   {
@@ -2414,7 +2414,6 @@ function Core.CustomTypes.initializeObjectArrayVerifierType()
   local typeName = 'ceUEDumper UObjectArray Verifier'
   local existing = getCustomType(typeName)
   if existing then
-    assert(existing == ownedResources.customTypes[typeName], 'Custom type is already owned by something: ' .. typeName)
     UObjectArray_Verifier_Type = existing
     return
   end
@@ -2428,7 +2427,7 @@ function Core.CustomTypes.initializeObjectArrayVerifierType()
   end
 
   UObjectArray_Verifier_Type.InternalOnly = true
-  ownedResources.customTypes[typeName] = UObjectArray_Verifier_Type
+  resources.customTypes[typeName] = UObjectArray_Verifier_Type
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// FNAME DISPLAY TYPE
@@ -2471,25 +2470,28 @@ end
 function Core.CustomTypes.setupFName()
   
   local existing = getCustomType('FName')
-  if existing then
-    assert(existing == ownedResources.customTypes.FName, 'Custom type FName is already owned by something')
-  end
+
   -- The stable dispatcher follows the current core after reloads
-  ownedResources.fnameConverter = Core.CustomTypes.fnameBytesToValue
+  resources.fnameConverter = Core.CustomTypes.fnameBytesToValue
+  if existing then
+    resources.customTypes.FName = existing
+    return
+  end
+
   if not existing then
 
     synchronize(function()
-      ownedResources.customTypes.FName =
+      resources.customTypes.FName =
       registerCustomTypeLua(
                               'FName',
                               8,
-                              function(...) return ownedResources.fnameConverter(...) end,
+                              function(...) return resources.fnameConverter(...) end,
                               Core.CustomTypes.fnameValueToBytes,
                               false,
                               true
                             )
 
-      assert(ownedResources.customTypes.FName, 'Failed to register FName custom type')
+      assert(resources.customTypes.FName, 'Failed to register FName custom type')
     end)
   end
 end
@@ -3367,7 +3369,7 @@ function Core.Names.getLegacyStringRegion(blockBaseAddress, regionStreams)
   cachedStream = createMemoryStream() -- we free them later
   cachedStream.Size = 0
 
-  -- Register ownership before reading so cleanup also covers read errors
+  -- cache the stream before reading so cleanup also covers read errors
   regionStreams[ blockBaseAddress ] = cachedStream
 
   local regionSize = Core.Names.getLegacyStringRegionSize(blockBaseAddress)
@@ -5223,7 +5225,7 @@ function Core.Menu.createUEMenu(scanning)
     gui.miReflectionMetadata = createMenuItem( gui.miUnrealEngine )
     gui.miReflectionMetadata.Name = 'miCeUEDumperReflectionMetadata'
     gui.miReflectionMetadata.Caption = 'Dissect UClass/UProperty metadata?'
-    gui.miReflectionMetadata.Checked = ownedResources.options.showReflectionMetadata == true
+    gui.miReflectionMetadata.Checked = resources.options.showReflectionMetadata == true
     gui.miReflectionMetadata.OnClick = function(menuItem)
       local enabled = not menuItem.Checked
       if type( ue_setReflectionMetadataVisible ) ~= 'function' then -- from main

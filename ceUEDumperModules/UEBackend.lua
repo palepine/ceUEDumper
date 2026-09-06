@@ -36,14 +36,15 @@ local PTR_SIZE = 0x8
 local typeLookupState
 local cachedObjectArrayView
 
-local resources = package.loaded['ceUEDumper.ownedResources']
+local resources = package.loaded['ceUEDumper.resources']
 
 if not resources then
-  resources = { customTypes = {}, symbols = {}, borrowedSymbols = {} }
-  package.loaded['ceUEDumper.ownedResources'] = resources
+  resources = { customTypes = {}, symbols = {} }
+  package.loaded['ceUEDumper.resources'] = resources
 end
 
-resources.borrowedSymbols = resources.borrowedSymbols or {}
+resources.customTypes = resources.customTypes or {}
+resources.symbols = resources.symbols or {}
 resources.options = resources.options or { showReflectionMetadata = false }
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// HELPERS
@@ -56,7 +57,7 @@ local function loadCore()
     UESignatures = require('ceUEDumperModules.UESignatures'),
     ceUEDumperResources = resources,
     ceUEDumperRegisterSymbol = function(name, address)
-      return Module.Resources.registerOwnedSymbol( name, address )
+      return Module.Resources.registerSymbol( name, address )
     end,
   }
 
@@ -109,59 +110,33 @@ local Core = loadCore()
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// RESOURCES
 
---- Check named CE custom type
+--- Check whether CE has a named custom type
 -- @param name string @ custom type name
--- @return boolean @ current registration is ours
-function Module.Resources.ownsCustomType(name)
-  return resources.customTypes[name] ~= nil and getCustomType(name) == resources.customTypes[name]
+-- @return boolean @ true when the type is registered
+function Module.Resources.hasCustomType(name)
+  return getCustomType(name) ~= nil
 end
 
---- Refuse replacement of symbol
--- @param name string @ requested symbol
--- @return boolean @ available or still owned
-function Module.Resources.canRegisterSymbol(name)
-  local current = getAddressSafe(name)
-  return current == nil or (resources.symbols[name] ~= nil and resources.symbols[name] == current)
-end
-
---- Register symbol
+--- Register or replace a CE symbol
 -- @param name string @ symbol name
 -- @param address number|string @ address/offset or relocatable expression
 -- @return nil
-function Module.Resources.registerOwnedSymbol(name, address)
+function Module.Resources.registerSymbol(name, address)
   local resolved = getAddressSafe(address)
   assert(resolved ~= nil, 'Cannot resolve symbol value: ' .. tostring(address))
 
-  local current = getAddressSafe(name)
-
-  if current ~= nil and resources.symbols[name] == nil then
-    assert(current == resolved, 'Symbol is already owned by something: ' .. name)
-
-    -- CE can restore saved/user-defined symbol while this Lua ownership ledger starts empty after a restart
-    -- identical value is safe to reuse, but remains borrowed (cleanup never deletes another owner)
-    resources.borrowedSymbols[name] = resolved
-    return
-  end
-
-  assert( Module.Resources.canRegisterSymbol(name), 'Symbol is already owned by another tool: ' .. name )
-
-  if resources.symbols[name] ~= nil then unregisterSymbol(name) end
+  if getAddressSafe(name) ~= nil then unregisterSymbol(name) end
   registerSymbol(name, address, true)
   resources.symbols[name] = resolved
-  resources.borrowedSymbols[name] = nil
 end
 
---- Remove symbol only while its registered value still matches ours
+--- Remove a CE symbol registered through this backend
 -- @param name string @ symbol to release
 -- @return nil
-function Module.Resources.unregisterOwnedSymbol(name)
-  
-  if resources.symbols[name] ~= nil and getAddressSafe(name) == resources.symbols[name] then
-    unregisterSymbol(name)
-  end
+function Module.Resources.unregisterSymbol(name)
+  if resources.symbols[name] ~= nil then unregisterSymbol(name) end
 
   resources.symbols[name] = nil
-  resources.borrowedSymbols[name] = nil
 end
 
 
@@ -1033,10 +1008,9 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// EXPORT
 
-Module.ownsCustomType = Module.Resources.ownsCustomType
-Module.canRegisterSymbol = Module.Resources.canRegisterSymbol
-Module.registerOwnedSymbol = Module.Resources.registerOwnedSymbol
-Module.unregisterOwnedSymbol = Module.Resources.unregisterOwnedSymbol
+Module.hasCustomType = Module.Resources.hasCustomType
+Module.registerSymbol = Module.Resources.registerSymbol
+Module.unregisterSymbol = Module.Resources.unregisterSymbol
 
 Module.isReady = Module.Lifecycle.isReady
 Module.launch = Module.Lifecycle.launch
