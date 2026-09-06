@@ -27,6 +27,11 @@ Copy and merge the `autorun` folder into the root Cheat Engine directory.
 An embedded copy can be loaded using this Lua script (lua script table or via a memrec AutoAssemble script)
 ```lua
 local function loadScriptFromTable(fileName)
+  local CEVersionSupported = 7.7 
+  if getCEVersion() < CEVersionSupported then
+    ShowMessage('Please update CE to' .. CEVersionSupported .. ' or newer')
+    error( 'update to Cheat Engine ' .. CEVersionSupported )
+  end
   if not fileName then error('Filename invalid') end
   local tableFile = findTableFile( fileName )
   if tableFile == nil then error('No script file found') end
