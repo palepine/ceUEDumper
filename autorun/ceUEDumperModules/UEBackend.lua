@@ -588,7 +588,7 @@ function Module.Functions.functionForObject(objectAddress, functionName)
     classAddress = readPointer( classAddress + superOffset )
   end
 
-  return nil, 'Unreal function was not found: ' .. functionName
+  return nil, 'UFunction was not found: ' .. functionName
 end
 
 --- Resolve the standalone UObject::ProcessEvent entry point
@@ -828,6 +828,16 @@ function Module.Reflection.properties(typeAddress)
 
         if property.propertyType == 'ArrayProperty' then
           property.innerProperty, property.innerError = Module.Reflection.propertyArrayInner( property.propertyAddress )
+          goto continue
+        end
+
+        if property.propertyType == 'SetProperty' then
+          property.elementProperty, property.elementError = Module.Reflection.propertySetElement( property.propertyAddress )
+          goto continue
+        end
+
+        if property.propertyType == 'MapProperty' then
+          property.keyProperty, property.valueProperty, property.mapError = Module.Reflection.propertyMapMembers( property.propertyAddress )
         end
 
         ::continue::
@@ -858,6 +868,16 @@ function Module.Reflection.properties(typeAddress)
 
     if property.propertyType == 'ArrayProperty' then
       property.innerProperty, property.innerError = Module.Reflection.propertyArrayInner( property.propertyAddress )
+      goto continue
+    end
+
+    if property.propertyType == 'SetProperty' then
+      property.elementProperty, property.elementError = Module.Reflection.propertySetElement( property.propertyAddress )
+      goto continue
+    end
+
+    if property.propertyType == 'MapProperty' then
+      property.keyProperty, property.valueProperty, property.mapError = Module.Reflection.propertyMapMembers( property.propertyAddress )
     end
 
     ::continue::
@@ -920,76 +940,158 @@ function Module.Reflection.propertyStruct(propertyAddress)
   return selected
 end
 
---- Resolve and decode FArrayProperty::Inner
--- The inner descriptor is another FProperty/FField whose ElementSize is the
--- array stride. Candidate slots cover legacy UProperty and modern FProperty
--- layouts; the first structurally valid zero-offset property is selected
--- @param propertyAddress number @ FArrayProperty/UArrayProperty descriptor
--- @return table|nil @ decoded inner property metadata
--- @return string|nil @ missing metadata error
-function Module.Reflection.propertyArrayInner(propertyAddress)
+--- Return pointers that belong to property's linked-list infra (not PropertyLinkNext)
+-- @param propertyAddress number @ container property descriptor
+-- @return table<number, boolean> @ pointers excluded from subtype probing
+local function containerExcludedPointers(propertyAddress)
   local definitions = Core.definitions()
-  local configuredOffset = definitions.FArrayProperty and definitions.FArrayProperty.Inner
-  local candidateOffsets = {}
-
-  if type(configuredOffset) == 'number' then
-    candidateOffsets[1] = configuredOffset
-  else
-    -- Most UE4/UE5 layouts place Inner at 0x70 or 0x78. The remaining
-    -- aligned slots retain compatibility with shifted/custom FProperty sizes
-    candidateOffsets = { 0x70, 0x78, 0x80, 0x68, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0x60 }
-  end
-
   local propertyLayout = definitions.FProperty or {}
   local excludedPointers = {}
   local linkOffsets = {}
 
   if type(propertyLayout.PropertyLinkNext) == 'number' then
-    linkOffsets[#linkOffsets + 1] = propertyLayout.PropertyLinkNext
+    linkOffsets[ #linkOffsets + 1 ] = propertyLayout.PropertyLinkNext
   end
 
   if definitions.FField and type(definitions.FField.PropertyLinkNext) == 'number' then
-    linkOffsets[#linkOffsets + 1] = definitions.FField.PropertyLinkNext
+    linkOffsets[ #linkOffsets + 1 ] = definitions.FField.PropertyLinkNext
   end
 
   for _, nextOffset in ipairs(linkOffsets) do
-
-    if type(nextOffset) == 'number' then
-      local linkedProperty = readPointer( propertyAddress + nextOffset )
-      
-      if linkedProperty then excludedPointers[linkedProperty] = true end
-    end
-
+    local linkedProperty = readPointer( propertyAddress + nextOffset )
+    if linkedProperty then excludedPointers[linkedProperty] = true end
   end
 
+  return excludedPointers
+end
+
+--- Decode one nested FProperty descriptor referenced by container property
+-- @param propertyAddress number @ outer Array/Set/Map property descriptor
+-- @param memberOffset number @ candidate pointer-member offset
+-- @param excludedPointers table<number, boolean> @ linked-list pointers to reject
+-- @param requireZeroValueOffset boolean @ reject nonzero Offset_Internal values
+-- @return table|nil @ decoded nested property metadata
+local function containerPropertyAt(propertyAddress, memberOffset, excludedPointers, requireZeroValueOffset)
+  local innerAddress = readPointer( propertyAddress + memberOffset )
+
+  if not isValidAddress(innerAddress) or excludedPointers[innerAddress] then return nil end
+
+  local innerName, innerProperty = Core.propertyMetadata(innerAddress)
+
+  if not innerProperty
+         or type(innerProperty.propertyType) ~= 'string'
+         or innerProperty.propertyType:sub(-8) ~= 'Property'
+         or type(innerProperty.offset) ~= 'number'
+         or innerProperty.offset < 0
+         or innerProperty.offset > 0x100000
+         or requireZeroValueOffset and innerProperty.offset ~= 0
+         or type(innerProperty.size) ~= 'number'
+         or innerProperty.size <= 0
+         or innerProperty.size > 0x100000
+  then
+    return nil
+  end
+
+  innerProperty.name = innerName
+  innerProperty.innerAddress = innerAddress
+  innerProperty.innerOffset = memberOffset
+
+  if innerProperty.propertyType == 'StructProperty' then
+    innerProperty.structAddress, innerProperty.structError = Module.Reflection.propertyStruct(innerAddress)
+  end
+
+  return innerProperty
+end
+
+--- Candidate offsets for the first subtype pointer in container property
+-- @param configuredOffset number|nil @ previously discovered exact member offset
+-- @return number[] @ ordered offsets, most common UE4/UE5 layouts first
+local function containerMemberOffsets(configuredOffset)
+  if type(configuredOffset) == 'number' then return { configuredOffset } end
+
+  return { 0x70, 0x78, 0x80, 0x68, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0x60 }
+end
+
+--- Resolve and decode FArrayProperty::Inner
+-- @param propertyAddress number @ FArrayProperty/UArrayProperty descriptor
+-- @return table|nil @ decoded inner property metadata
+-- @return string|nil @ missing metadata error
+function Module.Reflection.propertyArrayInner(propertyAddress)
+  -- the inner descriptor is another FProperty/FField whose ElementSize is the array stride
+  -- slots cover legacy UProperty and modern FProperty layouts
+  -- first structurally valid zero-offset property is selected
+  local definitions = Core.definitions()
+  local configuredOffset = definitions.FArrayProperty and definitions.FArrayProperty.Inner
+  local candidateOffsets = containerMemberOffsets(configuredOffset)
+  local excludedPointers = containerExcludedPointers(propertyAddress)
+
   for _, memberOffset in ipairs(candidateOffsets) do
-    local innerAddress = readPointer( propertyAddress + memberOffset )
+    local innerProperty = containerPropertyAt( propertyAddress, memberOffset, excludedPointers, true )
 
-    if isValidAddress(innerAddress) and not excludedPointers[innerAddress] then
-      local innerName, innerProperty = Core.propertyMetadata(innerAddress)
-
-      if innerProperty
-          and type(innerProperty.propertyType) == 'string'
-          and innerProperty.propertyType:sub(-8) == 'Property'
-          and innerProperty.offset == 0
-          and type(innerProperty.size) == 'number'
-          and innerProperty.size > 0
-          and innerProperty.size <= 0x100000
-      then
-        innerProperty.name = innerName
-        innerProperty.innerAddress = innerAddress
-        innerProperty.innerOffset = memberOffset
-
-        if innerProperty.propertyType == 'StructProperty' then
-          innerProperty.structAddress, innerProperty.structError = Module.Reflection.propertyStruct(innerAddress)
-        end
-
-        return innerProperty
-      end
+    if innerProperty then
+      definitions.FArrayProperty = definitions.FArrayProperty or {}
+      definitions.FArrayProperty.Inner = memberOffset
+      return innerProperty
     end
   end
 
   return nil, 'FArrayProperty.Inner was not resolved'
+end
+
+--- Resolve and decode FSetProperty::ElementProp
+-- @param propertyAddress number @ FSetProperty/USetProperty descriptor
+-- @return table|nil @ decoded element-property metadata
+-- @return string|nil @ missing metadata error
+function Module.Reflection.propertySetElement(propertyAddress)
+  local definitions = Core.definitions()
+  local configuredOffset = definitions.FSetProperty and definitions.FSetProperty.ElementProp
+  local excludedPointers = containerExcludedPointers(propertyAddress)
+
+  for _, memberOffset in ipairs( containerMemberOffsets(configuredOffset) ) do
+    local elementProperty = containerPropertyAt( propertyAddress, memberOffset, excludedPointers, true )
+
+    if elementProperty then
+      definitions.FSetProperty = definitions.FSetProperty or {}
+      definitions.FSetProperty.ElementProp = memberOffset
+      return elementProperty
+    end
+  end
+
+  return nil, 'FSetProperty.ElementProp was not resolved'
+end
+
+--- Resolve and decode FMapProperty::KeyProp and ValueProp
+-- @param propertyAddress number @ FMapProperty/UMapProperty descriptor
+-- @return table|nil @ decoded key-property metadata
+-- @return table|nil @ decoded value-property metadata
+-- @return string|nil @ missing metadata error
+function Module.Reflection.propertyMapMembers(propertyAddress)
+  -- descriptors occupy two consecutive pointer members in supported UE4/5 layouts
+  -- UE links both descriptors against the TPair,
+  -- making their Offset_Internal values the key/value offsets used by FScriptMapLayout
+  local definitions = Core.definitions()
+  local mapLayout = definitions.FMapProperty or {}
+  local excludedPointers = containerExcludedPointers(propertyAddress)
+  local candidateOffsets = containerMemberOffsets(mapLayout.KeyProp)
+
+  for _, keyOffset in ipairs(candidateOffsets) do
+    local valueOffset = type(mapLayout.ValueProp) == 'number' and mapLayout.ValueProp or keyOffset + PTR_SIZE
+    local keyProperty = containerPropertyAt( propertyAddress, keyOffset, excludedPointers, true )
+    local valueProperty = containerPropertyAt( propertyAddress, valueOffset, excludedPointers, false )
+
+    if keyProperty
+        and valueProperty
+        and keyProperty.innerAddress ~= valueProperty.innerAddress
+        and ( valueProperty.offset == 0 or valueProperty.offset >= keyProperty.size )
+    then
+      definitions.FMapProperty = definitions.FMapProperty or {}
+      definitions.FMapProperty.KeyProp = keyOffset
+      definitions.FMapProperty.ValueProp = valueOffset
+      return keyProperty, valueProperty
+    end
+  end
+
+  return nil, nil, 'FMapProperty.KeyProp/ValueProp were not resolved'
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// BACKEND SETTINGS
@@ -1037,6 +1139,8 @@ Module.propertyHeaderLayout = Module.Reflection.propertyHeaderLayout
 Module.properties = Module.Reflection.properties
 Module.propertyStruct = Module.Reflection.propertyStruct
 Module.propertyArrayInner = Module.Reflection.propertyArrayInner
+Module.propertySetElement = Module.Reflection.propertySetElement
+Module.propertyMapMembers = Module.Reflection.propertyMapMembers
 
 Module.showsReflectionMetadata = Module.Options.showsReflectionMetadata
 Module.setReflectionMetadataVisible = Module.Options.setReflectionMetadataVisible

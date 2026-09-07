@@ -241,7 +241,7 @@ function Dumper.Helpers.resolveProperty(properties, requested)
 
   end
 
-  if not selected then return nil, 'Unreal property was not found: ' .. requested end
+  if not selected then return nil, 'Property was not found: ' .. requested end
   return selected
 end
 
@@ -313,7 +313,7 @@ function Dumper.Offsets.ue_getPropertyOffset(typeNameOrAddress, propertyName)
   local resolveProperty = Dumper.Helpers.resolveProperty
 
   local typeAddress = Dumper.Helpers.resolveType(typeNameOrAddress)
-  if not typeAddress then return nil, 'Unreal type not found' end
+  if not typeAddress then return nil, 'Type not found' end
 
   local segments = {}
 
@@ -507,7 +507,7 @@ end
 -- @return string|nil @ error
 function Dumper.Offsets.ue_registerClassOffsets(typeNameOrAddress, propertyNames, namespace)
   local typeAddress = Dumper.Helpers.resolveType(typeNameOrAddress)
-  if not typeAddress then return nil, 'Unreal class or script struct not found' end
+  if not typeAddress then return nil, 'UClass or script struct not found' end
 
   local properties, errorMessage = Dumper.Offsets.collectRegistrationProperties( typeAddress, propertyNames )
   if not properties then return nil, errorMessage end
@@ -631,7 +631,7 @@ function Dumper.Lifecycle.checkInitStatus(config)
   local status = Backend.status()
 
   if config.requireNames ~= false and not (status and status.namesReady) then
-    return false, 'Unreal layout was found, but runtime names are unavailable'
+    return false, 'UE layout was found, but runtime names are unavailable'
   end
 
   return true
@@ -670,7 +670,7 @@ function Dumper.Lifecycle.ue_initDumper(config)
     reason = status.log:sub(-2000)
   end
 
-  return false, 'Unreal reflection querying failed: ' .. (reason or 'NO MEANINGFUL ERROR PRODUCED')
+  return false, 'UE reflection querying failed: ' .. (reason or 'NO MEANINGFUL ERROR PRODUCED')
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// CLASS/PROPERTY QUERIES
@@ -692,12 +692,12 @@ function Dumper.Reflection.ue_enumProperties(typeNameOrAddress)
   -- are we good?
   local status = Backend.status()
   if status and status.namesReady == false then
-    return nil, 'Unreal reflection unavailable; FName issue'
+    return nil, 'UE reflection unavailable; FName issue'
   end
 
   local address = Dumper.Helpers.resolveType(typeNameOrAddress)
 
-  if not address then return nil, 'Unreal class or script struct not found' end
+  if not address then return nil, 'UE class or script struct not found' end
 
   return Backend.properties(address)
 end
@@ -823,7 +823,7 @@ function Dumper.Structures.ue_enumFlattenedProperties(typeNameOrAddress, keepUnr
 
   local typeAddress = Dumper.Helpers.resolveType(typeNameOrAddress)
 
-  if not typeAddress then return nil, 'Unreal type not found' end
+  if not typeAddress then return nil, 'Type not found' end
 
   local complete, err = visit( typeAddress, '', 0, 0, '' )
 
@@ -1132,7 +1132,360 @@ function Dumper.Structures.createArrayDataStructure(property, arrayHeaderAddress
   return arrayStructure
 end
 
---- Add reflected field, expanding TArray headers & elements
+--- Align integer offset to power-of-two byte boundary
+-- @param value number @ unaligned byte offset
+-- @param alignment number @ positive power-of-two alignment
+-- @return number @ aligned byte offset
+function Dumper.Structures.alignOffset(value, alignment)
+  return ( value + alignment - 1 ) & ~( alignment - 1 )
+end
+
+--- Resolve minimum alignment required by one reflected property value
+-- @param property table @ decoded property metadata
+-- @return number @ alignment used by FScriptSetLayout/FScriptMapLayout
+function Dumper.Structures.propertyAlignment(property)
+
+  if property.propertyType == 'StructProperty' and property.structAddress then
+    local classLayout = Backend.classHeaderLayout()
+    local alignmentOffset = classLayout.MinAlignment
+    local alignment = type(alignmentOffset) == 'number' and readInteger( property.structAddress + alignmentOffset )
+
+    if type(alignment) == 'number'
+        and alignment > 0
+        and alignment <= 0x100
+        and alignment & ( alignment - 1 ) == 0
+    then
+      return alignment
+    end
+  end
+
+  local propertyType = property.propertyType
+
+  if propertyType == 'BoolProperty' or propertyType == 'ByteProperty' or propertyType == 'Int8Property' or propertyType == 'UInt8Property' then return 1 end
+  
+  if propertyType == 'Int16Property' or propertyType == 'UInt16Property' then return 2 end
+  
+  if propertyType == 'IntProperty'
+     or propertyType == 'Int32Property'
+     or propertyType == 'UInt32Property'
+     or propertyType == 'FloatProperty'
+     or propertyType == 'NameProperty'
+     or propertyType == 'WeakObjectProperty'
+     or propertyType == 'DelegateProperty'
+  then
+    return 4
+  end
+
+  local size = property.size or PTR_SIZE
+  if size >= 8 then return 8 end
+  if size >= 4 then return 4 end
+  if size >= 2 then return 2 end
+  return 1
+end
+
+--- Decode shared FScriptSet sparse-array header used by TSet/TMap
+-- @param containerAddress number @ live inline FScriptSet/FScriptMap address
+-- @return table|nil @ validated data pointer, counts and allocation-mask address
+-- @return string|nil @ invalid-header error
+function Dumper.Structures.readSparseContainerHeader(containerAddress)
+  --[[
+    FScriptSet / FScriptMap
+    ├─ +0x00 Elements.Data  -- TArray storage pointer
+    ├─ +0x08 Elements.Data.ArrayNum  -- sparse slot count (includes holes)
+    ├─ +0x0C Elements.Data.ArrayMax
+    ├─ +0x10 Elements.AllocationFlags  -- inline 128-bit allocation mask
+    ├─ +0x20 AllocationFlags.SecondaryData  -- mask pointer when capacity > 128
+    ├─ +0x28 AllocationFlags.NumBits
+    ├─ +0x2C AllocationFlags.MaxBits
+    ├─ +0x30 Elements.FirstFreeIndex
+    └─ +0x34 Elements.NumFreeIndices
+  ]]
+
+  local header =
+  {
+    dataAddress = readPointer(containerAddress),
+    slotCount = readInteger( containerAddress + 8 ),
+    maximumSlotCount = readInteger( containerAddress + 0xC ),
+    allocationBitCount = readInteger( containerAddress + 0x28 ),
+    maximumAllocationBitCount = readInteger( containerAddress + 0x2C ),
+    firstFreeIndex = readInteger( containerAddress + 0x30 ),
+    freeIndexCount = readInteger( containerAddress + 0x34 ),
+  }
+
+  if type(header.slotCount) ~= 'number'
+      or type(header.maximumSlotCount) ~= 'number'
+      or type(header.allocationBitCount) ~= 'number'
+      or type(header.maximumAllocationBitCount) ~= 'number'
+      or type(header.freeIndexCount) ~= 'number'
+      or header.slotCount < 0
+      or header.maximumSlotCount < header.slotCount
+      or header.maximumSlotCount > 0x100000
+      or header.allocationBitCount < header.slotCount
+      or header.maximumAllocationBitCount < header.allocationBitCount
+      or header.maximumAllocationBitCount > 0x100000
+      or header.freeIndexCount < 0
+      or header.freeIndexCount > header.slotCount
+  then
+    return nil, 'FScriptSet/FScriptMap header is invalid'
+  end
+
+  header.elementCount = header.slotCount - header.freeIndexCount
+
+  if header.slotCount == 0 then return header end
+  if not header.dataAddress or header.dataAddress == 0 then return nil, 'Sparse container data pointer is null' end
+
+  if header.maximumAllocationBitCount <= 128 then
+    header.allocationFlagsAddress = containerAddress + 0x10
+  else
+    header.allocationFlagsAddress = readPointer( containerAddress + 0x20 )
+  end
+
+  if not header.allocationFlagsAddress or header.allocationFlagsAddress == 0 then
+    return nil, 'Sparse container allocation flags are unavailable'
+  end
+
+  return header
+end
+
+--- Return occupied sparse indices using FScriptSet allocation flags
+-- @param header table @ result of readSparseContainerHeader
+-- @param maximumRenderedCount number|nil @ occupied-entry display limit
+-- @return number[]|nil @ occupied sparse indices
+-- @return string|nil @ allocation-bitset error
+function Dumper.Structures.sparseContainerIndices(header, maximumRenderedCount)
+  if header.slotCount == 0 then return {} end
+
+  -- reading complete bitset once to avoid reads per possible slots
+  local byteCount = ( header.slotCount + 7 ) >> 3
+  local allocationBytes = readBytes( header.allocationFlagsAddress, byteCount, true )
+  if type(allocationBytes) ~= 'table' or #allocationBytes < byteCount then return nil, 'Sparse container allocation flags are unreadable' end
+
+  local indices = {}
+  -- capped
+  local renderedLimit = math.min( header.elementCount, maximumRenderedCount or 256 )
+  if renderedLimit == 0 then return indices end
+
+  for index = 0, header.slotCount - 1 do
+    local allocationByte = allocationBytes[ (index >> 3) + 1 ]
+    local allocationMask = 1 << ( index & 7 )
+
+    if allocationByte & allocationMask ~= 0 then
+      indices[ #indices + 1 ] = index
+      if #indices >= renderedLimit then break end
+    end
+  end
+
+  return indices
+end
+
+--- Calculate FScriptSet element metadata stored after reflected value
+-- @param elementProperty table @ FSetProperty::ElementProp metadata
+-- @return table|nil @ element alignment, hash offsets and sparse-slot stride
+-- @return string|nil @ missing size error
+function Dumper.Structures.createSetLayout(elementProperty)
+  if type(elementProperty.size) ~= 'number' or elementProperty.size <= 0 then return nil, 'TSet element size is unavailable' end
+
+  -- each sparse slot contains value followed by HashNextId and HashIndex
+  local alignOffset = Dumper.Structures.alignOffset
+  local elementAlignment = math.max( 4, Dumper.Structures.propertyAlignment(elementProperty) )
+  local hashNextIdOffset = alignOffset( elementProperty.size, 4 )
+  local hashIndexOffset = hashNextIdOffset + 4
+
+  return
+  {
+    elementOffset = 0,
+    hashNextIdOffset = hashNextIdOffset,
+    hashIndexOffset = hashIndexOffset,
+    stride = alignOffset( hashIndexOffset + 4, elementAlignment ),
+  }
+end
+
+--- Calculate FScriptMap pair offsets and its enclosing sparse-slot stride
+-- @param keyProperty table @ FMapProperty::KeyProp metadata
+-- @param valueProperty table @ FMapProperty::ValueProp metadata
+-- @return table|nil @ key/value/hash offsets and sparse-slot stride
+-- @return string|nil @ missing size error
+function Dumper.Structures.createMapLayout(keyProperty, valueProperty)
+  if type(keyProperty.size) ~= 'number' or keyProperty.size <= 0 then return nil, 'TMap key size is unavailable' end
+  if type(valueProperty.size) ~= 'number' or valueProperty.size <= 0 then return nil, 'TMap value size is unavailable' end
+
+  -- UE links KeyProp/ValueProp against the pair
+  -- their Offset_Internal values are FScriptMapLayout::KeyOffset/ValueOffset
+  -- derive ValueOffset only when incomplete metadata leaves it at zero
+  -- complete pair is wrapped in the hash metadata used by FScriptSet
+  local alignOffset = Dumper.Structures.alignOffset
+  local keyAlignment = Dumper.Structures.propertyAlignment(keyProperty)
+  local valueAlignment = Dumper.Structures.propertyAlignment(valueProperty)
+  local pairAlignment = math.max( 4, keyAlignment, valueAlignment )
+  local computedValueOffset = alignOffset( keyProperty.size, valueAlignment )
+  local valueOffset = type(valueProperty.offset) == 'number' and valueProperty.offset > 0
+                      and valueProperty.offset
+                      or computedValueOffset
+
+  if valueOffset < keyProperty.size or valueOffset > 0x100000 then return nil, 'TMap value offset is invalid' end
+
+  local hashNextIdOffset = alignOffset( valueOffset + valueProperty.size, 4 )
+  local hashIndexOffset = hashNextIdOffset + 4
+
+  return
+  {
+    keyOffset = 0,
+    valueOffset = valueOffset,
+    hashNextIdOffset = hashNextIdOffset,
+    hashIndexOffset = hashIndexOffset,
+    stride = alignOffset( hashIndexOffset + 4, pairAlignment ),
+  }
+end
+
+--- Add one scalar, object, container or expanded struct value to container view
+-- @param structure userdata|table @ sparse-container child structure
+-- @param fieldName string @ displayed element/key/value name
+-- @param property table @ reflected element property metadata
+-- @param slotOffset number @ sparse slot base offset relative to container Data
+-- @param dataAddress number @ live sparse Data pointer
+-- @return boolean|nil @ success
+-- @return string|nil @ struct metadata error
+function Dumper.Structures.addContainerValue(structure, fieldName, property, slotOffset, dataAddress)
+  if property.propertyType == 'StructProperty' and property.structAddress then
+    local nestedProperties, nestedError = Dumper.Structures.ue_enumFlattenedProperties( property.structAddress, true )
+    if not nestedProperties then return nil, nestedError end
+
+    -- Struct flattening bypasses addRenderedProperty for the outer descriptor,
+    -- so apply the container property's Offset_Internal here exactly once.
+    local structOffset = slotOffset + property.offset
+
+    for _, nested in ipairs( Dumper.Structures.orderRenderableProperties(nestedProperties) ) do
+      Dumper.Structures.addRenderedProperty( structure, fieldName .. '.' .. nested.name, nested.property, structOffset, dataAddress )
+    end
+
+    return true
+  end
+
+  -- scalar/container rendering adds property.offset itself
+  -- passing only the slot base prevents map values from receiving ValueOffset twice
+  Dumper.Structures.addRenderedProperty( structure, fieldName, property, slotOffset, dataAddress )
+  return true
+end
+
+--- Build pointed-to occupied-element layout for a TSet
+-- @param property table @ outer SetProperty metadata
+-- @param containerAddress number @ live inline FScriptSet address
+-- @return userdata|nil @ child structure rooted at Elements.Data
+-- @return string|nil @ metadata/header error
+function Dumper.Structures.createSetDataStructure(property, containerAddress)
+  local elementProperty, elementError = property.elementProperty, property.elementError
+
+  if not elementProperty then
+    elementProperty, elementError = Backend.propertySetElement( property.propertyAddress )
+  end
+
+  if not elementProperty then return nil, elementError end
+
+  local header, headerError = Dumper.Structures.readSparseContainerHeader(containerAddress)
+  if not header then return nil, headerError end
+
+  local setLayout, layoutError = Dumper.Structures.createSetLayout(elementProperty)
+  if not setLayout then return nil, layoutError end
+
+  local setStructure = createStructure('ceUE.TSet<' .. elementProperty.propertyType .. '>')
+  if header.elementCount == 0 then return setStructure end
+
+  local indices, indexError = Dumper.Structures.sparseContainerIndices(header)
+  if not indices then return nil, indexError end
+
+  for _, sparseIndex in ipairs(indices) do
+    local slotOffset = sparseIndex * setLayout.stride
+    local added, addError = Dumper.Structures.addContainerValue( setStructure, ('[%d]'):format(sparseIndex), elementProperty, slotOffset, header.dataAddress )
+    if not added then return nil, addError end
+  end
+
+  return setStructure
+end
+
+--- Build pointed-to occupied-pair layout for a TMap
+-- @param property table @ outer MapProperty metadata
+-- @param containerAddress number @ live inline FScriptMap address
+-- @return userdata|nil @ child structure rooted at Elements.Data
+-- @return string|nil @ metadata/header error
+function Dumper.Structures.createMapDataStructure(property, containerAddress)
+  local keyProperty, valueProperty, mapError = property.keyProperty, property.valueProperty, property.mapError
+
+  if not keyProperty or not valueProperty then
+    keyProperty, valueProperty, mapError = Backend.propertyMapMembers( property.propertyAddress )
+  end
+
+  if not keyProperty or not valueProperty then return nil, mapError end
+
+  local header, headerError = Dumper.Structures.readSparseContainerHeader(containerAddress)
+  if not header then return nil, headerError end
+
+  local mapLayout, layoutError = Dumper.Structures.createMapLayout( keyProperty, valueProperty )
+  if not mapLayout then return nil, layoutError end
+
+  local mapStructure = createStructure( ('ceUE.TMap<%s,%s>'):format( keyProperty.propertyType, valueProperty.propertyType ) )
+  if header.elementCount == 0 then return mapStructure end
+
+  local indices, indexError = Dumper.Structures.sparseContainerIndices(header)
+  if not indices then return nil, indexError end
+
+  for _, sparseIndex in ipairs(indices) do
+    local slotOffset = sparseIndex * mapLayout.stride
+    local keyAdded, keyError = Dumper.Structures.addContainerValue( mapStructure, ('[%d].Key'):format(sparseIndex), keyProperty, slotOffset, header.dataAddress )
+    if not keyAdded then return nil, keyError end
+
+    local valueAdded, valueError = Dumper.Structures.addContainerValue( mapStructure, ('[%d].Value'):format(sparseIndex), valueProperty, slotOffset, header.dataAddress )
+    if not valueAdded then return nil, valueError end
+  end
+
+  return mapStructure
+end
+
+--- Add inline FScriptSet/FScriptMap header and its live sparse-data view
+-- @param structure userdata|table @ destination CE structure
+-- @param fieldName string @ displayed reflected field name
+-- @param property table @ SetProperty or MapProperty metadata
+-- @param fieldOffset number @ container offset relative to destination
+-- @param baseAddress number|nil @ live destination base
+function Dumper.Structures.addSparseContainerProperty(structure, fieldName, property, fieldOffset, baseAddress)
+  local dataElement = structure.addElement()
+  dataElement.Name = fieldName
+  dataElement.Offset = fieldOffset
+  dataElement.Vartype = vtPointer
+
+  local slotCountElement = structure.addElement()
+  slotCountElement.Name = fieldName .. ' [ArrayNum]'
+  slotCountElement.Offset = fieldOffset + 8
+  slotCountElement.Vartype = vtDword
+
+  local freeCountElement = structure.addElement()
+  freeCountElement.Name = fieldName .. ' [NumFreeIndices]'
+  freeCountElement.Offset = fieldOffset + 0x34
+  freeCountElement.Vartype = vtDword
+
+  if not baseAddress then return end
+
+  local containerAddress = baseAddress + fieldOffset
+  local createDataStructure = property.propertyType == 'MapProperty'
+                                                        and Dumper.Structures.createMapDataStructure
+                                                        or Dumper.Structures.createSetDataStructure
+
+  dataElement.OnCreateChild = function(_, dataAddress)
+    if not dataAddress or dataAddress == 0 then return nil, true end
+    local childStructure = createDataStructure( property, containerAddress )
+    if childStructure then return childStructure end
+    return nil, true
+  end
+
+  local childStructure, containerError = createDataStructure( property, containerAddress )
+
+  if childStructure then
+    dataElement.ChildStruct = childStructure
+  elseif containerError then
+    dataElement.Name = dataElement.Name .. ' [unresolved: ' .. containerError .. ']'
+  end
+end
+
+--- Add reflected field, expanding supported container headers and elements
 -- @param structure userdata|table @ destination CE structure
 -- @param fieldName string @ displayed field name
 -- @param property table @ reflected property metadata
@@ -1210,6 +1563,11 @@ function Dumper.Structures.addRenderedProperty(structure, fieldName, property, a
     return
   end
 
+  if property.propertyType == 'SetProperty' or property.propertyType == 'MapProperty' then
+    Dumper.Structures.addSparseContainerProperty( structure, fieldName, property, elementOffset, baseAddress )
+    return
+  end
+
   local element = structure.addElement()
   element.Name = property.expansionError and fieldName .. ' [unresolved struct]' or fieldName
   element.Offset = elementOffset
@@ -1217,7 +1575,7 @@ function Dumper.Structures.addRenderedProperty(structure, fieldName, property, a
 end
 
 --- Build a CE structure with embedded fields flattened at their true offsets
--- Does not replace CE's global Unreal renderer or install automatic callbacks
+-- Does not replace CE's global UE renderer or install automatic callbacks
 -- @param typeNameOrAddress string|number @ reflected class or script struct
 -- @return userdata|nil @ CE structure
 -- @return string|nil @ metadata error
@@ -1544,7 +1902,7 @@ end
 function Dumper.Functions.ue_enumFunctions(classNameOrAddress)
 
   local typeAddress = Dumper.Helpers.resolveType(classNameOrAddress)
-  if not typeAddress then return nil, 'Unreal class or script struct not found' end
+  if not typeAddress then return nil, 'UClass or script struct not found' end
   
   return Backend.functions(typeAddress)
 end
@@ -1829,7 +2187,7 @@ end
 --- Invoke a reflected UFunction on UObject through ProcessEvent
 --
 -- It supports scalar values, FName, raw UObject/UClass, ptrs, POD structs
--- Unreal-managed values requiring Ctors/Dtors are rejected before invocation
+-- UE-managed values requiring Ctors/Dtors are rejected before invocation
 -- via CE calling API, not main thread
 --
 -- @param objectAddress number @ live target UObject this pointer

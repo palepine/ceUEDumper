@@ -5046,7 +5046,7 @@ end
 
 --- Return modules eligible for FNamePool signature scanning
 --
--- The process image is always first. Recognized modular Unreal images
+-- The process image is always first. Recognized modular UE images
 -- follow in loader order. SDK, system and unknown DLLs are not scanned
 -- @return table[] @ ordered module descriptors
 function Core.Signatures.getNamePoolScanModules()
