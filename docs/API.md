@@ -1,12 +1,5 @@
 # CE UE Dumper Lua API reference
 
-## TODOs
-- maps, sets
-- arbitrary object name/base lookups for struct dissector
-- fname/object descryption
-- array limit setting
-- 
-
 ## Digest
 
 | Function                                           | Description                                            |
@@ -93,6 +86,13 @@ Enumeration API returns tables keyed by reflected property name (including inher
 | `size`            | `number or nil` | Element size (when available)                       |
 | `structAddress`   | `number or nil` | `UScriptStruct` for `StructProperty`                |
 | `structError`     | `string or nil` | reason for struct not being resolved                |
+| `innerProperty`   | `table or nil`  | `ArrayProperty` element metadata                     |
+| `elementProperty` | `table or nil`  | `SetProperty` element metadata                       |
+| `keyProperty`     | `table or nil`  | `MapProperty` key metadata                           |
+| `valueProperty`   | `table or nil`  | `MapProperty` value metadata                         |
+| `innerError`      | `string or nil` | reason an array element descriptor was not resolved  |
+| `elementError`    | `string or nil` | reason a set element descriptor was not resolved     |
+| `mapError`        | `string or nil` | reason map key/value descriptors were not resolved   |
 | `byteMask`        | `number or nil` | Boolean mask when that makes sense                  |
 
 
@@ -467,3 +467,8 @@ Can also be set via:
 ue_setReflectionMetadataVisible( true )
 print( ue_isReflectionMetadataVisible() ) -- true
 ```
+
+## TODOs
+- arbitrary object name/base lookups for struct dissector
+- fname/object descryption
+- array limit setting
