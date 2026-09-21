@@ -30,6 +30,7 @@ local Dumper =
   Offsets = {},
   Functions = {},
   Invocation = {},
+  StructureDissect = {},
   API = {},
   State = {},
 }
@@ -176,6 +177,9 @@ Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEBackend', 'UEBacken
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UESignatures', 'UESignatures.lua', 'ceUEDumper.UESignatures' )
 
 local Backend = require('ceUEDumperModules.UEBackend')
+local sharedResources = package.loaded['ceUEDumper.resources']
+
+sharedResources.structureDissectCallbacks = sharedResources.structureDissectCallbacks or {}
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// DUMPER CODE
 
@@ -1656,7 +1660,132 @@ function Dumper.Structures.ue_createStructureFromObject(objectAddress)
 end
 
 
--- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// REFLECTION METADATA VIEWS
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--/// STRUCTURE DISSECT OVERRIDE
+
+--- Resolve UObject, runtime class and display name for an address
+-- Passed addr can be a base or an addr inside the object
+-- @param address number @ possible UObject address or address inside one
+-- @return table|nil @ resolved object context
+-- @return string|nil @ lookup error
+function Dumper.StructureDissect.resolveObjectContext(address)
+  if type(address) ~= 'number' or address == 0 then return nil, 'Address must be non-zero' end
+  if not Backend.isReady() then return nil, 'UE reflection is not initialized' end
+
+  local objectAddress, objectError = Backend.findContainingObject(address)
+  if not objectAddress then return nil, objectError or 'Containing UObject was not found' end
+
+  local classAddress = Backend.objectClass(objectAddress)
+  if not classAddress or classAddress == 0 then return nil, 'Runtime UObject class unavailable' end
+
+  local className = Backend.objectName(classAddress)
+  if not className or className == 'None' then return nil, 'Runtime UObject class name unavailable' end
+
+  local objectName = Backend.objectName(objectAddress)
+  local displayName = 'ceUE.' .. className
+
+  if objectName and objectName ~= 'None' and objectName ~= className then
+    displayName = displayName .. ' [' .. objectName .. ']'
+  end
+
+  return
+  {
+    requestedAddress = address,
+    objectAddress = objectAddress,
+    classAddress = classAddress,
+    className = className,
+    objectName = objectName,
+    displayName = displayName,
+  }
+end
+
+--- Get UObject name and resolved base
+-- @param address number @ address requested by Structure Dissect
+-- @return string|nil @ inferred class/object display name
+-- @return number|nil @ recovered UObject base
+function Dumper.StructureDissect.structureNameLookup(address)
+  local resolved, context = pcall( Dumper.StructureDissect.resolveObjectContext, address )
+  if not resolved or not context then return nil end
+
+  return context.displayName, context.objectAddress
+end
+
+--- Build a struct for a UObject
+-- @param address number @ normalized Structure Dissect base address
+-- @return userdata|nil @ generated CE structure
+function Dumper.StructureDissect.structureDissectOverride(address)
+  local resolved, context = pcall( Dumper.StructureDissect.resolveObjectContext, address )
+
+  if not resolved or not context or context.objectAddress ~= address then return nil end
+
+  local created, structure = pcall( Dumper.Structures.ue_createStructureFromObject, context.objectAddress )
+  if not created or not structure then return nil end
+
+  structure.Name = context.displayName
+  return structure
+end
+
+--- Unregister ceUEDumper callbacks
+-- @return void
+function Dumper.StructureDissect.unregisterCallbacks()
+  local callbacks = sharedResources.structureDissectCallbacks
+
+  if callbacks.nameLookup then
+    pcall( unregisterStructureNameLookup, callbacks.nameLookup )
+    callbacks.nameLookup = nil
+  end
+
+  if callbacks.dissectOverride then
+    pcall( unregisterStructureDissectOverride2, callbacks.dissectOverride )
+    callbacks.dissectOverride = nil
+  end
+end
+
+--- Toggle UObject Struct Dissect resolvers
+-- Unknown addresses are declined to pass down the chain
+-- @param enabled boolean @ true to install the callbacks
+-- @return boolean|nil @ true when the requested state was applied
+-- @return string|nil @ error
+function Dumper.StructureDissect.ue_setStructureDissectEnabled(enabled)
+  assert( type(enabled) == 'boolean', 'enabled must be a boolean' )
+
+  Dumper.StructureDissect.unregisterCallbacks()
+  sharedResources.options.structureDissectEnabled = false
+
+  if not enabled then return true end
+  if not Backend.isReady() then return nil, 'UE reflection is not initialized' end
+
+  local callbacks = sharedResources.structureDissectCallbacks
+  callbacks.nameLookup = registerStructureNameLookup( Dumper.StructureDissect.structureNameLookup, true )
+
+  if not callbacks.nameLookup then return nil, 'Could not register the UObject structure-name lookup' end
+
+  callbacks.dissectOverride = registerStructureDissectOverride2( Dumper.StructureDissect.structureDissectOverride )
+
+  if not callbacks.dissectOverride then
+    Dumper.StructureDissect.unregisterCallbacks()
+    return nil, 'Could not register the UObject structure dissector'
+  end
+
+  sharedResources.options.structureDissectEnabled = true
+  return true
+end
+
+--- Are ceUEDumper Struct Dissect callbacks active
+-- @return boolean @ current automatic-dissection state
+function Dumper.StructureDissect.ue_isStructureDissectEnabled()
+  local callbacks = sharedResources.structureDissectCallbacks
+
+  return sharedResources.options.structureDissectEnabled == true
+         and callbacks.nameLookup ~= nil
+         and callbacks.dissectOverride ~= nil
+end
+
+-- Init
+Dumper.StructureDissect.unregisterCallbacks()
+sharedResources.options.structureDissectEnabled = false
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--/// REFLECTION METADATA VIEWS
 
 --- Build structural metadata layout shared by UClass objects
 -- Unlike an ordinary UObject instance, a UClass must expose its UStruct
@@ -2318,6 +2447,8 @@ Dumper.API =
   ue_enumFlattenedProperties = Dumper.Structures.ue_enumFlattenedProperties,
   ue_createStructureFromType = Dumper.Structures.ue_createStructureFromType,
   ue_createStructureFromObject = Dumper.Structures.ue_createStructureFromObject,
+  ue_setStructureDissectEnabled = Dumper.StructureDissect.ue_setStructureDissectEnabled,
+  ue_isStructureDissectEnabled = Dumper.StructureDissect.ue_isStructureDissectEnabled,
   ue_enumProperties = Dumper.Reflection.ue_enumProperties,
   ue_getPropertyOffset = Dumper.Offsets.ue_getPropertyOffset,
   ue_enumObjectProperties = Dumper.Reflection.ue_enumObjectProperties,

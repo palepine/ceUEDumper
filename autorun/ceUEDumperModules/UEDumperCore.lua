@@ -2625,6 +2625,15 @@ function Core.Objects.isContainingObjectCandidate(candidateObjectAddress, target
   if not objectNameIndex or objectNameIndex == 0 then return false end
   if not Core.Reflection.UObject_getName( candidateObjectAddress ) then return false end
 
+  local classAddress = readPointer( candidateObjectAddress + CUEDEFS.UObject.Class )
+
+  if not classAddress or classAddress == 0 then return false end
+  if not Core.Reflection.UObject_getName(classAddress) then return false end
+
+  -- validated header at requested address is already sufficient
+  -- property validation is only needed when recovering a base from an addr somewhere inside the obj
+  if candidateObjectAddress == targetAddress then return true end
+
   local propertiesByName = Core.Reflection.UObject_enumProperties( candidateObjectAddress )
   if not propertiesByName then return false end
 
@@ -2644,7 +2653,7 @@ end
 -- @param targetAddress number @ address believed to reside inside a UObject
 -- @return number|nil @ containing UObject base address
 -- @return string|nil @ error
-function Core.Objects.findContainingObject(startAddress) -- TODO: adapt in struct dissect view
+function Core.Objects.findContainingObject(startAddress)
   if not (CUEDEFS.UObject and CUEDEFS.UObject.Class and CUEDEFS.UObject.Name) then return nil end
 
   local isContainingObjectCandidate = Core.Objects.isContainingObjectCandidate
@@ -5497,6 +5506,34 @@ function Core.Menu.showCompletedState()
       gui.miUnrealEngine.add( gui.miDissectGWorld )
     end
 
+    if gui.miAutomaticStructureDissect then
+      gui.miAutomaticStructureDissect.destroy()
+    end
+
+    gui.miAutomaticStructureDissect = createMenuItem( gui.miUnrealEngine )
+    gui.miAutomaticStructureDissect.Caption = 'Toggle Struct Guessing'
+    gui.miAutomaticStructureDissect.Name = 'miCeUEDumperAutomaticStructureDissect'
+    gui.miAutomaticStructureDissect.Checked = type(ue_isStructureDissectEnabled) == 'function'
+      and ue_isStructureDissectEnabled()
+    gui.miAutomaticStructureDissect.OnClick = function(menuItem)
+      if type(ue_setStructureDissectEnabled) ~= 'function' then
+        messageDialog( 'ceUEDumper public API is unavailable', mtError, mbOK )
+        return
+      end
+
+      local enabled = not menuItem.Checked
+      local changed, changeError = ue_setStructureDissectEnabled(enabled)
+
+      if not changed then
+        messageDialog( changeError or 'Could not change struct dissect override', mtError, mbOK )
+        return
+      end
+
+      menuItem.Checked = enabled
+    end
+
+    gui.miUnrealEngine.add( gui.miAutomaticStructureDissect )
+
   end)
 
 end
@@ -6411,6 +6448,12 @@ function Core.Process.installProcessOpenedListener()
   -- just store the callback in the state
   hookState.callback = function(processid, processhandle, caption)
     -- local processId = getOpenedProcessID()
+    -- object-layout callbacks retain previous process's addrs
+    -- remove before CE starts querying newly opened process
+    if type(ue_setStructureDissectEnabled) == 'function' then
+      ue_setStructureDissectEnabled(false)
+    end
+
     Core.Menu.destroyUEMenu()
     if type(processid) ~= 'number' or processid <= 0 or processid == 0xFFFFFFFF or processid == 0xFFFFFFFE then return end
     if ueScannerThread then ueScannerThread.Terminate() end
@@ -6497,6 +6540,7 @@ Core.API.classProperties = Core.Reflection.UClass_enumProperties -- Core.API.ue_
 Core.API.scan = Core.Scanner.UEInfoScanner -- Core.API.ue_findRuntimeInternal
 Core.API.probeClassProperties = Core.Reflection.probeClassProperties
 Core.API.propertyMetadata = Core.Reflection.readPropertyMetadata
+Core.API.findContainingObject = Core.Objects.findContainingObject
 Core.API.status = Core.API.ue_getScannerStatusInternal
 Core.API.processEvent = Core.Signatures.resolveProcessEvent
 Core.API.subsystems = Core

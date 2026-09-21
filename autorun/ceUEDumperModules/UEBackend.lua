@@ -217,6 +217,17 @@ function Module.Objects.objectCount()
   return view and view.count or 0
 end
 
+--- Find UObject base owning passed addr
+-- base addrs resolve to themselves
+-- otherwise guessing the base
+-- @param address number @ possible UObject address or address inside one
+-- @return number|nil @ recovered UObject base
+-- @return string|nil @ validation/read error
+function Module.Objects.findContainingObject(address)
+  if not isValidAddress(address) then return nil, 'Address must be non-zero' end
+  return Core.findContainingObject(address)
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// OBJECT/TYPE LOOKUP
 
 --- Capture GUObjectArray fields required by indexed traversal
@@ -1126,6 +1137,7 @@ Module.objectName = Module.Objects.objectName
 Module.objectClass = Module.Objects.objectClass
 Module.findType = Module.Objects.findType
 Module.clearTypeLookupCache = Module.Objects.clearTypeLookupCache
+Module.findContainingObject = Module.Objects.findContainingObject
 
 Module.functions = Module.Functions.functions
 Module.functionForObject = Module.Functions.functionForObject
