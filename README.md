@@ -27,12 +27,7 @@ Copy and merge the `autorun` folder into the root Cheat Engine directory.
 An embedded copy can be loaded using this Lua script (lua script table or via a memrec AutoAssemble script)
 ```lua
 local function loadScriptFromTable(fileName)
-  local CEVersionSupported = 7.7 
-  if getCEVersion() < CEVersionSupported then
-    ShowMessage('Please update CE to' .. CEVersionSupported .. ' or newer')
-    error( 'update to Cheat Engine ' .. CEVersionSupported )
-  end
-  if not fileName then error('Filename invalid') end
+  if isNullOrNil(fileName) then error('Filename invalid') end
   local tableFile = findTableFile( fileName )
   if tableFile == nil then error('No script file found') end
   local fileStream = tableFile.getData()
@@ -58,22 +53,21 @@ See the [currenly supported Lua API reference](docs/API.md).
 
 Provided CE is attached to a supported UE process, you may initialize and test the script with:
 ```lua
-createThread(
-  function()
-    print("will take a while")
+print("will take a while")
 
-    local ready, err = ue_initDumper( { timeout = 120000 } )
-    assert( ready, err )
+local ready, err = ue_initDumper()
+assert( ready, err )
 
-    print("im ok")
+print("im ok")
 
-    local offset, offsetError = ue_getPropertyOffset( 'GameEngine', 'TinyFont' )
-    assert( offset, offsetError )
+local offset, offsetError = ue_getPropertyOffset( 'GameEngine', 'TinyFont' )
+assert( offset, offsetError )
 
-    print( ('GameEngine.TinyFont = 0x%X'):format(offset) )
-  end
-)
+print( ('GameEngine.TinyFont = 0x%X'):format(offset) )
 ```
+
+`ue_initDumper()` is blocking.
+Use `ceUEDumper → Initialize UE reflection` for background init without freezing CE interface
 
 You can quickly resolve offsets (or sequences of offsets) with some runtime obj instance like `UWorld`:
 ```lua

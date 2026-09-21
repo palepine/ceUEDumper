@@ -4,7 +4,7 @@
 
 | Function                                           | Description                                            |
 | -------------------------------------------------- | ------------------------------------------------------ |
-| `ue_initDumper(config)`                            | Init & wait                                            |
+| `ue_initDumper(config)`                            | Blocking initialization                               |
 | `ue_isReady()`                                     | Get ready status                                       |
 | `ue_isNameReady()`                                 | Get cached names status                                |
 | `ue_getStatus()`                                   | Get verbose dumper state                               |
@@ -35,17 +35,18 @@
 ## Initialization
 
 #### `ue_initDumper(config)`
-> Launch the scanner via Lua. Will clear the cache too.
+> Run reflection scan synchronously and clear the lookup cache.
 
-- `config.timeout`: wait in millis, default 30000
 - `config.signatureSelection`: `'first'` (default) or `'scored'`
+- `config.launchScanner`: set to `false` to query existing ready state without starting anew
 
-  > Notes: returns `true` on success, `false, errorMessage` on failure
+  > Returns `true` on success or `false, errorMessage` on failure
+  > Use ceUEDumper menu for asynchronous initialization to keep CE GUI responsive
     
   > First uses signatures to lookup fundamental globals w/o scoring heuristics.
 
 ```lua
-local ready, err = ue_initDumper( { timeout = 120000 } )
+local ready, err = ue_initDumper()
 assert(ready, err)
 ```
 
