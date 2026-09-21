@@ -78,6 +78,9 @@ local PTR_SIZE = 0x8
 Core.State.lastScannerError = nil
 Core.State.scannerRunning = false
 Core.State.signatureSelection = 'first'
+Core.State.scannerGeneration = 0
+Core.State.activeScanner = nil
+Core.State.scannerRuns = setmetatable( {}, { __mode = 'k' } )
 
 local CUEDEFS -- UEDEFS
 
@@ -318,19 +321,46 @@ function Core.Runtime.log(str)
   CUEDEFS.log = CUEDEFS.log .. str .. '\n\r'
 end
 
---- Waits for a CE thread
+--- Waits for CE thread
 -- @param thread userdata @ CE thread object
 -- @param timeout number @ max wait in millis
 -- @return boolean|nil @ wait result
 function Core.Runtime.ue_waitForThreadInternal(thread, timeout)
+  -- worker can call synchronize() while public API waits for it.
+  -- blocking CE main thread in TThread.WaitFor would then deadlock until the timeout
+  -- pump only synchronized callbacks here
+  if inMainThread() then
+    local startedAt = getTickCount()
+
+    while not thread.Finished do
+      checkSynchronize(10)
+
+      if timeout and timeout >= 0 and getTickCount() - startedAt >= timeout then return false end
+      sleep(1)
+    end
+
+    checkSynchronize(0)
+    return true
+  end
+
   if type(thread.waitForThread) == 'function' then
     return thread.waitForThread(timeout)
   elseif type(thread.waitfor) == 'function' then
-    return thread.waitfor(timeout)
+    thread.waitfor(timeout)
+    return thread.Finished
   elseif type(thread.waitFor) == 'function' then
     return thread.waitFor(timeout)
   end
   error('No supported thread wait method in CE')
+end
+
+--- Execute callback on CE main thread
+-- @param callback function @ operation requiring CE main-thread affinity
+-- @param ... any @ callback arguments
+-- @return ... @ callback return values
+function Core.Runtime.onMainThread(callback, ...)
+  if inMainThread() then return callback(...) end
+  return synchronize( callback, ... )
 end
 
 --- Execute func with Lua debugging suspended for performance reasons
@@ -2416,10 +2446,15 @@ end
 
 --- Register matching globals as pGEngine, pGEngine2, and subsequent aliases
 -- @param addresses number[] @ module addresses pointing to the engine instance
--- @return nil
-function Core.Engine.registerEngineGlobalSymbols(addresses)
+-- @param cancellationThread userdata|nil @ scanner worker
+-- @return boolean|nil @ true when all symbols were registered
+-- @return string|nil @ cancellation error
+function Core.Engine.registerEngineGlobalSymbols(addresses, cancellationThread)
 
   for index, address in ipairs(addresses) do
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
+
     local definitionName = 'GEngine'
 
     if index > 1 then definitionName = definitionName .. index end
@@ -2429,9 +2464,11 @@ function Core.Engine.registerEngineGlobalSymbols(addresses)
 
     local relocatableAddress = getNameFromAddress( address, true, false, false )
 
-    ceUEDumperRegisterSymbol( symbolName, relocatableAddress )
+    local published, publishError = Core.Scanner.publishSymbol( symbolName, relocatableAddress, cancellationThread )
+    if not published then return nil, publishError end
   end
 
+  return true
 end
 
 --- Locate module globals pointing to the selected engine instance
@@ -2458,9 +2495,7 @@ function Core.Engine.findEngineGlobals(instanceAddress, cancellationThread)
 
   if #addresses == 0 then return nil, 'No GEngine global pointer found' end
 
-  Core.Engine.registerEngineGlobalSymbols(addresses)
-
-  return true
+  return Core.Engine.registerEngineGlobalSymbols( addresses, cancellationThread )
 end
 
 
@@ -2518,24 +2553,26 @@ end
 --- Register GUObjectArray header verifier type
 -- The custom type validates the common NumElements/MaxElements/count tuple during structural scans
 function Core.CustomTypes.initializeObjectArrayVerifierType()
+  Core.Runtime.onMainThread(
+    function()
+      local typeName = 'ceUEDumper UObjectArray Verifier'
+      local existing = getCustomType(typeName)
 
-  local typeName = 'ceUEDumper UObjectArray Verifier'
-  local existing = getCustomType(typeName)
-  if existing then
-    UObjectArray_Verifier_Type = existing
-    return
-  end
+      if existing then
+        UObjectArray_Verifier_Type = existing
+      else
+        local registrationError
+        UObjectArray_Verifier_Type, registrationError = registerCustomTypeAutoAssembler(cUObjectArrayVerifierType)
 
-  local registrationError
+        if UObjectArray_Verifier_Type == nil then
+          error(registrationError or 'Failed to register GUObjectArray verifier type')
+        end
+      end
 
-  UObjectArray_Verifier_Type, registrationError = registerCustomTypeAutoAssembler(cUObjectArrayVerifierType)
-
-  if UObjectArray_Verifier_Type == nil and registrationError then
-    error(registrationError)
-  end
-
-  UObjectArray_Verifier_Type.InternalOnly = true
-  resources.customTypes[typeName] = UObjectArray_Verifier_Type
+      UObjectArray_Verifier_Type.InternalOnly = true
+      resources.customTypes[typeName] = UObjectArray_Verifier_Type
+    end
+  )
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// FNAME DISPLAY TYPE
@@ -2576,19 +2613,17 @@ end
 -- The eight input bytes are decoded as ComparisonIndex and Number
 -- The index is resolved through the validated cached FNamePool
 function Core.CustomTypes.setupFName()
-  
-  local existing = getCustomType('FName')
+  Core.Runtime.onMainThread(function()
+    -- keep lookup/registration/publication in one main-thread
+    -- so overlapping scanner attempts cannot register twice
+    local existing = getCustomType('FName')
 
-  -- The stable dispatcher follows the current core after reloads
-  resources.fnameConverter = Core.CustomTypes.fnameBytesToValue
-  if existing then
-    resources.customTypes.FName = existing
-    return
-  end
+    -- The stable dispatcher follows the current core after reloads.
+    resources.fnameConverter = Core.CustomTypes.fnameBytesToValue
 
-  if not existing then
-
-    synchronize(function()
+    if existing then
+      resources.customTypes.FName = existing
+    else
       resources.customTypes.FName =
       registerCustomTypeLua(
                               'FName',
@@ -2600,8 +2635,8 @@ function Core.CustomTypes.setupFName()
                             )
 
       assert(resources.customTypes.FName, 'Failed to register FName custom type')
-    end)
-  end
+    end
+  end)
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CORE.OBJECTS
@@ -3023,7 +3058,8 @@ function Core.Objects.locateObjectArray(cancellationThread)
     local scanError
     candidates, scanError = Core.Objects.scanObjectArrayHeaders()
 
-    if cancellationThread and cancellationThread.Terminated then return nil, 'ueScannerThread terminated' end
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
 
     if not candidates then return nil, scanError end
 
@@ -3033,7 +3069,8 @@ function Core.Objects.locateObjectArray(cancellationThread)
 
   end
 
-  if cancellationThread and cancellationThread.Terminated then return nil, 'ueScannerThread terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   if #candidates ~= 1 then return nil, 'Core.Objects.FindObjectArray needs more filtering' end
 
@@ -3740,7 +3777,8 @@ function Core.Names.populateNamePoolMaps( blockCount, pointerList, blockStream, 
   if copied == nil then return nil, 'Read Failed' end
 
   for blockIndex = 0, blockCount - 1 do
-    if cancellationThread and cancellationThread.Terminated then return false, 'ueScannerThread terminated' end
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return false, cancellationError end
 
     local blockAddress = pointerList.readQword()
     if blockAddress == 0 then break end
@@ -4013,7 +4051,8 @@ function Core.NameScan.findLegacyFirstStringBlock(cancellationThread)
 
   local candidates = Core.NameScan.scanLegacyNamePoolMemory( scanSettings ) or {}
 
-  if cancellationThread and cancellationThread.Terminated then return nil, 'ueScannerThread terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   if #candidates == 0 then return nil, 'No known stringpool found' end
 
@@ -4076,7 +4115,8 @@ function Core.NameScan.findLegacyEntryPointerBlock(firstEntryAddress, cancellati
   }
   local candidates = Core.NameScan.scanLegacyNamePoolMemory( scanSettings )
 
-  if cancellationThread and cancellationThread.Terminated then return false, 'ueScannerThread terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return false, cancellationError end
 
   if #candidates == 0 then return nil, 'no list found' end
   if #candidates > 1 then return nil, 'needs more refining' end
@@ -4163,7 +4203,7 @@ function Core.NameScan.scanNamePrefix(pattern, cancellationThread)
 
   while scan.waitTillDone(1000) == false do
 
-    if cancellationThread and cancellationThread.Terminated then
+    if Core.Scanner.getCancellationError(cancellationThread) then
       scan.terminateScan()
     end
 
@@ -4474,7 +4514,8 @@ function Core.NameScan.findNamePoolData(cancellationThread)
   -- possible addresses of the first name-entry block
   local blockCandidates = Core.NameScan.findModernNameBlockCandidates(cancellationThread) -- find None/Byteproperty block in modern layouts
 
-  if cancellationThread and cancellationThread.Terminated then return false, 'ueScannerThread terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return false, cancellationError end
 
   if #blockCandidates == 0 then -- legacy fallback
     return Core.NameScan.selectLegacyNamePool(cancellationThread)
@@ -4486,7 +4527,8 @@ function Core.NameScan.findNamePoolData(cancellationThread)
   -- └─ return possible FNameEntryAllocator::Blocks[0] locations
   local references = Core.NameScan.scanNameBlockReferences( blockCandidates )
 
-  if cancellationThread and cancellationThread.Terminated then return false, 'ueScannerThread terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return false, cancellationError end
 
   -- when several results, inspect neighboring Blocks[] pointers,
   -- accept candidates whose following block pointers are null/point to allocations having the expected block size
@@ -5317,6 +5359,93 @@ function Core.Signatures.selectNamePoolFromSignature()
   return false
 end
 
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// SCANNER RUN OWNERSHIP
+
+--- Return scanner run associated with a worker thread
+-- @param cancellationThread userdata|nil @ scanner worker
+-- @return table|nil @ immutable run identity
+function Core.Scanner.getRun(cancellationThread)
+  if not cancellationThread then return nil end
+
+  local mappedRun = Core.State.scannerRuns[cancellationThread]
+  if mappedRun then return mappedRun end
+
+  local activeRun = Core.State.activeScanner
+  if activeRun and activeRun.generation == Core.State.scannerGeneration then
+    return activeRun
+  end
+
+  return nil
+end
+
+--- Check if scanner worker still owns active process/run
+-- @param cancellationThread userdata|nil @ scanner worker; nil permits direct scans
+-- @return boolean @ true when publishing results remains valid
+function Core.Scanner.isRunCurrent(cancellationThread)
+  if not cancellationThread then return true end
+
+  local run = Core.Scanner.getRun(cancellationThread)
+  if not run or run.cancelled then return false end
+  if Core.State.activeScanner ~= run then return false end
+  return Core.State.scannerGeneration == run.generation
+end
+
+--- Return cancellation/staleness error for scanner worker
+-- @param cancellationThread userdata|nil @ scanner worker
+-- @return string|nil @ error when the run must stop
+function Core.Scanner.getCancellationError(cancellationThread)
+  if Core.Scanner.isRunCurrent(cancellationThread) then return nil end
+  return 'ueScannerThread terminated or superseded by another process'
+end
+
+--- Gracefully invalidate active scanner
+-- @return nil
+function Core.Scanner.cancelActiveRun(reason)
+  Core.State.scannerGeneration = Core.State.scannerGeneration + 1
+  -- the worker retains its handle until it has actually finished
+  -- remaining synchronized callbacks are rejected by run-generation checks
+
+  local run = Core.State.activeScanner
+  if not run then return end
+
+  run.cancelled = true
+  run.cancelReason = reason or 'cancelled'
+  Core.State.scannerRunning = false
+  if run.thread and not run.finished and not run.thread.Finished then run.thread.Terminate() end
+end
+
+--- Publish scanner-owned symbol atomically with respect to process changes
+-- @param name string @ symbol name
+-- @param address number|string @ address or relocatable expression
+-- @param cancellationThread userdata|nil @ scanner worker
+-- @return boolean|nil @ true when published
+-- @return string|nil @ cancellation error
+function Core.Scanner.publishSymbol(name, address, cancellationThread)
+  -- process-open callback runs on same main thread
+  -- so final ownership check and symbol mutation cannot be interleaved with attachment
+  return Core.Runtime.onMainThread(function()
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
+
+    ceUEDumperRegisterSymbol( name, address )
+    return true
+  end)
+end
+
+--- Stage persisted setting until the scanner run commits successfully
+-- @param savedSettings table|userdata @ persistent settings destination
+-- @param key string @ setting name
+-- @param value any @ setting value
+-- @param cancellationThread userdata|nil @ scanner worker
+-- @return nil
+function Core.Scanner.stageSetting(savedSettings, key, value, cancellationThread)
+  local run = Core.Scanner.getRun(cancellationThread)
+
+  if run then  run.pendingSettings[key] = value
+  else         savedSettings[key] = value
+  end
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CORE.MENU
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// MENU LIFETIME
@@ -5324,6 +5453,8 @@ end
 --- Remove main menu items. Must run on the CE main thread
 -- @return void
 function Core.Menu.destroyUEMenu()
+  if not inMainThread() then return Core.Runtime.onMainThread(Core.Menu.destroyUEMenu) end
+
   local menuRoot = MainForm.Menu.Items
 
   for index = menuRoot.Count - 1, 0, -1 do
@@ -5341,7 +5472,7 @@ end
 --- Create a menu item
 -- @param scanning boolean|nil @ show worker progress controls when true
 -- @return void
-function Core.Menu.createUEMenu(scanning)
+function Core.Menu.createUEMenu(scanning, cancellationThread)
   Core.Runtime.log('Creating menuitem')
 
   --- Invoke the public portable-table packager from the isolated core
@@ -5409,7 +5540,9 @@ function Core.Menu.createUEMenu(scanning)
     gui.miStatus.Caption = 'Working (click to cancel)'
     gui.miStatus.OnClick = function()
       if ueScannerThread and ( messageDialog( 'Cancel the UE data collection?', mtConfirmation, mbYes, mbNo ) == mrYes ) then
-        ueScannerThread.Terminate()
+        Core.Scanner.cancelActiveRun('user')
+        gui.miStatus.Caption = 'Cancelling...'
+        gui.miStatus.OnClick = nil
       end
     end
     gui.miUnrealEngine.add(gui.miStatus)
@@ -5425,7 +5558,8 @@ function Core.Menu.createUEMenu(scanning)
     gui.miUnrealEngine.add(gui.miHurry)
   end
 
-  synchronize(function()
+  Core.Runtime.onMainThread(function()
+    if not Core.Scanner.isRunCurrent(cancellationThread) then return end
 
     Core.Menu.destroyUEMenu()
     CUEDEFS.GUI = {}
@@ -5452,16 +5586,26 @@ end
 --- Update the scanner status in menu item
 -- @param caption string @ status text
 -- @return nil
-function Core.Menu.setScannerStatus(caption)
-  synchronize( function() CUEDEFS.GUI.miStatus.Caption = caption end )
+function Core.Menu.setScannerStatus(caption, cancellationThread)
+  Core.Runtime.onMainThread(
+    function()
+      if not Core.Scanner.isRunCurrent(cancellationThread) then return end
+
+      local gui = CUEDEFS and CUEDEFS.GUI
+      if gui and gui.miStatus then gui.miStatus.Caption = caption end
+    end
+  )
 end
 
 --- Replace scan controls with the completed dumper menu
 -- @return nil
-function Core.Menu.showCompletedState()
+function Core.Menu.showCompletedState(cancellationThread)
   
-  synchronize(function()
-    local gui = CUEDEFS.GUI
+  Core.Runtime.onMainThread(function()
+    if not Core.Scanner.isRunCurrent(cancellationThread) then return end
+
+    local gui = CUEDEFS and CUEDEFS.GUI
+    if not gui or not gui.miUnrealEngine then return end
 
     if gui.miStatus then
       gui.miStatus.destroy()
@@ -5544,6 +5688,8 @@ end
 -- @param globalSymbol string @ symbol containing the UObject pointer
 -- @return nil
 function Core.Menu.dissectGlobal(globalSymbol)
+  if not inMainThread() then return Core.Runtime.onMainThread( Core.Menu.dissectGlobal, globalSymbol ) end
+
   local pointerExpression = '[' .. globalSymbol .. ']'
   local instanceAddress = getAddressSafe(pointerExpression)
 
@@ -5606,7 +5752,8 @@ end
 function Core.Persistence.restoreDefinitions(savedSettings)
   --load all fields and offsets
   --load the CUEDEFS data from the registry
-  local savedDefinitions = savedSettings.getValueList()
+  local getValueList = savedSettings.getValueList
+  local savedDefinitions = type(getValueList) == 'function' and getValueList() or savedSettings
 
   for settingName, value in pairs( savedDefinitions ) do
 
@@ -5633,10 +5780,12 @@ function Core.Persistence.restoreDefinitions(savedSettings)
 
 end
 
---- Restore saved global addresses and the relocatable GEngine symbol
+--- Restore saved global addresses and relocatable engine/world symbols
 -- @param savedSettings table|userdata @ persisted scanner settings
--- @return nil
-function Core.Persistence.restoreGlobalAddresses(savedSettings)
+-- @param cancellationThread userdata|nil @ scanner worker
+-- @return boolean|nil @ true when restoration remains current
+-- @return string|nil @ cancellation error
+function Core.Persistence.restoreGlobalAddresses(savedSettings, cancellationThread)
   CUEDEFS.NamePoolData = getAddressSafe( savedSettings.NamePoolData )
   CUEDEFS.ObjectArray = getAddressSafe( savedSettings.ObjectArray )
   CUEDEFS.GEngine = getAddressSafe( savedSettings.GEngine )
@@ -5649,23 +5798,32 @@ function Core.Persistence.restoreGlobalAddresses(savedSettings)
   end
 
   if CUEDEFS.GEngine then
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
     local symbolName = getNameFromAddress( CUEDEFS.GEngine, true, false, false )
-    local processName = extractFileNameWithoutExt(process)
+    local run = Core.Scanner.getRun(cancellationThread)
+    local processName = extractFileNameWithoutExt( run and run.processName or process )
 
     if symbolName:find( processName, nil, true ) then
-      ceUEDumperRegisterSymbol( 'pGEngine', symbolName )
+      local published, publishError = Core.Scanner.publishSymbol( 'pGEngine', symbolName, cancellationThread )
+      if not published then return nil, publishError end
     end
   end
 
   if CUEDEFS.GWorld then
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
     local symbolName = getNameFromAddress( CUEDEFS.GWorld, true, false, false )
-    local processName = extractFileNameWithoutExt(process)
+    local run = Core.Scanner.getRun(cancellationThread)
+    local processName = extractFileNameWithoutExt( run and run.processName or process )
 
     if symbolName:find( processName, nil, true ) then
-      ceUEDumperRegisterSymbol( 'pGWorld', symbolName )
+      local published, publishError = Core.Scanner.publishSymbol( 'pGWorld', symbolName, cancellationThread )
+      if not published then return nil, publishError end
     end
   end
 
+  return true
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// LAYOUT STORE
@@ -5745,16 +5903,28 @@ function Core.Scanner.initializeScannerState(cancellationThread)
     cancellationThread.Name = 'ueScannerThread'
   end
 
-  local processId = getOpenedProcessID()
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
-  if CUEDEFS and CUEDEFS.processid == processId then return end
+  local run = Core.Scanner.getRun(cancellationThread)
+  local processId = run and run.processId or getOpenedProcessID()
+
+  if CUEDEFS and CUEDEFS.processid == processId then return true end
 
   --start from scratch
-  synchronize(Core.Menu.destroyUEMenu)
+  Core.Runtime.onMainThread(
+    function()
+      if Core.Scanner.isRunCurrent(cancellationThread) then Core.Menu.destroyUEMenu() end
+    end
+  )
+
+  cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   CUEDEFS = {}
   CUEDEFS.processid = processId
-  Core.Menu.createUEMenu(true)
+  Core.Menu.createUEMenu( true, cancellationThread )
+  return true
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// SHARED NAME INITIALIZATION
@@ -5816,18 +5986,28 @@ end
 -- @return boolean|nil @ true when restoration succeeds
 -- @return string|nil @ error
 function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
+
   Core.Runtime.log('The state was fully parsed. Using it')
 
   Core.Persistence.restoreDefinitions(savedSettings)
 
+  cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
+
   --cache the namepool data
-  Core.Menu.createUEMenu(true)
-  Core.Persistence.restoreGlobalAddresses(savedSettings)
+  Core.Menu.createUEMenu( true, cancellationThread )
+  local restored, restoreError = Core.Persistence.restoreGlobalAddresses( savedSettings, cancellationThread )
+  if not restored then return nil, restoreError end
+
+  cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   --todo: use the function method instead until specifically requested to cache the names
   Core.Runtime.log('Loading FName table')
 
-  Core.Menu.setScannerStatus('Loading FName table')
+  Core.Menu.setScannerStatus( 'Loading FName table', cancellationThread )
 
   if CUEDEFS.NamePoolData == nil then
     --can happen in the old stringpool forma
@@ -5838,15 +6018,25 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
   local ready, cacheError = Core.Scanner.cacheScannerNames(cancellationThread)
   if not ready then return nil, cacheError end
 
+  cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
+
   Core.Scanner.findScannerNameConversion() -- TODO: make use FName::ToString as a fallback
+
+  cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   if not CUEDEFS.GWorld then
     CUEDEFS.GWorld = Core.Signatures.ue_findUObjectGlobalBySignaturesInternal( 'GWorld', 'World' )
 
     if CUEDEFS.GWorld then
+      local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+      if cancellationError then return nil, cancellationError end
+
       local relocatableAddress = getNameFromAddress( CUEDEFS.GWorld, true, false, false )
-      savedSettings.GWorld = relocatableAddress
-      ceUEDumperRegisterSymbol( 'pGWorld', relocatableAddress )
+      Core.Scanner.stageSetting( savedSettings, 'GWorld', relocatableAddress, cancellationThread )
+      local published, publishError = Core.Scanner.publishSymbol( 'pGWorld', relocatableAddress, cancellationThread )
+      if not published then return nil, publishError end
     end
 
   end
@@ -5889,20 +6079,26 @@ function Core.Scanner.findScannerNames(savedSettings, cancellationThread)
 
     local symbolName = getNameFromAddress( CUEDEFS.NamePoolData, true, false, false )
     if symbolName:find( extractFileNameWithoutExt(process), nil, true ) then
-      savedSettings.NamePoolData = getNameFromAddress( CUEDEFS.NamePoolData ) -- It is a module address; save it as a relocatable symbol
+      Core.Scanner.stageSetting(
+                                savedSettings,
+                                'NamePoolData',
+                                getNameFromAddress(CUEDEFS.NamePoolData), -- module-relative address
+                                cancellationThread
+                              )
     end
 
   end
 
-  if cancellationThread and cancellationThread.Terminated then return nil, 'UEInfoScanner terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   --still here, notify that there is some unreal info available
-  Core.Menu.createUEMenu(true)
+  Core.Menu.createUEMenu( true, cancellationThread )
 
   if CUEDEFS.NameToIndex == nil then
     Core.Runtime.log( 'Building FName lookup table' )
 
-    Core.Menu.setScannerStatus( 'Building FName lookup table' )
+    Core.Menu.setScannerStatus( 'Building FName lookup table', cancellationThread )
 
     local ready, cacheError = Core.Scanner.cacheScannerNames( cancellationThread )
     if not ready then return nil, cacheError end
@@ -5911,7 +6107,8 @@ function Core.Scanner.findScannerNames(savedSettings, cancellationThread)
   -- resolve FName::ToString
   Core.Scanner.findScannerNameConversion()
 
-  if cancellationThread and cancellationThread.Terminated then return nil, 'UEInfoScanner terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   return true
 end
@@ -5936,7 +6133,7 @@ function Core.Scanner.findScannerObjects(savedSettings, cancellationThread)
   if CUEDEFS.ObjectArray ~= nil and CUEDEFS.UObject ~= nil then return true end
 
   Core.Runtime.log('Scanning for object table')
-  Core.Menu.setScannerStatus('Scanning for object table')
+  Core.Menu.setScannerStatus( 'Scanning for object table', cancellationThread )
 
   -- signature
   if CUEDEFS.ObjectArray == nil then
@@ -5963,7 +6160,12 @@ function Core.Scanner.findScannerObjects(savedSettings, cancellationThread)
   local ready, scanError = Core.Objects.FindObjectArray(cancellationThread)
   if not ready then   return nil, 'Core.Objects.FindObjectArray failed: ' .. (scanError or 'No error given')    end
 
-  savedSettings.ObjectArray = getNameFromAddress( CUEDEFS.ObjectArray, true, false, false )
+  Core.Scanner.stageSetting(
+                            savedSettings,
+                            'ObjectArray',
+                            getNameFromAddress( CUEDEFS.ObjectArray, true, false, false ),
+                            cancellationThread
+                          )
 
   return true
 end
@@ -5979,7 +6181,7 @@ function Core.Scanner.findScannerEngine(savedSettings, cancellationThread)
   if CUEDEFS.UGameEngine ~= nil then return true end
 
   Core.Runtime.log('Searching for GEngine')
-  Core.Menu.setScannerStatus('Searching for GEngine')
+  Core.Menu.setScannerStatus( 'Searching for GEngine', cancellationThread )
 
   CUEDEFS.GEngine = Core.Signatures.ue_findUObjectGlobalBySignaturesInternal('GEngine')
 
@@ -6007,20 +6209,28 @@ function Core.Scanner.findScannerEngine(savedSettings, cancellationThread)
   end
 
   if CUEDEFS.GEngine and CUEDEFS.GEngine ~= 0 then
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
+
     local relocatableAddress = getNameFromAddress( CUEDEFS.GEngine, true, false, false )
-    savedSettings.GEngine = relocatableAddress
-    ceUEDumperRegisterSymbol( 'pGEngine', relocatableAddress )
+    Core.Scanner.stageSetting( savedSettings, 'GEngine', relocatableAddress, cancellationThread )
+    local published, publishError = Core.Scanner.publishSymbol( 'pGEngine', relocatableAddress, cancellationThread )
+    if not published then return nil, publishError end
   end
 
   Core.Runtime.log('Searching for GWorld')
-  Core.Menu.setScannerStatus('Searching for GWorld')
+  Core.Menu.setScannerStatus( 'Searching for GWorld', cancellationThread )
 
   CUEDEFS.GWorld = Core.Signatures.ue_findUObjectGlobalBySignaturesInternal('GWorld', 'World')
 
   if CUEDEFS.GWorld and CUEDEFS.GWorld ~= 0 then
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
+
     local relocatableAddress = getNameFromAddress( CUEDEFS.GWorld, true, false, false )
-    savedSettings.GWorld = relocatableAddress
-    ceUEDumperRegisterSymbol( 'pGWorld', relocatableAddress )
+    Core.Scanner.stageSetting( savedSettings, 'GWorld', relocatableAddress, cancellationThread )
+    local published, publishError = Core.Scanner.publishSymbol( 'pGWorld', relocatableAddress, cancellationThread )
+    if not published then return nil, publishError end
     Core.Runtime.log( ('SIG: GWorld instance is 0x%X'):format( readPointer( CUEDEFS.GWorld ) or 0 ) )
   else
     Core.Runtime.log('SIG: no validated GWorld target; UWorld dissection is unavailable')
@@ -6195,11 +6405,12 @@ end
 -- @return string|nil @ error
 function Core.Scanner.findScannerPropertyLayout(cancellationThread)
 
-  if cancellationThread and cancellationThread.Terminated then return nil, 'ueScannerThread terminated' end
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
 
   --everything ok so far. Try to find the layout of Property Field objects.  Can be either UProperty or FProperty. Doesn't matter
   Core.Runtime.log( 'Figuring out the other offsets (Core.PropertyLayout.findGameInstanceFPropertyAndFields) ' )
-  Core.Menu.setScannerStatus('Figuring out offsets')
+  Core.Menu.setScannerStatus( 'Figuring out offsets', cancellationThread )
 
   local ready, layoutError = Core.PropertyLayout.findGameInstanceFPropertyAndFields(cancellationThread)
 
@@ -6219,24 +6430,44 @@ end
 function Core.Scanner.findIncompleteScannerRuntime(savedSettings, cancellationThread)
   Core.Runtime.log( 'New or incomplete state' )
 
-  local ready, stageError = Core.Scanner.findScannerNames(savedSettings, cancellationThread)
+  --- Run discovery stage only while this worker still owns the active scan
+  -- @param stage function @ scanner stage
+  -- @param ... any @ stage arguments
+  -- @return boolean|nil @ stage result
+  -- @return string|nil @ stage/cancellation error
+  local function runStage(stage, ...)
+    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
+
+    local ready, stageError = stage(...)
+    if not ready then return ready, stageError end
+
+    cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
+
+    return ready
+  end
+
+  local ready, stageError = runStage( Core.Scanner.findScannerNames, savedSettings, cancellationThread )
   if not ready then return nil, stageError end
 
-  ready, stageError = Core.Scanner.findScannerObjects(savedSettings, cancellationThread)
+  ready, stageError = runStage( Core.Scanner.findScannerObjects, savedSettings, cancellationThread )
   if not ready then return nil, stageError end
 
-  ready, stageError = Core.Scanner.findScannerEngine(savedSettings, cancellationThread)
+  ready, stageError = runStage( Core.Scanner.findScannerEngine, savedSettings, cancellationThread )
   if not ready then return nil, stageError end
 
-  ready, stageError = Core.Scanner.resolveScannerEngineClass()
+  ready, stageError = runStage( Core.Scanner.resolveScannerEngineClass )
   if not ready then return nil, stageError end
 
-  ready, stageError = Core.Scanner.findScannerSuperStruct()
+  ready, stageError = runStage( Core.Scanner.findScannerSuperStruct )
   if not ready then return nil, stageError end
 
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
   Core.Scanner.selectScannerGameEngineBase()
 
-  return Core.Scanner.findScannerPropertyLayout(cancellationThread)
+  return runStage( Core.Scanner.findScannerPropertyLayout, cancellationThread )
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// SCANNER ENTRY POINT
@@ -6254,21 +6485,35 @@ function Core.Scanner.UEInfoScanner(cancellationThread)
   --can be called directly or with a thread
   Core.Runtime.log('UEInfoScanner start')
 
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
   if process == nil then return false, 'No process selected' end
 
-  -- calculate hash for a chunk of file data
-  local versionIdentifier = Core.Persistence.getVersionIdentifier()
+  local run = Core.Scanner.getRun(cancellationThread)
+  local processName = run and run.processName or process
+  local settingsKey
+  local savedSettings
+  local persistentSettings
 
-  if versionIdentifier == nil then
-    Core.Runtime.log('file and main module unreadable')
-    return false
+  if run then
+    settingsKey = run.settingsKey
+    savedSettings = run.settingsSnapshot
+    persistentSettings = run.persistentSettings
+  else
+    -- Direct scans execute without a managed worker and retain the historical
+    -- immediate Settings-object path.
+    local versionIdentifier = Core.Persistence.getVersionIdentifier()
+    if versionIdentifier == nil then return false, 'file and main module unreadable' end
+
+    settingsKey = 'ceUEDumper\\Layouts\\CUEDEFS\\' .. processName .. '-' .. versionIdentifier
+    persistentSettings = getSettings( settingsKey, true )
+    savedSettings = persistentSettings
   end
 
-  local settingsKey = 'ceUEDumper\\Layouts\\CUEDEFS\\' .. process .. '-' .. versionIdentifier
   Core.Runtime.log( 'Settings key: ' .. settingsKey)
-  local savedSettings = getSettings( settingsKey, true )
 
-  Core.Scanner.initializeScannerState(cancellationThread)
+  local initialized, stateError = Core.Scanner.initializeScannerState(cancellationThread)
+  if not initialized then return nil, stateError end
 
   --[[
   check the settings if everything has already been found, or if only a subset was found so far.
@@ -6286,12 +6531,34 @@ function Core.Scanner.UEInfoScanner(cancellationThread)
 
   if not ready then return ready, initializationError end
 
-  -- store the layout for quick repeated lookups (reruns)
-  Core.Persistence.saveLayout(savedSettings)
+  cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, cancellationError end
+
+  -- commit process-specific persistence on the main thread
+  -- final ownership check is atomic with CE process-open callback
+  local saved, saveError = Core.Runtime.onMainThread(
+    function()
+      local currentError = Core.Scanner.getCancellationError(cancellationThread)
+      if currentError then return nil, currentError end
+
+      local currentRun = Core.Scanner.getRun(cancellationThread)
+
+      if currentRun then
+        for key, value in pairs(currentRun.pendingSettings) do
+          persistentSettings[key] = value
+        end
+      end
+
+      Core.Persistence.saveLayout(persistentSettings)
+      return true
+    end
+  )
+
+  if not saved then return nil, saveError end
 
   Core.Runtime.log('success. Runtime initialized; external structure callbacks are not adopted')
   
-  Core.Menu.showCompletedState()
+  Core.Menu.showCompletedState(cancellationThread)
 
   return ready
 end
@@ -6302,42 +6569,134 @@ end
 -- @param timeout number @ maximum wait in milliseconds
 -- @return boolean|nil @ CE thread wait result
 function Core.Scanner.WaitForUnrealEngineInfo(timeout)
-  if ueScannerThread then
-    ueScannerThread.Priority = 'tpHigher' -- poke scheduler
-    return Core.Runtime.ue_waitForThreadInternal( ueScannerThread, timeout )
+  local run = Core.State.activeScanner
+  local worker = run and run.thread or ueScannerThread
+
+  if worker then
+    worker.Priority = 'tpHigher' -- poke scheduler
+    return Core.Runtime.ue_waitForThreadInternal( worker, timeout )
   end
 
   return true
 end
 
+--- Run reflection discovery synchronously on Cheat Engine's main thread
+-- A blocking Lua caller must not start a same-state Lua worker and then wait
+-- for it: the caller can retain the Lua-state lock and starve the scanner.
+-- Menu-triggered discovery continues to use LaunchUEInfoScanner instead.
+-- @return boolean|nil @ true when initialization succeeds
+-- @return string|nil @ discovery error
+function Core.Scanner.RunUEInfoScannerSynchronously()
+  if not inMainThread() then
+    return Core.Runtime.onMainThread(Core.Scanner.RunUEInfoScannerSynchronously)
+  end
+
+  local activeRun = Core.State.activeScanner
+
+  if activeRun and activeRun.thread and not activeRun.finished and not activeRun.thread.Finished then
+    return nil, 'A background UE scanner is already running'
+  end
+
+  if activeRun and activeRun.thread then
+    local finishedWorker = activeRun.thread
+    Core.State.scannerRuns[finishedWorker] = nil
+    if ueScannerThread == finishedWorker then ueScannerThread = nil end
+    Core.State.activeScanner = nil
+    finishedWorker.destroy()
+  end
+
+  Core.State.scannerGeneration = Core.State.scannerGeneration + 1
+  Core.State.scannerRunning = true
+  Core.State.lastScannerError = nil
+
+  local called, scannerResult, scannerError = xpcall(
+    function() return Core.Scanner.UEInfoScanner(nil) end,
+    debug.traceback
+  )
+
+  Core.State.scannerRunning = false
+
+  if not called then
+    scannerError = scannerResult
+    scannerResult = nil
+  end
+
+  if scannerResult then return scannerResult end
+
+  Core.State.lastScannerError = scannerError or 'UEInfoScanner returned no result'
+  Core.Menu.createUEMenu(false)
+  return nil, Core.State.lastScannerError
+end
+
 --- Spawn a worker to scan UE runtime. entry point
 function Core.Scanner.LaunchUEInfoScanner()
-  
-  if ueScannerThread and Core.State.scannerRunning then
-    ueScannerThread.Priority = 'tpHigher' -- increase scheduler priority if not finished
-    return
-  end
+  local activeRun = Core.State.activeScanner
 
-  -- not running, should terminate
-  if ueScannerThread then
-    ueScannerThread.Terminate()
-    
-    if Core.Runtime.ue_waitForThreadInternal( ueScannerThread, 5000 ) then
-      ueScannerThread.destroy()
-      ueScannerThread = nil
+  if activeRun and activeRun.thread then
+    if activeRun.finished or activeRun.thread.Finished then
+      local finishedWorker = activeRun.thread
+      Core.State.scannerRuns[finishedWorker] = nil
+
+      if ueScannerThread == finishedWorker then ueScannerThread = nil end
+      if Core.State.activeScanner == activeRun then Core.State.activeScanner = nil end
+      finishedWorker.destroy()
+    else
+      if not activeRun.cancelled and activeRun.processId == getOpenedProcessID() then
+        activeRun.thread.Priority = 'tpHigher'
+        return true
+      end
+
+      return nil, 'Previous UE scanner is still shutting down'
     end
-    ueScannerThread = nil
   end
 
-  Core.State.scannerRunning = true
-  Core.Menu.createUEMenu(true)
+  local processId = getOpenedProcessID()
+  if type(processId) ~= 'number' or processId <= 0 or processId == 0xFFFFFFFF or processId == 0xFFFFFFFE then
+    return nil, 'No process selected'
+  end
 
-  ueScannerThread = createThread(function(t)
+  -- CE streams and Settings objects are created on the main thread before the
+  -- worker starts. The scanner receives only a plain table snapshot and the
+  -- persistent object is touched again only during its guarded final commit.
+  local processName = process
+  local versionIdentifier = Core.Persistence.getVersionIdentifier()
+
+  if versionIdentifier == nil then return nil, 'Executable identity could not be read' end
+
+  local settingsKey = 'ceUEDumper\\Layouts\\CUEDEFS\\' .. processName .. '-' .. versionIdentifier
+  local persistentSettings = getSettings( settingsKey, true )
+  local settingsSnapshot = persistentSettings.getValueList() or {}
+
+  Core.State.scannerGeneration = Core.State.scannerGeneration + 1
+
+  local run =
+  {
+    generation = Core.State.scannerGeneration,
+    processId = processId,
+    processName = processName,
+    settingsKey = settingsKey,
+    settingsSnapshot = settingsSnapshot,
+    persistentSettings = persistentSettings,
+    cancelled = false,
+    finished = false,
+    pendingSettings = {},
+  }
+
+  local worker = createThreadSuspended(function(t)
+    -- bind callback's actual Thread wrapper before any ownership check
+    Core.State.scannerRuns[t] = run
+    run.thread = t
+    ueScannerThread = t
+
+    t.FreeOnTerminate(false)
     Core.State.lastScannerError = nil
 
     Core.Runtime.log('ueScannerThread started')
 
-    t.Priority = 'tpIdle' -- runs when other processes are idle
+    -- t.Priority = 'tpIdle'
+
+    -- testing normal
+    t.Priority = 'tpNormal'
 
     local scannerResult, scannerError
     local succeeded
@@ -6350,25 +6709,46 @@ function Core.Scanner.LaunchUEInfoScanner()
     end
 
 
-    Core.Runtime.log('ueScannerThread finished')
-    Core.State.scannerRunning = false
+    local isCurrentRun = Core.Scanner.isRunCurrent(t)
 
-    if scannerResult then
-      Core.Runtime.log('UEInfoScanner: Success')
-      synchronize( function() CUEDEFS.GUI.miUnrealEngine.Caption = 'ceUEDumper' end )
-    else
-      Core.State.lastScannerError = scannerError or 'UEInfoScanner returned no result'
-      
-      if scannerError then
-        Core.Runtime.log('UEInfoScanner failure:' .. scannerError)
+    if isCurrentRun then
+      Core.Runtime.log('ueScannerThread finished')
+      Core.State.scannerRunning = false
+
+      if scannerResult then
+        Core.Runtime.log('UEInfoScanner: Success')
       else
-        Core.Runtime.log('UEInfoScanner failure (???)')
-      end
+        Core.State.lastScannerError = scannerError or 'UEInfoScanner returned no result'
 
+        if scannerError then
+          Core.Runtime.log('UEInfoScanner failure:' .. scannerError)
+        else
+          Core.Runtime.log('UEInfoScanner failure (???)')
+        end
+
+        Core.Menu.createUEMenu( false, t )
+      end
+    end
+
+    -- Manual cancellation keeps the current process open
+    -- restore the idle menu once the worker has really stopped
+    -- process-switch cancellation won't publish UI into newly attached process
+    if run.cancelled and run.cancelReason == 'user' and Core.State.activeScanner == run then
       Core.Menu.createUEMenu(false)
     end
 
+    run.finished = true
   end)
+
+  run.thread = worker
+  Core.State.scannerRuns[worker] = run
+  Core.State.activeScanner = run
+  Core.State.scannerRunning = true
+  ueScannerThread = worker
+
+  Core.Menu.createUEMenu( true, worker )
+  worker.resume()
+  return true
 end
 
 
@@ -6428,13 +6808,22 @@ function Core.Process.detectUnrealProcess(processId)
       end
     end
 
-    if isUnreal and getOpenedProcessID() == processId then Core.Menu.createUEMenu(false) end
+    if isUnreal then
+      Core.Runtime.onMainThread(
+        function()
+          if getOpenedProcessID() == processId and not Core.State.scannerRunning then
+            Core.Menu.createUEMenu(false)
+          end
+        end
+      )
+    end
   end)
 end
 
 --- Install a reload-safe OnProcessOpened listener
 -- @return void
 function Core.Process.installProcessOpenedListener()
+  if not inMainThread() then return Core.Runtime.onMainThread(Core.Process.installProcessOpenedListener) end
 
   -- we preserve the hook state through it
   local hookState = package.loaded[ 'ceUEDumper.processOpenedHook' ]
@@ -6454,9 +6843,9 @@ function Core.Process.installProcessOpenedListener()
       ue_setStructureDissectEnabled(false)
     end
 
+    Core.Scanner.cancelActiveRun('process-change')
     Core.Menu.destroyUEMenu()
     if type(processid) ~= 'number' or processid <= 0 or processid == 0xFFFFFFFF or processid == 0xFFFFFFFE then return end
-    if ueScannerThread then ueScannerThread.Terminate() end
     Core.Process.detectUnrealProcess(processid)
   end
 
@@ -6497,6 +6886,7 @@ end
 function Core.API.ue_getScannerStatusInternal()
 
   local ready = type(CUEDEFS) == 'table'
+                and CUEDEFS.processid == getOpenedProcessID()
                 and type( CUEDEFS.UObject ) == 'table'
                 and type( CUEDEFS.UClass ) == 'table'
                 and type( CUEDEFS.FProperty ) == 'table'
@@ -6534,6 +6924,7 @@ Core.API.configureSignatures =
 Core.API.definitions = Core.API.ue_getDefinitionsInternal
 Core.API.launch = Core.Scanner.LaunchUEInfoScanner -- Core.API.ue_scannerLaunchInternal
 Core.API.wait = Core.Scanner.WaitForUnrealEngineInfo -- Core.API.ue_scannerWaitInternal
+Core.API.initialize = Core.Scanner.RunUEInfoScannerSynchronously
 Core.API.objectName = Core.Reflection.UObject_getName -- Core.API.ue_objectGetNameInternal
 Core.API.objectProperties = Core.Reflection.UObject_enumProperties -- Core.API.ue_objectEnumPropertiesInternal
 Core.API.classProperties = Core.Reflection.UClass_enumProperties -- Core.API.ue_classEnumPropertiesInternal

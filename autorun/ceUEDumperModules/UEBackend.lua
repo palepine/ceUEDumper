@@ -31,6 +31,15 @@ local CHUNK_SIZE = 0x10000
 local MAX_OBJECTS = 0x1000000
 local PTR_SIZE = 0x8
 
+--- Execute CE registry/UI resource mutations on the main thread
+-- @param callback function @ operation requiring main-thread affinity
+-- @param ... any @ callback arguments
+-- @return ... @ callback return values
+local function onMainThread(callback, ...)
+  if inMainThread() then return callback(...) end
+  return synchronize( callback, ... )
+end
+
 -- incremental reflected-type index for current object-array layout
 -- each GUObjectArray entry is decoded at most once between cache resets
 local typeLookupState
@@ -62,16 +71,19 @@ local function loadCore()
   }
 
   local attachmentName = 'ceUEDumper.UEDumperCore'
-  local tableFile = type(findTableFile) == 'function' and findTableFile(attachmentName)
-  local sourceText
+  local function readAttachedSource()
+    local tableFile = type(findTableFile) == 'function' and findTableFile(attachmentName)
+    if not tableFile then return nil end
 
-  if tableFile then
     local stringStream = createStringStream()
     stringStream.Position = 0
     stringStream.copyFrom( tableFile.Stream, tableFile.Stream.Size )
-    sourceText = stringStream.DataString
+    local sourceText = stringStream.DataString
     stringStream.destroy()
+    return sourceText
   end
+
+  local sourceText = onMainThread(readAttachedSource)
 
   local chunk, loadError
 
@@ -114,6 +126,7 @@ local Core = loadCore()
 -- @param name string @ custom type name
 -- @return boolean @ true when the type is registered
 function Module.Resources.hasCustomType(name)
+  if not inMainThread() then return onMainThread( Module.Resources.hasCustomType, name ) end
   return getCustomType(name) ~= nil
 end
 
@@ -122,6 +135,8 @@ end
 -- @param address number|string @ address/offset or relocatable expression
 -- @return nil
 function Module.Resources.registerSymbol(name, address)
+  if not inMainThread() then return onMainThread( Module.Resources.registerSymbol, name, address ) end
+
   local resolved = getAddressSafe(address)
   assert(resolved ~= nil, 'Cannot resolve symbol value: ' .. tostring(address))
 
@@ -134,6 +149,8 @@ end
 -- @param name string @ symbol to release
 -- @return nil
 function Module.Resources.unregisterSymbol(name)
+  if not inMainThread() then return onMainThread( Module.Resources.unregisterSymbol, name ) end
+
   if resources.symbols[name] ~= nil then unregisterSymbol(name) end
 
   resources.symbols[name] = nil
@@ -147,6 +164,7 @@ end
 function Module.Lifecycle.isReady()
   local definitions = Core.definitions()
   return type( definitions ) == 'table' and
+        definitions.processid == getOpenedProcessID() and
         type( definitions.UObject ) == 'table' and
         type( definitions.UClass ) == 'table' and
         type( definitions.FProperty ) == 'table' and
@@ -157,7 +175,14 @@ end
 
 --- Start core service
 function Module.Lifecycle.launch()
-  Core.launch()
+  return Core.launch()
+end
+
+--- Run core initialization synchronously for blocking API callers
+-- @return boolean|nil @ true when initialization succeeds
+-- @return string|nil @ error
+function Module.Lifecycle.initialize()
+  return Core.initialize()
 end
 
 --- Configure signature selection for subsequent search
@@ -1481,6 +1506,7 @@ Module.unregisterSymbol = Module.Resources.unregisterSymbol
 
 Module.isReady = Module.Lifecycle.isReady
 Module.launch = Module.Lifecycle.launch
+Module.initialize = Module.Lifecycle.initialize
 Module.configureSignatures = Module.Lifecycle.configureSignatures
 Module.wait = Module.Lifecycle.wait
 Module.status = Module.Lifecycle.status

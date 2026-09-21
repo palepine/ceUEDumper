@@ -21,6 +21,7 @@
 
 local Dumper =
 {
+  Runtime = {},
   Portable = {},
   Helpers = {},
   Lifecycle = {},
@@ -56,6 +57,7 @@ Dumper.State.typeCache = {}
 Dumper.State.classMetadataStructure = nil
 Dumper.State.propertyMetadataStructure = nil
 Dumper.State.classReferenceIndex = nil
+Dumper.State.cacheProcessId = getOpenedProcessID()
 local typeCache = Dumper.State.typeCache
 
 local PORTABLE_FILES =
@@ -66,11 +68,20 @@ local PORTABLE_FILES =
   { name = 'ceUEDumper.UESignatures', path = [[autorun\ceUEDumperModules\UESignatures.lua]] },
 }
 
+--- Execute operation on CE main thread
+-- @param callback function @ operation with GUI/global-object affinity
+-- @param ... any @ callback arguments
+-- @return ... @ callback return values
+function Dumper.Runtime.onMainThread(callback, ...)
+  if inMainThread() then return callback(...) end
+  return synchronize( callback, ... )
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// PORTABLE MODULES
 
 -- very cool registerStructureDissectOverride2 stuff
 if getCEVersion() < CEVersionSupported then
-  ShowMessage('Please update CE to' .. CEVersionSupported .. ' or newer')
+  Dumper.Runtime.onMainThread( ShowMessage, 'Please update CE to ' .. CEVersionSupported .. ' or newer' )
   error( 'update to Cheat Engine ' .. CEVersionSupported )
 end
 
@@ -78,6 +89,8 @@ end
 -- @param fileName string
 -- @return string|nil @ Source text when an attachment exists
 function Dumper.Portable.getScriptFileAttached(fileName)
+  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Portable.getScriptFileAttached, fileName ) end
+
   local tableFile = findTableFile(fileName)
   if tableFile == nil then return nil end -- error('attached file not found')
   local stringStream = createStringStream()
@@ -151,6 +164,8 @@ end
 -- @param sourceText string @ complete Lua source
 -- @return nil
 function Dumper.Portable.replaceTableFile(attachmentName, sourceText)
+  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Portable.replaceTableFile, attachmentName, sourceText ) end
+
   local existingFile = findTableFile(attachmentName)
   if existingFile then existingFile.delete() end
 
@@ -165,10 +180,20 @@ end
 -- @return boolean|nil @ true when every runtime file was attached
 -- @return string|nil @ error
 function Dumper.Portable.ue_attachToTable()
+  if not inMainThread() then return Dumper.Runtime.onMainThread(Dumper.Portable.ue_attachToTable) end
+
   local files, readError = Dumper.Portable.readPortableFiles()
   if not files then return nil, readError end
 
-  local attached, attachError = pcall(   function()  for _, file in ipairs(files) do Dumper.Portable.replaceTableFile(file.name, file.source) end  end   )
+  local attached, attachError = pcall(
+    function()
+      Dumper.Runtime.onMainThread(function()
+        for _, file in ipairs(files) do
+          Dumper.Portable.replaceTableFile( file.name, file.source )
+        end
+      end)
+    end
+  )
 
   if not attached then return nil, 'Could not attach ceUEDumper: ' .. tostring(attachError) end
 
@@ -195,6 +220,18 @@ sharedResources.structureDissectCallbacks = sharedResources.structureDissectCall
 function Dumper.Helpers.resolveType(typeNameOrAddress, kind)
   if type(typeNameOrAddress) == 'number' then return typeNameOrAddress end
   assert( type(typeNameOrAddress) == 'string', 'type must be a name or address' )
+
+  local processId = getOpenedProcessID()
+
+  if Dumper.State.cacheProcessId ~= processId then
+    Dumper.State.cacheProcessId = processId
+    Dumper.State.typeCache = {}
+    typeCache = Dumper.State.typeCache
+    Dumper.State.classMetadataStructure = nil
+    Dumper.State.propertyMetadataStructure = nil
+    Dumper.State.classReferenceIndex = nil
+    Backend.clearTypeLookupCache()
+  end
 
   local cacheKey = (kind or '*') .. ':' .. typeNameOrAddress
   if not typeCache[cacheKey] then
@@ -606,6 +643,7 @@ end
 --- Clear cached type addresses and the incremental GUObjectArray type index
 -- Registered Cheat Engine symbols are not removed.
 function Dumper.Lifecycle.ue_clearCache()
+  Dumper.State.cacheProcessId = getOpenedProcessID()
   Dumper.State.typeCache = {}
   typeCache = Dumper.State.typeCache
   Backend.clearTypeLookupCache()
@@ -662,10 +700,15 @@ function Dumper.Lifecycle.ue_initDumper(config)
 
   if complete then return true end
 
-  -- on by default
-  if config.launchScanner ~= false then Backend.launch() end
+  if config.launchScanner == false then
+    return false, 'UE reflection is not initialized and scanner launch was disabled'
+  end
 
-  Backend.wait( config.timeout or INIT_WAIT_TIME )
+  -- it's blocking, perform scan in caller/main thread
+  local initialized, initializationError = Backend.initialize()
+  if not initialized then
+    return false, 'UE reflection querying failed: ' .. tostring(initializationError or 'scanner returned no result')
+  end
 
   complete, completionError = Dumper.Lifecycle.checkInitStatus(config)
   if complete then return true end
@@ -1912,6 +1955,8 @@ end
 -- @return userdata|nil @ CE structure
 -- @return string|nil @ metadata error
 function Dumper.Structures.ue_createStructureFromType(typeNameOrAddress, baseAddress)
+  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Structures.ue_createStructureFromType, typeNameOrAddress, baseAddress ) end
+
   local enumFlattenedProperties = Dumper.Structures.ue_enumFlattenedProperties
   local orderRenderableProperties = Dumper.Structures.orderRenderableProperties
   local addRenderedProperty = Dumper.Structures.addRenderedProperty
@@ -1934,6 +1979,8 @@ end
 -- @return userdata|nil @ CE structure
 -- @return string|nil @ error
 function Dumper.Structures.ue_createStructureFromObject(objectAddress)
+  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Structures.ue_createStructureFromObject, objectAddress ) end
+
   local typeAddress = Backend.objectClass(objectAddress)
 
   if not typeAddress or typeAddress == 0 then return nil, 'Runtime UObject class unavailable' end
@@ -2055,6 +2102,8 @@ end
 --- Unregister ceUEDumper callbacks
 -- @return void
 function Dumper.StructureDissect.unregisterCallbacks()
+  if not inMainThread() then return Dumper.Runtime.onMainThread(Dumper.StructureDissect.unregisterCallbacks) end
+
   local callbacks = sharedResources.structureDissectCallbacks
 
   if callbacks.nameLookup then
@@ -2074,6 +2123,10 @@ end
 -- @return boolean|nil @ true when the requested state was applied
 -- @return string|nil @ error
 function Dumper.StructureDissect.ue_setStructureDissectEnabled(enabled)
+  if not inMainThread() then
+    return Dumper.Runtime.onMainThread( Dumper.StructureDissect.ue_setStructureDissectEnabled, enabled )
+  end
+
   assert( type(enabled) == 'boolean', 'enabled must be a boolean' )
 
   Dumper.StructureDissect.unregisterCallbacks()
