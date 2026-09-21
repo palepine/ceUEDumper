@@ -9,6 +9,7 @@
 | `ue_isNameReady()`                                 | Get cached names status                                |
 | `ue_getStatus()`                                   | Get verbose dumper state                               |
 | `ue_findClass(name)`                               | Find a `UClass` by short name, eg 'GameInstance        |
+| `ue_findClassReferences(class, options)`           | Find class fields declared with a referenced UClass    |
 | `ue_enumFunctions(type)`                           | Enumerate `UFunctions` for type                        |
 | `ue_findFunction(type, name)`                      | Find a specific `UFunction` for type                   |
 | `ue_getFunctionMetadata(function)`                 | Get `UFunction` obj & parameter metadata               |
@@ -122,6 +123,77 @@ Enumeration API returns tables keyed by reflected property name (including inher
 ```lua
 return ue_findClass('GameEngine')
 ```
+
+#### `ue_findClassReferences(classNameOrAddress, options)`
+
+Build/query reverse reflection index and return fields
+whose declared type references the requested `UClass` (using metadata only)
+
+`ue_clearCache()` also clears this reverse index.
+
+```lua
+local options =
+{
+  includeBaseDeclarations = true, -- fields declared as Character/Object/etc that can hold PlayerCharacter_C
+  includeDerivedDeclarations = true, -- fields explicitly declared as subclasses of PlayerCharacter_C
+}
+local references, err, statistics = ue_findClassReferences('PlayerCharacter_C') -- suing deafult options
+assert( references, err )
+
+
+
+for _, reference in ipairs(references) do
+  print(
+        reference.ownerClassName,
+        reference.path,
+        reference.propertyType,
+        reference.referencedClassName,
+        reference.staticOffset
+      )
+end
+
+print('Classes scanned:', statistics.scannedClassCount)
+print('References indexed:', statistics.referenceCount)
+```
+
+`options` fields:
+
+| Field                        | Default | Description |
+| ---------------------------- | ------- | ----------- |
+| `rebuild`                    | `false` | Discard compatible reverse index  & rebuild it |
+| `includeBaseDeclarations`    | `false` | Include fields declared as an ancestor of the target; such fields can hold the target class |
+| `includeDerivedDeclarations` | `false` | Include fields declared as a descendant of the target |
+
+It follows object/class/interface references inside embedded structs,
+arrays, sets, and map keys or values. Paths use these forms:
+
+```text
+DirectObject
+Settings.Owner
+Objects[]
+ObjectSet{}
+ObjectMap{Key}
+ObjectMap{Value}
+```
+
+Each returned record contains:
+
+| Field                    | Description |
+| ------------------------ | ----------- |
+| `ownerClassAddress`      | Declaring `UClass` address |
+| `ownerClassName`         | Declaring class name |
+| `propertyName`           | Referencing leaf property's reflected name |
+| `propertyAddress`        | `UProperty`/`FProperty` descriptor address |
+| `propertyType`           | Object, class, interface, or related property kind |
+| `propertyOffset`         | Offset stored in the leaf property descriptor |
+| `staticOffset`           | Complete class-relative offset for direct or embedded-struct fields; `nil` inside containers |
+| `rootPropertyOffset`     | Offset of the top-level class field |
+| `path`                   | Complete property/container path |
+| `wrappers`               | Enclosing struct/container kinds |
+| `referencedClassAddress` | Referenced `UClass` address |
+| `referencedClassName`    | Referenced class name |
+| `referenceMember`        | Descriptor member used: `PropertyClass`, `MetaClass`, or `InterfaceClass` |
+| `referenceMemberOffset`  | Inferred offset of that member inside the property descriptor |
 
 #### `ue_findStruct(name)`
   > For `UScriptStruct`, find UScriptStruct object via its name

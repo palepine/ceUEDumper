@@ -25,6 +25,7 @@ local Dumper =
   Helpers = {},
   Lifecycle = {},
   Reflection = {},
+  References = {},
   Structures = {},
   MetadataViews = {},
   Offsets = {},
@@ -53,6 +54,7 @@ local registeredSymbols = Dumper.State.registeredSymbols
 Dumper.State.typeCache = {}
 Dumper.State.classMetadataStructure = nil
 Dumper.State.propertyMetadataStructure = nil
+Dumper.State.classReferenceIndex = nil
 local typeCache = Dumper.State.typeCache
 
 local PORTABLE_FILES =
@@ -608,6 +610,7 @@ function Dumper.Lifecycle.ue_clearCache()
   Backend.clearTypeLookupCache()
   Dumper.State.classMetadataStructure = nil
   Dumper.State.propertyMetadataStructure = nil
+  Dumper.State.classReferenceIndex = nil
 end
 
 --- Enable or disable UClass/UProperty metadata expansion in new structures
@@ -729,7 +732,312 @@ function Dumper.Reflection.ue_enumObjectProperties(objectAddress)
 end
 
 
--- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// STRUCTURE DISSECT
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--/// CLASS REFERENCE INDEX
+
+--- Copy wrapper path and append one property/container kind
+-- @param wrappers string[] @ existing wrapper path
+-- @param wrapper string @ enclosing property/container kind
+-- @return string[] @ independent extended wrapper path
+function Dumper.References.appendWrapper(wrappers, wrapper)
+  local extended = {}
+
+  for index, value in ipairs(wrappers) do extended[index] = value end
+  extended[ #extended + 1 ] = wrapper
+
+  return extended
+end
+
+--- Index class references reachable through one reflected property
+-- Embedded structs are followed recursively
+-- Containers retain a field path, yet their element reference has no fixed object-relative offset
+-- @param index table @ reverse-reference index under construction
+-- @param owner table @ declaring UClass metadata
+-- @param propertyName string @ reflected leaf property name
+-- @param property table @ decoded property metadata
+-- @param path string @ readable path from the declaring class
+-- @param parentStaticOffset number|nil @ parent embedded-struct offset
+-- @param rootPropertyOffset number @ top-level class field offset
+-- @param wrappers string[] @ enclosing property/container kinds
+-- @param activeStructs table<number, boolean> @ recursion-cycle guard
+-- @return nil
+function Dumper.References.indexProperty(index, owner, propertyName, property, path, parentStaticOffset, rootPropertyOffset, wrappers, activeStructs)
+  local propertyType = property.propertyType
+  local staticOffset = parentStaticOffset and parentStaticOffset + (property.offset or 0) or nil
+  local referencedClass, referenceMember, referenceMemberOffset = Backend.propertyClassReference( property.propertyAddress, propertyType )
+
+  if referencedClass then
+    local references = index.byReferencedClass[referencedClass]
+
+    if not references then
+      references = {}
+      index.byReferencedClass[referencedClass] = references
+    end
+
+    references[ #references + 1 ] =
+    {
+      ownerClassAddress = owner.address,
+      ownerClassName = owner.name,
+      propertyName = propertyName,
+      propertyAddress = property.propertyAddress,
+      propertyType = propertyType,
+      propertyOffset = property.offset,
+      staticOffset = staticOffset,
+      rootPropertyOffset = rootPropertyOffset,
+      path = path,
+      wrappers = wrappers,
+      referencedClassAddress = referencedClass,
+      referencedClassName = Backend.objectName(referencedClass),
+      referenceMember = referenceMember,
+      referenceMemberOffset = referenceMemberOffset,
+    }
+
+    index.referenceCount = index.referenceCount + 1
+    return
+  end
+
+  if propertyType == 'StructProperty' then
+    local structAddress = property.structAddress or Backend.propertyStruct( property.propertyAddress )
+
+    if not structAddress or activeStructs[structAddress] then return end
+
+    local structProperties = Backend.properties(structAddress)
+    if not structProperties then return end
+
+    activeStructs[structAddress] = true
+    local nestedWrappers = Dumper.References.appendWrapper( wrappers, 'StructProperty' )
+
+    for nestedName, nestedProperty in pairs(structProperties) do
+      Dumper.References.indexProperty(
+                                      index,
+                                      owner,
+                                      nestedName,
+                                      nestedProperty,
+                                      path .. '.' .. nestedName,
+                                      staticOffset,
+                                      rootPropertyOffset,
+                                      nestedWrappers,
+                                      activeStructs
+                                    )
+    end
+
+    activeStructs[structAddress] = nil
+    return
+  end
+
+  if propertyType == 'ArrayProperty' then
+    local innerProperty = property.innerProperty or Backend.propertyArrayInner( property.propertyAddress )
+
+    if innerProperty then
+      Dumper.References.indexProperty(
+                                      index,
+                                      owner,
+                                      innerProperty.name or propertyName,
+                                      innerProperty,
+                                      path .. '[]',
+                                      nil,
+                                      rootPropertyOffset,
+                                      Dumper.References.appendWrapper( wrappers, 'ArrayProperty' ),
+                                      activeStructs
+                                    )
+    end
+
+    return
+  end
+
+  if propertyType == 'SetProperty' then
+    local elementProperty = property.elementProperty or Backend.propertySetElement( property.propertyAddress )
+
+    if elementProperty then
+      Dumper.References.indexProperty(
+                                      index,
+                                      owner,
+                                      elementProperty.name or propertyName,
+                                      elementProperty,
+                                      path .. '{}',
+                                      nil,
+                                      rootPropertyOffset,
+                                      Dumper.References.appendWrapper( wrappers, 'SetProperty' ),
+                                      activeStructs
+                                    )
+    end
+
+    return
+  end
+
+  if propertyType ~= 'MapProperty' then return end
+
+  local keyProperty = property.keyProperty
+  local valueProperty = property.valueProperty
+
+  if not keyProperty or not valueProperty then
+    keyProperty, valueProperty = Backend.propertyMapMembers( property.propertyAddress )
+  end
+
+  if keyProperty then
+    Dumper.References.indexProperty(
+                                    index,
+                                    owner,
+                                    keyProperty.name or propertyName,
+                                    keyProperty,
+                                    path .. '{Key}',
+                                    nil,
+                                    rootPropertyOffset,
+                                    Dumper.References.appendWrapper( wrappers, 'MapKey' ),
+                                    activeStructs
+                                  )
+  end
+
+  if valueProperty then
+    Dumper.References.indexProperty(
+                                    index,
+                                    owner,
+                                    valueProperty.name or propertyName,
+                                    valueProperty,
+                                    path .. '{Value}',
+                                    nil,
+                                    rootPropertyOffset,
+                                    Dumper.References.appendWrapper( wrappers, 'MapValue' ),
+                                    activeStructs
+                                  )
+  end
+end
+
+--- Build reverse index from referenced UClass to declaring properties
+-- @param rebuild boolean|nil @ ignore the compatible cached index
+-- @return table|nil @ reverse-reference index
+-- @return string|nil @ scan error
+function Dumper.References.buildClassReferenceIndex(rebuild)
+  local classes, runtimeIdentity = Backend.reflectedTypes('Class')
+  if not classes then return nil, 'UClass descriptors could not be enumerated' end
+
+  -- only directly declared properties are rooted at each class to avoid inherited declarations from being duplicated for every derived class
+  -- every UClass descriptor in GUObjectArray is visited once per runtime layout
+
+  local cached = Dumper.State.classReferenceIndex
+
+  if not rebuild and cached and cached.runtimeIdentity == runtimeIdentity and cached.classCount == #classes
+  then
+    return cached
+  end
+
+  local index =
+  {
+    runtimeIdentity = runtimeIdentity,
+    byReferencedClass = {},
+    classCount = #classes,
+    scannedClassCount = 0,
+    unresolvedClasses = {},
+    referenceCount = 0,
+  }
+  local propertyCache = {}
+
+  for _, classAddress in ipairs(classes) do
+    local className = Backend.objectName(classAddress) or ('Class_%X'):format(classAddress)
+    local properties, propertyError = Backend.declaredProperties( classAddress, propertyCache )
+
+    if not properties then
+      index.unresolvedClasses[ #index.unresolvedClasses + 1 ] =
+      {
+        classAddress = classAddress,
+        className = className,
+        error = propertyError,
+      }
+      goto continue
+    end
+
+    index.scannedClassCount = index.scannedClassCount + 1
+    local owner = { address = classAddress, name = className }
+
+    for propertyName, property in pairs(properties) do
+      Dumper.References.indexProperty(
+                                      index,
+                                      owner,
+                                      propertyName,
+                                      property,
+                                      propertyName,
+                                      0,
+                                      property.offset,
+                                      {},
+                                      {}
+                                    )
+    end
+
+    ::continue::
+  end
+
+  Dumper.State.classReferenceIndex = index
+  return index
+end
+
+--- Find reflected class fields whose declared type references a UClass
+-- @param classNameOrAddress string|number @ target UClass
+-- @param options table|nil @ rebuild, includeBaseDeclarations, includeDerivedDeclarations
+-- @return table[]|nil @ reference metadata records
+-- @return string|nil @ query error
+-- @return table|nil @ index statistics
+function Dumper.References.ue_findClassReferences(classNameOrAddress, options)
+  options = options or {}
+  assert( type(options) == 'table', 'options must be a table or nil' )
+  
+  -- exact declaration matches are returned by default.
+  -- optional compatibility matching can include fields declared as ancestor/descendant class
+  -- this queries reflection descriptors only
+  
+  local targetClass = Dumper.Helpers.resolveType( classNameOrAddress, 'Class' )
+  if not targetClass then return nil, 'Target UClass was not found' end
+
+  local index, indexError = Dumper.References.buildClassReferenceIndex(options.rebuild == true)
+  if not index then return nil, indexError end
+
+  local references = {}
+  local seen = {}
+
+  for referencedClass, records in pairs(index.byReferencedClass) do
+    local matches = referencedClass == targetClass
+
+    if not matches and options.includeBaseDeclarations == true then
+      matches = Backend.classDerivesFrom( targetClass, referencedClass )
+    end
+
+    if not matches and options.includeDerivedDeclarations == true then
+      matches = Backend.classDerivesFrom( referencedClass, targetClass )
+    end
+
+    if not matches then goto continue end
+
+    for _, record in ipairs(records) do
+      local key = ('%X:%X:%s'):format( record.ownerClassAddress, record.propertyAddress, record.path )
+
+      if not seen[key] then
+        seen[key] = true
+        references[ #references + 1 ] = record
+      end
+    end
+
+    ::continue::
+  end
+
+  table.sort(references,
+    function(left, right)
+      if left.ownerClassName == right.ownerClassName then return left.path < right.path end
+      return left.ownerClassName < right.ownerClassName
+    end
+  )
+
+  return references, nil,
+  {
+    targetClassAddress = targetClass,
+    targetClassName = Backend.objectName(targetClass),
+    classCount = index.classCount,
+    scannedClassCount = index.scannedClassCount,
+    unresolvedClassCount = #index.unresolvedClasses,
+    referenceCount = index.referenceCount,
+    runtimeIdentity = index.runtimeIdentity,
+  }
+end
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--/// STRUCTURE DISSECT
 
 local SCALAR_PROPERTY_TYPES =
 {
@@ -2443,6 +2751,7 @@ Dumper.API =
   ue_clearCache = Dumper.Lifecycle.ue_clearCache,
   ue_initDumper = Dumper.Lifecycle.ue_initDumper,
   ue_findClass = Dumper.Reflection.ue_findClass,
+  ue_findClassReferences = Dumper.References.ue_findClassReferences,
   ue_findStruct = Dumper.Reflection.ue_findStruct,
   ue_enumFlattenedProperties = Dumper.Structures.ue_enumFlattenedProperties,
   ue_createStructureFromType = Dumper.Structures.ue_createStructureFromType,

@@ -392,6 +392,11 @@ local function getTypeLookupState()
         Class = {},
         ScriptStruct = {},
       },
+      addressesByKind =
+      {
+        Class = {},
+        ScriptStruct = {},
+      },
       any = {},
       metaClassKinds = {},
     }
@@ -459,7 +464,32 @@ local function indexReflectedType(state, typeAddress, kind)
   if kindIndex[name] == nil then kindIndex[name] = typeAddress end
   if state.any[name] == nil then state.any[name] = typeAddress end
 
+  local addresses = state.addressesByKind[kind]
+  addresses[ #addresses + 1 ] = typeAddress
+
   return name
+end
+
+--- Index next GUObjectArray entry when it is a reflected type
+-- @param state table @ incremental type-index state
+-- @return number|nil @ reflected type descriptor
+-- @return string|nil @ Class or ScriptStruct
+-- @return string|nil @ reflected short name
+local function indexNextReflectedType(state)
+  if state.nextIndex >= state.view.count then return nil end
+
+  local objectAddress = Module.Objects.objectAtFromView( state.view, state.nextIndex )
+  state.nextIndex = state.nextIndex + 1
+
+  if not isValidAddress(objectAddress) then return nil end
+
+  local classOffset = state.view.definitions.UObject.Class
+  local metaClassAddress = readPointer( objectAddress + classOffset )
+  local detectedKind = reflectedTypeKind( metaClassAddress, state )
+
+  if not detectedKind then return nil end
+
+  return objectAddress, detectedKind, indexReflectedType( state, objectAddress, detectedKind )
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// REFLECTED TYPE LOOKUP
@@ -499,31 +529,63 @@ function Module.Objects.findType(name, kind)
     return nil
   end
 
-  local view = state.view
-  local objectAtFromView = Module.Objects.objectAtFromView
-  local classOffset = view.definitions.UObject.Class
-
-  while state.nextIndex < view.count do
-    local objectAddress = objectAtFromView(view, state.nextIndex)
-    state.nextIndex = state.nextIndex + 1
-
-    if not isValidAddress(objectAddress) then goto continue end
-
-    local metaClassAddress = readPointer(objectAddress + classOffset)
-    
-    local detectedKind = reflectedTypeKind(metaClassAddress, state)
-    if not detectedKind then goto continue end
-
-    local indexedName = indexReflectedType(state, objectAddress, detectedKind)
+  while state.nextIndex < state.view.count do
+    local _, detectedKind, indexedName = indexNextReflectedType(state)
 
     if indexedName == name and (kind == nil or kind == detectedKind) then
-      return objectAddress
+      return requestedIndex[indexedName]
     end
-
-    ::continue::
   end
 
   return requestedIndex and requestedIndex[name] or nil
+end
+
+--- Enumerate every reflected type of one supported kind
+-- @param kind string @ Class or ScriptStruct
+-- @return number[]|nil @ reflected descriptor addresses
+-- @return string|nil @ object-array identity used by higher-level caches
+function Module.Objects.reflectedTypes(kind)
+  assert( kind == 'Class' or kind == 'ScriptStruct', 'kind must be Class or ScriptStruct' )
+  -- incremental GUObjectArray index is completed only once per runtime
+
+  local state = getTypeLookupState()
+  if not state then return nil end
+
+  while state.nextIndex < state.view.count do
+    indexNextReflectedType(state)
+  end
+
+  local result = {}
+
+  for index, address in ipairs( state.addressesByKind[kind] ) do
+    result[index] = address
+  end
+
+  return result, state.identity
+end
+
+--- Test if UClass is equal to or derived from another
+-- @param classAddress number @ possible derived UClass
+-- @param ancestorAddress number @ required base UClass
+-- @return boolean @ true for equality or a coherent SuperStruct path
+function Module.Objects.classDerivesFrom(classAddress, ancestorAddress)
+  if not isValidAddress(classAddress) or not isValidAddress(ancestorAddress) then return false end
+
+  local definitions = Core.definitions()
+  local superOffset = definitions.UClass and definitions.UClass.SuperStruct
+  local visited = {}
+
+  if type(superOffset) ~= 'number' then return classAddress == ancestorAddress end
+
+  for _ = 1, 256 do
+    if not isValidAddress(classAddress) or visited[classAddress] then return false end
+    if classAddress == ancestorAddress then return true end
+
+    visited[classAddress] = true
+    classAddress = readPointer( classAddress + superOffset )
+  end
+
+  return false
 end
 
 
@@ -897,6 +959,168 @@ function Module.Reflection.properties(typeAddress)
   return merged
 end
 
+--- Enumerate properties declared directly by UClass/UScriptStruct
+-- @param typeAddress number @ owning UClass or UScriptStruct
+-- @param propertyCache table|nil @ build-scoped cache keyed by type address
+-- @return table<string, table>|nil @ directly declared properties
+-- @return string|nil @ reflection error
+function Module.Reflection.declaredProperties(typeAddress, propertyCache)
+  propertyCache = propertyCache or {}
+
+  -- inherited descriptors are removed by property identity
+  -- to prevents a reverse-reference index from reporting
+  -- same declaration once for every derived class that inherits it
+
+  --- Read and cache type's merged inherited property map
+  local function cachedProperties(address)
+    local cached = propertyCache[address]
+    if cached then return cached.properties, cached.error end
+
+    local properties, propertyError = Module.Reflection.properties(address)
+    propertyCache[address] = { properties = properties, error = propertyError }
+    return properties, propertyError
+  end
+
+  local properties, propertyError = cachedProperties(typeAddress)
+  if not properties then return nil, propertyError end
+
+  local definitions = Core.definitions()
+  local superOffset = definitions.UClass and definitions.UClass.SuperStruct
+
+  if type(superOffset) ~= 'number' then return properties end
+
+  local superclassAddress = readPointer( typeAddress + superOffset )
+  if not isValidAddress(superclassAddress) then return properties end
+
+  local inheritedProperties = cachedProperties(superclassAddress)
+  if not inheritedProperties then return properties end
+
+  local inheritedAddresses = {}
+
+  for _, inheritedProperty in pairs(inheritedProperties) do
+    inheritedAddresses[inheritedProperty.propertyAddress] = true
+  end
+
+  local declared = {}
+
+  for name, property in pairs(properties) do
+    if not inheritedAddresses[ property.propertyAddress ] then declared[name] = property end
+  end
+
+  return declared
+end
+
+local CLASS_REFERENCE_PROPERTY_TYPES =
+{
+  ObjectProperty = 'PropertyClass',
+  ObjectPtrProperty = 'PropertyClass',
+  WeakObjectProperty = 'PropertyClass',
+  LazyObjectProperty = 'PropertyClass',
+  SoftObjectProperty = 'PropertyClass',
+  AssetObjectProperty = 'PropertyClass',
+  ClassProperty = 'MetaClass',
+  ClassPtrProperty = 'MetaClass',
+  SoftClassProperty = 'MetaClass',
+  AssetClassProperty = 'MetaClass',
+  InterfaceProperty = 'InterfaceClass',
+}
+
+--- Resolve UClass referenced by object/class/interface property
+-- @param propertyAddress number @ reflected property descriptor
+-- @param propertyType string @ reflected property class name
+-- @return number|nil @ referenced UClass address
+-- @return string|nil @ PropertyClass, MetaClass, or InterfaceClass
+-- @return number|nil @ selected descriptor-member offset
+function Module.Reflection.propertyClassReference(propertyAddress, propertyType)
+  local memberName = CLASS_REFERENCE_PROPERTY_TYPES[propertyType]
+  if not memberName or not isValidAddress(propertyAddress) then return nil end
+
+  -- object properties append PropertyClass after their common property base
+  -- class properties additionally append MetaClass that's useful target
+  -- because PropertyClass commonly names UClass itself
+  -- interface properties append InterfaceClass.
+  -- first coherent descriptor teaches the engine-wide offset
+  -- later properties use stored member directly
+
+  local definitions = Core.definitions()
+  local layoutName
+
+  if memberName == 'PropertyClass' then       layoutName = 'FObjectPropertyBase'
+  elseif memberName == 'MetaClass' then       layoutName = propertyType == 'SoftClassProperty' and 'FSoftClassProperty' or 'FClassProperty'
+  else                                        layoutName = 'FInterfaceProperty'
+  end
+
+  local configuredOffset = definitions[layoutName] and definitions[layoutName][memberName]
+
+  if type(configuredOffset) == 'number' then
+    local configuredClass = readPointer( propertyAddress + configuredOffset )
+
+    if isValidAddress(configuredClass) and objectHasMetaClass( configuredClass, 'Class' ) then
+      return configuredClass, memberName, configuredOffset
+    end
+  end
+
+  local candidates = {}
+
+  -- supported UE4/UE5 property bases normally end around 0x60-0x80
+  -- scan bounded pointer-aligned tail & accept only actual UClass descriptors
+  for offset = 0x58, 0xB8, PTR_SIZE do
+    local classAddress = readPointer( propertyAddress + offset )
+
+    if isValidAddress(classAddress)
+        and objectHasMetaClass( classAddress, 'Class' )
+    then
+      candidates[ #candidates + 1 ] = { address = classAddress, offset = offset }
+    end
+  end
+
+  if #candidates == 0 then return nil end
+
+  table.sort( candidates, function(left, right) return left.offset < right.offset end )
+
+  local selected = candidates[1]
+  local unambiguousClassMetadata = memberName ~= 'MetaClass'
+
+  if memberName == 'MetaClass' and propertyType == 'SoftClassProperty' then
+    -- FSoftClassProperty appends only MetaClass to its FProperty base
+    unambiguousClassMetadata = true
+  elseif memberName == 'MetaClass' then
+    -- FClassProperty derives from FObjectPropertyBase
+    -- PropertyClass and MetaClass are consecutive pointers
+    -- select latter without treating unrelated class pointers farther past descriptor as candidates
+    unambiguousClassMetadata = false
+
+    for candidateIndex = 1, #candidates - 1 do
+      local propertyClass = candidates[candidateIndex]
+      local metaClass = candidates[ candidateIndex + 1 ]
+
+      if metaClass.offset == propertyClass.offset + PTR_SIZE then
+        selected = metaClass
+        unambiguousClassMetadata = true
+        break
+      end
+    end
+
+    if not unambiguousClassMetadata then
+      -- a null PropertyClass can leave only MetaClass readable
+      -- prefer non-Class descriptor, but don't publish its offset engine-wide
+      for _, candidate in ipairs(candidates) do
+        if Module.Objects.objectName(candidate.address) ~= 'Class' then
+          selected = candidate
+          break
+        end
+      end
+    end
+  end
+
+  if unambiguousClassMetadata then
+    definitions[layoutName] = definitions[layoutName] or {}
+    definitions[layoutName][memberName] = selected.offset
+  end
+
+  return selected.address, memberName, selected.offset
+end
+
 --- Resolve UScriptStruct referenced by a struct-property descriptor
 -- Candidate slots accommodate legacy/modern FProperty sizes. Accept only a
 -- unique ScriptStruct-typed target; never interpret inline data as a UObject
@@ -1136,6 +1360,8 @@ Module.objectAt = Module.Objects.objectAt
 Module.objectName = Module.Objects.objectName
 Module.objectClass = Module.Objects.objectClass
 Module.findType = Module.Objects.findType
+Module.reflectedTypes = Module.Objects.reflectedTypes
+Module.classDerivesFrom = Module.Objects.classDerivesFrom
 Module.clearTypeLookupCache = Module.Objects.clearTypeLookupCache
 Module.findContainingObject = Module.Objects.findContainingObject
 
@@ -1149,6 +1375,8 @@ Module.objectHeaderLayout = Module.Reflection.objectHeaderLayout
 Module.classHeaderLayout = Module.Reflection.classHeaderLayout
 Module.propertyHeaderLayout = Module.Reflection.propertyHeaderLayout
 Module.properties = Module.Reflection.properties
+Module.declaredProperties = Module.Reflection.declaredProperties
+Module.propertyClassReference = Module.Reflection.propertyClassReference
 Module.propertyStruct = Module.Reflection.propertyStruct
 Module.propertyArrayInner = Module.Reflection.propertyArrayInner
 Module.propertySetElement = Module.Reflection.propertySetElement
