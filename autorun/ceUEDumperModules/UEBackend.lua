@@ -588,6 +588,136 @@ function Module.Objects.classDerivesFrom(classAddress, ancestorAddress)
   return false
 end
 
+--- Test and memoize one runtime class against object-query target
+-- @param runtimeClass number @ object's actual UClass
+-- @param targetClass number @ requested UClass
+-- @param includeSubclasses boolean @ permit derived runtime classes
+-- @param accepted table<number, boolean> @ matching-class cache
+-- @param rejected table<number, boolean> @ unrelated-class cache
+-- @return boolean @ whether instances of runtimeClass should be returned
+function Module.Objects.matchesClassQuery(runtimeClass, targetClass, includeSubclasses, accepted, rejected)
+  if accepted[runtimeClass] then return true end
+  if rejected[runtimeClass] then return false end
+
+  local matches = includeSubclasses and Module.Objects.classDerivesFrom( runtimeClass, targetClass )
+
+  if matches then accepted[runtimeClass] = true
+  else            rejected[runtimeClass] = true
+  end
+
+  return matches == true
+end
+
+--- Describe one matched UObject without rereading its class name repeatedly
+-- @param objectAddress number @ live UObject
+-- @param objectIndex number @ GUObjectArray index
+-- @param runtimeClass number @ actual UClass
+-- @param targetClass number @ requested UClass
+-- @param classNames table<number, string|false> @ per-scan class-name cache
+-- @return table @ public object result record
+function Module.Objects.describeClassQueryObject(objectAddress, objectIndex, runtimeClass, targetClass, classNames)
+  local runtimeClassName = classNames[runtimeClass]
+
+  if runtimeClassName == nil then
+    runtimeClassName = Module.Objects.objectName(runtimeClass) or false
+    classNames[runtimeClass] = runtimeClassName
+  end
+
+  return
+  {
+    objectAddress = objectAddress,
+    objectIndex = objectIndex,
+    objectName = Module.Objects.objectName(objectAddress),
+    classAddress = runtimeClass,
+    className = runtimeClassName or nil,
+    isExactClass = runtimeClass == targetClass,
+  }
+end
+
+--- Find every runtime GUObjectArray entry whose runtime class matches UClass
+-- scanned every time
+-- @param classAddress number @ target UClass descriptor
+-- @param options table|nil @ includeSubclasses, excludeDefaultObjects, limit
+-- @return table[]|nil @ matching object metadata records
+-- @return string|nil @ traversal error
+-- @return table|nil @ scan statistics
+function Module.Objects.findObjectsOfClass(classAddress, options)
+  options = options or {}
+
+  if not isValidAddress(classAddress) then return nil, 'Target UClass must be non-zero' end
+  if not objectHasMetaClass( classAddress, 'Class' ) then return nil, 'Target address is not a UClass descriptor' end
+
+  local view = Module.Objects.createObjectArrayView(true)
+  if not view then return nil, 'GUObjectArray is unavailable' end
+
+  local classOffset = view.definitions.UObject.Class
+  local includeSubclasses = options.includeSubclasses == true
+  local excludeDefaultObjects = options.excludeDefaultObjects == true
+  local limit = options.limit
+
+  if limit ~= nil and ( type(limit) ~= 'number' or limit < 1 or limit % 1 ~= 0 ) then
+    return nil, 'options.limit must be a positive integer or nil'
+  end
+
+  local objectAtFromView = Module.Objects.objectAtFromView
+  local matchesClassQuery = Module.Objects.matchesClassQuery
+  local describeObject = Module.Objects.describeClassQueryObject
+  local matchingRuntimeClasses = { [classAddress] = true }
+  local rejectedRuntimeClasses = {}
+  local classNames = {}
+  local results = {}
+  local scannedCount = 0
+  local exactCount = 0
+  local subclassCount = 0
+  local truncated = false
+
+  for objectIndex = 0, view.count - 1 do
+    local objectAddress = objectAtFromView( view, objectIndex )
+    if not isValidAddress(objectAddress) then goto continue end
+
+    scannedCount = scannedCount + 1
+    local runtimeClass = readPointer( objectAddress + classOffset )
+    if not isValidAddress(runtimeClass) then goto continue end
+
+    if not matchesClassQuery( runtimeClass, classAddress, includeSubclasses, matchingRuntimeClasses, rejectedRuntimeClasses ) then
+      goto continue
+    end
+
+    local record = describeObject( objectAddress, objectIndex, runtimeClass, classAddress, classNames )
+
+    if excludeDefaultObjects and record.objectName and record.objectName:sub(1, 9) == 'Default__' then
+      goto continue
+    end
+
+    if record.isExactClass then  exactCount = exactCount + 1
+    else                         subclassCount = subclassCount + 1
+    end
+
+    results[ #results + 1 ] = record
+
+    if limit and #results >= limit then
+      truncated = objectIndex < view.count - 1
+      break
+    end
+
+    ::continue::
+  end
+
+  return results, nil,
+  {
+    targetClassAddress = classAddress,
+    targetClassName = Module.Objects.objectName(classAddress),
+    objectArrayCount = view.count,
+    scannedObjectCount = scannedCount,
+    matchedObjectCount = #results,
+    exactClassCount = exactCount,
+    subclassCount = subclassCount,
+    includeSubclasses = includeSubclasses,
+    excludeDefaultObjects = excludeDefaultObjects,
+    truncated = truncated,
+  }
+end
+
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// UFUNCTION
 
@@ -1362,6 +1492,7 @@ Module.objectClass = Module.Objects.objectClass
 Module.findType = Module.Objects.findType
 Module.reflectedTypes = Module.Objects.reflectedTypes
 Module.classDerivesFrom = Module.Objects.classDerivesFrom
+Module.findObjectsOfClass = Module.Objects.findObjectsOfClass
 Module.clearTypeLookupCache = Module.Objects.clearTypeLookupCache
 Module.findContainingObject = Module.Objects.findContainingObject
 

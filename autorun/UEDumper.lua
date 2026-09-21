@@ -25,6 +25,7 @@ local Dumper =
   Helpers = {},
   Lifecycle = {},
   Reflection = {},
+  Objects = {},
   References = {},
   Structures = {},
   MetadataViews = {},
@@ -729,6 +730,25 @@ function Dumper.Reflection.ue_enumObjectProperties(objectAddress)
   if not classAddress then return nil, 'Runtime UObject class wasnt read' end
 
   return Dumper.Reflection.ue_enumProperties(classAddress)
+end
+
+--- Find runtime UObject instances whose class matches UClass/class name
+-- exact class matches are returned by default
+-- set includeSubclasses to include instances of any class derived from the requested UClass
+-- GUObjectArray is scanned on every call
+-- @param classNameOrAddress string|number @ target UClass name or descriptor
+-- @param options table|nil @ includeSubclasses, excludeDefaultObjects, limit
+-- @return table[]|nil @ object metadata records
+-- @return string|nil @ query error
+-- @return table|nil @ traversal statistics
+function Dumper.Objects.ue_findObjectsOfClass(classNameOrAddress, options)
+  options = options or {}
+  assert( type(options) == 'table', 'options must be a table or nil' )
+
+  local classAddress = Dumper.Helpers.resolveType( classNameOrAddress, 'Class' )
+  if not classAddress then return nil, 'Target UClass was not found' end
+
+  return Backend.findObjectsOfClass( classAddress, options )
 end
 
 
@@ -2751,6 +2771,7 @@ Dumper.API =
   ue_clearCache = Dumper.Lifecycle.ue_clearCache,
   ue_initDumper = Dumper.Lifecycle.ue_initDumper,
   ue_findClass = Dumper.Reflection.ue_findClass,
+  ue_findObjectsOfClass = Dumper.Objects.ue_findObjectsOfClass,
   ue_findClassReferences = Dumper.References.ue_findClassReferences,
   ue_findStruct = Dumper.Reflection.ue_findStruct,
   ue_enumFlattenedProperties = Dumper.Structures.ue_enumFlattenedProperties,
