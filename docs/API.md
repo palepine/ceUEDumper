@@ -197,6 +197,18 @@ assert( ue_getObjectPropertyOffset( playerAddr, 'Settings.Cheats.GodMode' ) )
 
 ## Structure Dissecting
 
+Toggle `ceUEDumper > Toggle Struct Guessing` to enable CE Struct Dissect to guess UObjects:
+- name lookup
+- struct layout
+- try find base for a field
+
+```lua
+-- toggle it from lua
+assert( ue_setStructureDissectEnabled(true) )
+print( ue_isStructureDissectEnabled() )
+assert( ue_setStructureDissectEnabled(false) )
+```
+
 #### `ue_createStructureFromObject( objectAddr )`
   > create a laid out structure for a Structure Dissect form using an object instance
 ```lua
@@ -469,6 +481,5 @@ print( ue_isReflectionMetadataVisible() ) -- true
 ```
 
 ## TODOs
-- arbitrary object name/base lookups for struct dissector
 - fname/object descryption
 - array limit setting
