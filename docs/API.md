@@ -9,6 +9,7 @@
 | `ue_isNameReady()`                                 | Get cached names status                                |
 | `ue_getStatus()`                                   | Get verbose dumper state                               |
 | `ue_findClass(name)`                               | Find a `UClass` by short name, eg 'GameInstance        |
+| `ue_findObjectsOfClass(class, options)`            | Find live objects with an exact or derived class       |
 | `ue_findClassReferences(class, options)`           | Find class fields declared with a referenced UClass    |
 | `ue_enumFunctions(type)`                           | Enumerate `UFunctions` for type                        |
 | `ue_findFunction(type, name)`                      | Find a specific `UFunction` for type                   |
@@ -123,6 +124,49 @@ Enumeration API returns tables keyed by reflected property name (including inher
 ```lua
 return ue_findClass('GameEngine')
 ```
+
+#### `ue_findObjectsOfClass(classNameOrAddress, options)`
+
+Find runtime `UObject` instances using UClass. Exact-class query are default
+Scans all objects on every call!
+
+```lua
+local objects, err, statistics = ue_findObjectsOfClass('GameInstance')
+assert(objects, err)
+
+-- local actors, err = ue_findObjectsOfClass( 'Actor', { includeSubclasses = true, excludeDefaultObjects = true, } )
+-- assert(actors, err)
+
+for _, object in ipairs(objects) do
+  print(
+        ('0x%X'):format(object.objectAddress),
+        object.objectName,
+        object.className,
+        object.objectIndex
+      )
+end
+
+print('Matches:', statistics.matchedObjectCount)
+```
+
+`options` fields:
+
+| Field                   | Default | Description |
+| ----------------------- | ------- | ----------- |
+| `includeSubclasses`     | `false` | Include instances whose runtime class derives from the requested class |
+| `excludeDefaultObjects` | `false` | Exclude objects whose name begins with `Default__` |
+| `limit`                 | `nil`   | Stop after this many results; must be a positive integer |
+
+Each result contains:
+
+| Field           | Description |
+| --------------- | ----------- |
+| `objectAddress` | Runtime `UObject*` |
+| `objectIndex`   | Zero-based GUObjectArray index |
+| `objectName`    | Reflected instance name |
+| `classAddress`  | Actual `UClass*` |
+| `className`     | Actual class name |
+| `isExactClass`  | `true` when `classAddress` exactly equals the requested class |
 
 #### `ue_findClassReferences(classNameOrAddress, options)`
 
