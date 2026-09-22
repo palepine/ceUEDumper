@@ -95,7 +95,7 @@ Any feedback and contribution is welcomed!
 
 ## Support
 
-If you find the script useful, [consider supporting me here so I keep improving the tool](https://ko-fi.com/vesperpallens)
+If you find the script useful, consider supporting me here so I keep improving the tool
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/R6R813UKCL)
 
