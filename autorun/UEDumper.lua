@@ -30,6 +30,8 @@ local Dumper =
   References = {},
   Structures = {},
   MetadataViews = {},
+  Bytecode = {},
+  Patching = {},
   Offsets = {},
   Functions = {},
   Invocation = {},
@@ -65,6 +67,7 @@ local PORTABLE_FILES =
 {
   { name = 'ceUEDumper',                  path = [[autorun\UEDumper.lua]] },
   { name = 'ceUEDumper.UEBackend',    path = [[autorun\ceUEDumperModules\UEBackend.lua]] },
+  { name = 'ceUEDumper.UEBytecode',   path = [[autorun\ceUEDumperModules\UEBytecode.lua]] },
   { name = 'ceUEDumper.UEDumperCore', path = [[autorun\ceUEDumperModules\UEDumperCore.lua]] },
   { name = 'ceUEDumper.UESignatures', path = [[autorun\ceUEDumperModules\UESignatures.lua]] },
 }
@@ -203,12 +206,20 @@ end
 
 
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEBackend', 'UEBackend.lua', 'ceUEDumper.UEBackend' )
+Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEBytecode', 'UEBytecode.lua', 'ceUEDumper.UEBytecode' )
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UESignatures', 'UESignatures.lua', 'ceUEDumper.UESignatures' )
 
 local Backend = require('ceUEDumperModules.UEBackend')
+local Bytecode = require('ceUEDumperModules.UEBytecode')
 local sharedResources = package.loaded['ceUEDumper.resources']
 
 sharedResources.structureDissectCallbacks = sharedResources.structureDissectCallbacks or {}
+sharedResources.functionPatches = sharedResources.functionPatches or
+{
+  processId = getOpenedProcessID(),
+  nextId = 1,
+  active = {},
+}
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// DUMPER CODE
 
@@ -2113,6 +2124,11 @@ function Dumper.StructureDissect.structureDissectOverride(address)
 
   if not resolved or not context or context.objectAddress ~= address then return nil end
 
+  if Backend.showsReflectionMetadata() and context.className == 'Function' then
+    local functionStructure = Dumper.MetadataViews.getFunctionMetadataStructure(context.objectAddress)
+    if functionStructure then return functionStructure end
+  end
+
   local created, structure = pcall( Dumper.Structures.ue_createStructureFromObject, context.objectAddress )
   if not created or not structure then return nil end
 
@@ -2303,7 +2319,7 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
     { 'ChildProperties [parameters]', layout.PropertyLinkAlt, vtPointer, 'property' },
     { 'PropertiesSize', layout.PropertiesSize, vtDword },
     { 'MinAlignment', layout.MinAlignment, vtWord },
-    { 'Script.Data [' .. scriptKind .. ']', metadata.scriptOffset, vtPointer },
+    { 'Script.Data [' .. scriptKind .. ']', metadata.scriptOffset, vtPointer, 'script' },
     { 'Script.Num', metadata.scriptOffset and metadata.scriptOffset + PTR_SIZE, vtDword },
     { 'Script.Max', metadata.scriptOffset and metadata.scriptOffset + PTR_SIZE + 4, vtDword },
     { 'PropertyLink [parameters]', layout.PropertyLink, vtPointer, 'property' },
@@ -2330,6 +2346,11 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
     elseif field[4] == 'name' and Backend.hasCustomType('FName') then element.Vartype, element.CustomTypeName = vtCustom, 'FName'
     elseif field[4] == 'property' then element.ChildStruct = Dumper.MetadataViews.getPropertyMetadataStructure()
     elseif field[4] == 'field' then element.OnCreateChild = function(_, address) return Dumper.MetadataViews.getFieldMetadataStructure(address) end
+    elseif field[4] == 'script' and metadata.bytecodeSize and metadata.bytecodeSize > 0 then
+      element.OnCreateChild = function()
+        local childStructure = Dumper.Bytecode.createStructure(metadata)
+        return childStructure
+      end
     end
 
     ::continue::
@@ -2420,6 +2441,184 @@ function Dumper.MetadataViews.getPropertyMetadataStructure()
   end
 
   return structure
+end
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// KISMET BYTECODE
+
+--- Describe runtime-linked object/property operands embedded in Kismet bytecode
+-- @param address number @ linked UObject or FField pointer
+-- @return string|nil @ reflected operand name
+function Dumper.Bytecode.describePointer(address)
+  local propertyDecoded, propertyName, property = pcall( Backend.propertyMetadata, address )
+  if propertyDecoded and property then return propertyName end
+
+  local objectDecoded, objectName = pcall( Backend.objectName, address )
+  return objectDecoded and objectName or nil
+end
+
+--- Build struct view for UFunction::Script bytecode
+-- @param functionMetadata table @ validated UFunction metadata
+-- @return userdata|nil @ CE child structure rooted at Script.Data
+-- @return string|nil @ decoding feedback
+function Dumper.Bytecode.createStructure(functionMetadata)
+  local structure, feedback = Bytecode.Structures.create(
+    functionMetadata,
+    {
+      describePointer = Dumper.Bytecode.describePointer,
+      hasFNameCustomType = Backend.hasCustomType('FName'),
+    }
+  )
+
+  if structure and feedback then structure.Name = structure.Name .. ' [partial]' end
+  return structure, feedback
+end
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// BYTECODE PATCHING
+
+--- Return process-local reversible-patch registry
+-- registry survives reloading, previous patches are discarded
+-- @return table @ active-patch registry
+function Dumper.Patching.registry()
+  local registry = sharedResources.functionPatches
+  local processId = getOpenedProcessID()
+
+  if registry.processId ~= processId then
+    registry.processId = processId
+    registry.nextId = 1
+    registry.active = {}
+  end
+
+  return registry
+end
+
+--- Find active patch overlapping proposed Script byte range
+-- @param bytecodeAddress number @ Script.Data base
+-- @param byteOffset number @ zero-based patch offset
+-- @param byteCount number @ patch size
+-- @return table|nil @ conflicting patch handle
+function Dumper.Patching.findOverlap(bytecodeAddress, byteOffset, byteCount)
+  local rangeAddress = bytecodeAddress + byteOffset
+
+  for _, patch in pairs( Dumper.Patching.registry().active ) do
+    if patch.active and Bytecode.Patches.rangesOverlap( rangeAddress, byteCount, patch.address, patch.size ) then return patch end
+  end
+
+  return nil
+end
+
+--- Patch bytes inside UFunction's Blueprint Script array
+-- Patches bytes only, original bytes are saved as a handle for safely recovery
+-- @param functionAddress number @ UFunction descriptor address
+-- @param patchBytes number[] @ replacement byte values
+-- @param byteOffset number|nil @ zero-based Script.Data offset, defaults to zero
+-- @return table|nil @ reversible patch handle
+-- @return string|nil @ error
+function Dumper.Patching.ue_patchFunction(functionAddress, patchBytes, byteOffset)
+  assert( type(functionAddress) == 'number' and functionAddress ~= 0, 'function address must be non-zero' )
+
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+  if not metadata then return nil, metadataError end
+
+  local validatedBytes, validationError = Bytecode.Patches.validateBytes(patchBytes)
+  if not validatedBytes then return nil, validationError end
+
+  byteOffset = byteOffset or 0
+  if type(byteOffset) ~= 'number' or byteOffset % 1 ~= 0 or byteOffset < 0 then return nil, 'Patch offset must be a non-negative integer' end
+
+  local conflictingPatch = metadata.bytecode and Dumper.Patching.findOverlap( metadata.bytecode, byteOffset, #validatedBytes )
+  if conflictingPatch then return nil, ('Patch overlaps active patch #%d'):format(conflictingPatch.id) end
+
+  local patch, patchError = Bytecode.Patches.apply( metadata, validatedBytes, byteOffset )
+  if not patch then return nil, patchError end
+
+  local registry = Dumper.Patching.registry()
+  patch.id = registry.nextId
+  patch.processId = registry.processId
+  registry.nextId = registry.nextId + 1
+  registry.active[patch.id] = patch
+
+  return patch
+end
+
+--- NOP (void) Blueprint function body (inject return)
+-- @param functionAddress number @ UFunction descriptor address
+-- @param options table|nil @ { allowNonVoid=true } opts into an unsafe uninitialized return
+-- @return table|nil @ reversible patch handle
+-- @return string|nil @ error
+function Dumper.Patching.ue_nopFunction(functionAddress, options)
+  assert( type(functionAddress) == 'number' and functionAddress ~= 0, 'function address must be non-zero' )
+  options = options or {}
+
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+  if not metadata then return nil, metadataError end
+  if metadata.native then return nil, 'Native UFunction thunks cannot be disabled by patching Blueprint bytecode' end
+
+  local returnParameter
+  for parameterName, property in pairs(metadata.parameters or {}) do
+    if property.isReturnParameter then returnParameter = parameterName; break end
+  end
+
+  if returnParameter and not options.allowNonVoid then
+    return nil, ('UFunction has return parameter %s; a void bytecode stub would leave it uninitialized'):format(returnParameter)
+  end
+
+  return Dumper.Patching.ue_patchFunction( functionAddress, Bytecode.Patches.VOID_RETURN, 0 )
+end
+
+--- Restore one reversible function patch
+-- @param patch table @ handle returned by ue_patchFunction/ue_nopFunction
+-- @param options table|nil @ { force=true } overwrites externally changed bytes
+-- @return boolean|nil @ true when restored
+-- @return string|nil @ error
+function Dumper.Patching.ue_restoreFunctionPatch(patch, options)
+  if type(patch) ~= 'table' then return nil, 'Function patch handle is required' end
+
+  local registry = Dumper.Patching.registry()
+  if patch.processId ~= registry.processId then return nil, 'Function patch belongs to another process' end
+  if not patch.id or registry.active[patch.id] ~= patch then return nil, 'Function patch is not owned by this dumper instance' end
+
+  local restored, restoreError = Bytecode.Patches.restore( patch, options and options.force == true )
+  if not restored then return nil, restoreError end
+
+  registry.active[patch.id] = nil
+  return true
+end
+
+--- Restore every active function patch in reverse application order
+-- @param options table|nil @ forwarded to ue_restoreFunctionPatch
+-- @return number|nil @ number of restored patches
+-- @return string|nil @ error
+function Dumper.Patching.ue_restoreAllFunctionPatches(options)
+  local registry = Dumper.Patching.registry()
+  local patches = {}
+
+  for _, patch in pairs(registry.active) do patches[ #patches + 1 ] = patch end
+  table.sort( patches, function(left, right) return left.id > right.id end )
+
+  local restoredCount = 0
+  for _, patch in ipairs(patches) do
+    local restored, restoreError = Dumper.Patching.ue_restoreFunctionPatch( patch, options )
+    if not restored then return nil, ('Patch #%d: %s'):format( patch.id, restoreError ) end
+    restoredCount = restoredCount + 1
+  end
+
+  return restoredCount
+end
+
+--- Enumerate active reversible function patches
+-- @param functionAddress number|nil @ optional UFunction filter
+-- @return table[] @ handles ordered by application id
+function Dumper.Patching.ue_getFunctionPatches(functionAddress)
+  local patches = {}
+
+  for _, patch in pairs( Dumper.Patching.registry().active ) do
+    if not functionAddress or patch.functionAddress == functionAddress then patches[ #patches + 1 ] = patch end
+  end
+
+  table.sort( patches, function(left, right) return left.id < right.id end )
+  return patches
 end
 
 
@@ -3274,6 +3473,11 @@ Dumper.API =
   ue_enumFunctions = Dumper.Functions.ue_enumFunctions,
   ue_findFunction = Dumper.Functions.ue_findFunction,
   ue_getFunctionMetadata = Dumper.Functions.ue_getFunctionMetadata,
+  ue_patchFunction = Dumper.Patching.ue_patchFunction,
+  ue_nopFunction = Dumper.Patching.ue_nopFunction,
+  ue_restoreFunctionPatch = Dumper.Patching.ue_restoreFunctionPatch,
+  ue_restoreAllFunctionPatches = Dumper.Patching.ue_restoreAllFunctionPatches,
+  ue_getFunctionPatches = Dumper.Patching.ue_getFunctionPatches,
   ue_callFunction = Dumper.Invocation.ue_callFunction,
   ue_dumpFNames = Dumper.Dumps.ue_dumpFNames,
   ue_dumpTypes = Dumper.Dumps.ue_dumpTypes,
