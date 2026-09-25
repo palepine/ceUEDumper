@@ -17,6 +17,11 @@
 | `ue_enumFunctions(type)`                           | Enumerate `UFunctions` for type                        |
 | `ue_findFunction(type, name)`                      | Find a specific `UFunction` for type                   |
 | `ue_getFunctionMetadata(function)`                 | Get `UFunction` obj & parameter metadata               |
+| `ue_patchFunction(function, bytes, offset)`        | Apply a reversible Blueprint-bytecode patch             |
+| `ue_nopFunction(function, options)`                | Replace a void Blueprint body with an immediate return  |
+| `ue_restoreFunctionPatch(patch, options)`          | Restore one bytecode patch                              |
+| `ue_restoreAllFunctionPatches(options)`            | Restore all active bytecode patches                     |
+| `ue_getFunctionPatches(function)`                  | List active reversible patches                          |
 | `ue_callFunction(this, name, arguments, options)`  | Invoke `UFunction` for an object                       |
 | `ue_enumProperties(class)`                         | Enumerate properties for class name UClass addr        |
 | `ue_getPropertyOffset(class, property)`            | Resolve one property offset                            |
@@ -476,6 +481,50 @@ for name, parameter in pairs( info.parameters ) do
     print( name, parameter.propertyType, parameter.offset, parameter.isOutParameter, parameter.isReturnParameter )
   end
 end
+```
+
+### Blueprint bytecode patching
+
+#### `ue_patchFunction(functionAddress, patchBytes, byteOffset)`
+> replace raw bytes inside `UFunction::Script` array
+
+    `byteOffset` is zero-based optional index.
+    Returns a handle with original bytesused to restore original bytes
+
+```lua
+local functionAddress = assert( ue_findFunction( 'BP_ThirdPersonCharacter_C', 'ReceiveBeginPlay' ) )
+
+local patch = assert( ue_patchFunction( functionAddress, { 0x04, 0x0B, 0x53 }, 0 ) ) -- EX_Return EX_Nothing EX_EndOfScript
+
+assert( ue_restoreFunctionPatch(patch) ) -- reverting
+```
+
+#### `ue_nopFunction(functionAddress, options)`
+> Patches a void Blueprint function to immediately return from the prologue
+
+    `ue_nopFunction(functionAddress, { allowNonVoid = true })` ignores return property check
+    making the caller accept an uninitialized result, i.e. UB
+
+```lua
+local functionAddress = assert( ue_findFunction( 'BP_ThirdPersonCharacter_C', 'ReceiveTick' ) )
+
+local patch, patchError = ue_nopFunction(functionAddress)
+assert(patch, patchError)
+
+assert( ue_restoreFunctionPatch(patch) ) -- reverting
+```
+
+#### ue_restoreFunctionPatch(patch, options )
+> tries to safely restore a patch via a func address
+`ue_restoreFunctionPatch(patch, { force = true })` or `ue_restoreAllFunctionPatches({ force = true })` to force-patch
+
+```lua
+-- all active patches
+local active = ue_getFunctionPatches()
+local forFunction = ue_getFunctionPatches(functionAddress)
+
+local restoredCount, restoreError = ue_restoreAllFunctionPatches()
+assert(restoredCount, restoreError)
 ```
 
 ### Invoking & argument passing
