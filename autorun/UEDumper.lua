@@ -18,6 +18,10 @@
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// GLOBALS CONSTANTS
 
 -- TODO: name all magic numbers across the project
+-- TODO: search for properties by name
+-- TODO: search for objects by fname
+-- TODO: fname/object descryption
+-- TODO: more option for limiting
 
 local Dumper =
 {
