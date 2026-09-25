@@ -515,7 +515,7 @@ assert( ue_restoreFunctionPatch(patch) ) -- reverting
 ```
 
 #### ue_restoreFunctionPatch(patch, options )
-> tries to safely restore a patch via a func address
+> tries to safely restore a patch via a handler
 `ue_restoreFunctionPatch(patch, { force = true })` or `ue_restoreAllFunctionPatches({ force = true })` to force-patch
 
 ```lua
