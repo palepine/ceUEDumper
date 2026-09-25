@@ -56,6 +56,10 @@ resources.customTypes = resources.customTypes or {}
 resources.symbols = resources.symbols or {}
 resources.options = resources.options or { showReflectionMetadata = false }
 
+if resources.options.menuVisible == nil then
+  resources.options.menuVisible = true
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// HELPERS
 
 --- Load Core from the portable table attachment or installed module
@@ -345,6 +349,29 @@ function Module.Objects.objectAt(index)
   return Module.Objects.objectAtFromView( view, index )
 end
 
+--- Create sequential GUObjectArray iterator
+-- @return function|nil @ iterator yielding zero-based index and UObject address
+-- @return number|string @ object count, or error text when unavailable
+function Module.Objects.objectIterator()
+  local view = Module.Objects.createObjectArrayView(true)
+  if not view then return nil, 'GUObjectArray view is unavailable' end
+
+  local index = 0
+  local objectAtFromView = Module.Objects.objectAtFromView
+
+  -- iterator retains one object-array view and its current chunk cache
+  local function nextObject()
+    if index >= view.count then return nil end
+
+    local currentIndex = index
+    local objectAddress = objectAtFromView( view, currentIndex )
+    index = index + 1
+    return currentIndex, objectAddress
+  end
+
+  return nextObject, view.count
+end
+
 --- Return short reflected name of a UObject
 -- @param address number @ UObject addr
 -- @return string|nil @ reflected name
@@ -416,11 +443,13 @@ local function getTypeLookupState()
       {
         Class = {},
         ScriptStruct = {},
+        Enum = {},
       },
       addressesByKind =
       {
         Class = {},
         ScriptStruct = {},
+        Enum = {},
       },
       any = {},
       metaClassKinds = {},
@@ -437,7 +466,7 @@ end
 -- Ordinary UObject instances sharing one class therefore pay ancestry check only once
 -- @param metaClassAddress number @ candidate object's ClassPrivate pointer
 -- @param state table @ incremental type-lookup state
--- @return string|nil @ Class or ScriptStruct
+-- @return string|nil @ Class, ScriptStruct or Enum
 local function reflectedTypeKind(metaClassAddress, state)
   if not isValidAddress(metaClassAddress) then return nil end
 
@@ -459,7 +488,7 @@ local function reflectedTypeKind(metaClassAddress, state)
       visited[currentAddress] = true
       local currentName = objectName(currentAddress)
 
-      if currentName == 'Class' or currentName == 'ScriptStruct' then
+      if currentName == 'Class' or currentName == 'ScriptStruct' or currentName == 'Enum' then
         kind = currentName
         break
       end
@@ -479,7 +508,7 @@ end
 -- behavior when duplicate short names exist
 -- @param state table @ incremental lookup state
 -- @param typeAddress number @ UClass or UScriptStruct descriptor
--- @param kind string @ Class or ScriptStruct
+-- @param kind string @ Class, ScriptStruct or Enum
 -- @return string|nil @ reflected short name
 local function indexReflectedType(state, typeAddress, kind)
   local name = Core.objectName(typeAddress)
@@ -498,7 +527,7 @@ end
 --- Index next GUObjectArray entry when it is a reflected type
 -- @param state table @ incremental type-index state
 -- @return number|nil @ reflected type descriptor
--- @return string|nil @ Class or ScriptStruct
+-- @return string|nil @ Class, ScriptStruct or Enum
 -- @return string|nil @ reflected short name
 local function indexNextReflectedType(state)
   if state.nextIndex >= state.view.count then return nil end
@@ -519,9 +548,9 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// REFLECTED TYPE LOOKUP
 
---- Find reflected class or script struct by name
+--- Find reflected class, script struct, or enum by name
 -- @param name string @ short reflected name, e.g. "Character"
--- @param kind string|nil @ Class/ScriptStruct. nil to accept either
+-- @param kind string|nil @ Class/ScriptStruct/Enum. nil to accept any
 -- @return number|nil @ addr of the reflected type
 function Module.Objects.findType(name, kind)
   assert( type(name) == 'string' and name ~= '' , 'type name must be a non-empty string' )
@@ -529,7 +558,7 @@ function Module.Objects.findType(name, kind)
   local state = getTypeLookupState()
   if not state then return nil end
 
-  local supportedKind = kind == nil or kind == 'Class' or kind == 'ScriptStruct'
+  local supportedKind = kind == nil or kind == 'Class' or kind == 'ScriptStruct' or kind == 'Enum'
   local requestedIndex
 
   if kind == nil then         requestedIndex = state.any
@@ -566,11 +595,11 @@ function Module.Objects.findType(name, kind)
 end
 
 --- Enumerate every reflected type of one supported kind
--- @param kind string @ Class or ScriptStruct
+-- @param kind string @ Class, ScriptStruct or Enum
 -- @return number[]|nil @ reflected descriptor addresses
 -- @return string|nil @ object-array identity used by higher-level caches
 function Module.Objects.reflectedTypes(kind)
-  assert( kind == 'Class' or kind == 'ScriptStruct', 'kind must be Class or ScriptStruct' )
+  assert( kind == 'Class' or kind == 'ScriptStruct' or kind == 'Enum', 'kind must be Class, ScriptStruct, or Enum' )
   -- incremental GUObjectArray index is completed only once per runtime
 
   local state = getTypeLookupState()
@@ -936,6 +965,14 @@ function Module.Reflection.nameIndex(name)
   return definitions.NameToIndex and definitions.NameToIndex[name] or nil
 end
 
+--- Return decoded FName table indexed by comparison index
+-- table is owned by the scanner, read-only
+-- @return table<number, string>|nil @ cached runtime names
+function Module.Reflection.namesByIndex()
+  local definitions = Core.definitions()
+  return definitions.IndexToName
+end
+
 --- Get found UObject header offsets without exposing mutable core state
 -- @return table @ known header offsets only
 function Module.Reflection.objectHeaderLayout()
@@ -1276,6 +1313,64 @@ function Module.Reflection.propertyClassReference(propertyAddress, propertyType)
   return selected.address, memberName, selected.offset
 end
 
+--- Resolve UEnum referenced by EnumProperty/ByteProperty descriptor
+-- @param propertyAddress number @ reflected property descriptor
+-- @param propertyType string @ EnumProperty or ByteProperty
+-- @return number|nil @ referenced UEnum descriptor
+function Module.Reflection.propertyEnum(propertyAddress, propertyType)
+  if propertyType ~= 'EnumProperty' and propertyType ~= 'ByteProperty' then return nil end
+  if not isValidAddress(propertyAddress) then return nil end
+
+  local definitions = Core.definitions()
+  local layoutName = propertyType == 'EnumProperty' and 'FEnumProperty' or 'FByteProperty'
+  local configuredOffset = definitions[layoutName] and definitions[layoutName].Enum
+
+  if type(configuredOffset) == 'number' then
+    local configuredEnum = readPointer( propertyAddress + configuredOffset )
+
+    if isValidAddress(configuredEnum) and objectHasMetaClass( configuredEnum, 'Enum' ) then
+      return configuredEnum
+    end
+  end
+
+  for offset = 0x58, 0xB8, PTR_SIZE do
+    local enumAddress = readPointer( propertyAddress + offset )
+
+    if isValidAddress(enumAddress) and objectHasMetaClass( enumAddress, 'Enum' ) then
+      definitions[layoutName] = definitions[layoutName] or {}
+      definitions[layoutName].Enum = offset
+      return enumAddress
+    end
+  end
+
+  return nil
+end
+
+--- Decode one reflected property descriptor outside property chain
+-- used by object dumping when GUObjectArray contains UProperty/FProperty objects
+-- @param propertyAddress number @ reflected property descriptor
+-- @return string|nil @ reflected field name
+-- @return table|nil @ enriched property metadata
+-- @return string|nil @ decode error
+function Module.Reflection.propertyMetadata(propertyAddress)
+  local propertyName, property, propertyError = Core.propertyMetadata(propertyAddress)
+  if not property then return propertyName, nil, propertyError end
+
+  addPropertyFlags(property)
+
+  if property.propertyType == 'StructProperty' then
+    property.structAddress, property.structError = Module.Reflection.propertyStruct(propertyAddress)
+  elseif property.propertyType == 'ArrayProperty' then
+    property.innerProperty, property.innerError = Module.Reflection.propertyArrayInner(propertyAddress)
+  elseif property.propertyType == 'SetProperty' then
+    property.elementProperty, property.elementError = Module.Reflection.propertySetElement(propertyAddress)
+  elseif property.propertyType == 'MapProperty' then
+    property.keyProperty, property.valueProperty, property.mapError = Module.Reflection.propertyMapMembers(propertyAddress)
+  end
+
+  return propertyName, property
+end
+
 --- Resolve UScriptStruct referenced by a struct-property descriptor
 -- Candidate slots accommodate legacy/modern FProperty sizes. Accept only a
 -- unique ScriptStruct-typed target; never interpret inline data as a UObject
@@ -1484,6 +1579,100 @@ function Module.Reflection.propertyMapMembers(propertyAddress)
   return nil, nil, 'FMapProperty.KeyProp/ValueProp were not resolved'
 end
 
+--- Decode UEnum::Names without assuming one fixed engine-version offset
+-- UEnum stores TArray of name/value pairs
+-- Supported pair layouts cover the ordinary 8-byte FName and case-preserving 12-byte FName variants
+-- @param enumAddress number @ UEnum descriptor
+-- @return table[]|nil @ ordered entries containing name and value
+-- @return string|nil @ layout error
+function Module.Reflection.enumValues(enumAddress)
+  if not isValidAddress(enumAddress) or not objectHasMetaClass( enumAddress, 'Enum' ) then
+    return nil, 'Address is not a UEnum'
+  end
+
+  local definitions = Core.definitions()
+  local namesByIndex = definitions.IndexToName or {}
+  local enumName = Module.Objects.objectName(enumAddress) or ''
+  local pairLayouts =
+  {
+    { stride = 0x10, valueOffset = 0x8 },
+    { stride = 0x18, valueOffset = 0x10 },
+    { stride = 0x20, valueOffset = 0x10 },
+  }
+  local best
+
+  for arrayOffset = 0x28, 0xB0, PTR_SIZE do
+    local dataAddress = readPointer( enumAddress + arrayOffset )
+    local count = readInteger( enumAddress + arrayOffset + PTR_SIZE )
+    local capacity = readInteger( enumAddress + arrayOffset + PTR_SIZE + 4 )
+
+    if not isValidAddress(dataAddress)
+           or type(count) ~= 'number'
+           or count <= 0
+           or count > 0x10000
+           or type(capacity) ~= 'number'
+           or capacity < count
+           or capacity > 0x100000
+    then
+      goto continueArray
+    end
+
+    for _, pairLayout in ipairs(pairLayouts) do
+      local sampleCount = math.min( count, 32 )
+      local validNameCount = 0
+      local scopedNameCount = 0
+
+      for index = 0, sampleCount - 1 do
+        local entryAddress = dataAddress + index * pairLayout.stride
+        local nameIndex = readInteger(entryAddress)
+        local name = nameIndex and namesByIndex[nameIndex]
+
+        if name then
+          validNameCount = validNameCount + 1
+
+          if name:find('::', 1, true) or enumName ~= '' and name:find(enumName, 1, true) then
+            scopedNameCount = scopedNameCount + 1
+          end
+        end
+      end
+
+      if validNameCount == sampleCount then
+        local score = validNameCount * 10 + scopedNameCount * 100
+
+        if not best or score > best.score then
+          best =
+          {
+            score = score,
+            dataAddress = dataAddress,
+            count = count,
+            stride = pairLayout.stride,
+            valueOffset = pairLayout.valueOffset,
+          }
+        end
+      end
+    end
+
+    ::continueArray::
+  end
+
+  if not best then return nil, 'UEnum name/value array was not resolved' end
+
+  local values = {}
+
+  for index = 0, best.count - 1 do
+    local entryAddress = best.dataAddress + index * best.stride
+    local nameIndex = readInteger(entryAddress)
+    local name = nameIndex and namesByIndex[nameIndex]
+    local value = readQword( entryAddress + best.valueOffset )
+
+    if not name or value == nil then return nil, 'UEnum name/value entry became unreadable' end
+
+    values[ #values + 1 ] = { name = name, value = value }
+  end
+
+  return values
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// BACKEND SETTINGS
 
 --- If structure views should expand reflection descriptor internals
@@ -1496,6 +1685,19 @@ end
 -- @param enabled boolean @ show UClass property chains when true
 function Module.Options.setReflectionMetadataVisible(enabled)
   resources.options.showReflectionMetadata = enabled == true
+end
+
+--- Return configured root-menu visibility
+-- @return boolean @ true when the menu is configured to be visible
+function Module.Options.isMenuVisible()
+  return Core.isMenuVisible()
+end
+
+--- Show/hide ceUEDumper menu
+-- @param enabled boolean @ true to show the root menu item
+-- @return boolean @ resulting configured visibility
+function Module.Options.setMenuVisible(enabled)
+  return Core.setMenuVisible(enabled)
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// EXPORT
@@ -1513,6 +1715,7 @@ Module.status = Module.Lifecycle.status
 
 Module.objectCount = Module.Objects.objectCount
 Module.objectAt = Module.Objects.objectAt
+Module.objectIterator = Module.Objects.objectIterator
 Module.objectName = Module.Objects.objectName
 Module.objectClass = Module.Objects.objectClass
 Module.findType = Module.Objects.findType
@@ -1528,18 +1731,24 @@ Module.processEvent = Module.Functions.processEvent
 Module.functionMetadata = Module.Functions.functionMetadata
 
 Module.nameIndex = Module.Reflection.nameIndex
+Module.namesByIndex = Module.Reflection.namesByIndex
 Module.objectHeaderLayout = Module.Reflection.objectHeaderLayout
 Module.classHeaderLayout = Module.Reflection.classHeaderLayout
 Module.propertyHeaderLayout = Module.Reflection.propertyHeaderLayout
 Module.properties = Module.Reflection.properties
 Module.declaredProperties = Module.Reflection.declaredProperties
 Module.propertyClassReference = Module.Reflection.propertyClassReference
+Module.propertyEnum = Module.Reflection.propertyEnum
+Module.propertyMetadata = Module.Reflection.propertyMetadata
 Module.propertyStruct = Module.Reflection.propertyStruct
 Module.propertyArrayInner = Module.Reflection.propertyArrayInner
 Module.propertySetElement = Module.Reflection.propertySetElement
 Module.propertyMapMembers = Module.Reflection.propertyMapMembers
+Module.enumValues = Module.Reflection.enumValues
 
 Module.showsReflectionMetadata = Module.Options.showsReflectionMetadata
 Module.setReflectionMetadataVisible = Module.Options.setReflectionMetadataVisible
+Module.isMenuVisible = Module.Options.isMenuVisible
+Module.setMenuVisible = Module.Options.setMenuVisible
 
 return Module

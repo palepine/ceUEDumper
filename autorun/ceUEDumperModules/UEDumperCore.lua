@@ -89,6 +89,10 @@ local UObjectArray_Verifier_Type
 local resources = ceUEDumperResources or { customTypes = {} }
 resources.options = resources.options or { showReflectionMetadata = false }
 
+if resources.options.menuVisible == nil then
+  resources.options.menuVisible = true
+end
+
 local PROPERTY_LAYOUTS =
   {
     {
@@ -508,6 +512,18 @@ function Core.Reflection.readPropertyMetadata(propertyAddress)
   -- some found layouts expose ElementSize, others don't
   if type(layout.Size) == 'number' then
     propertyMetadata.size = readInteger( propertyAddress + layout.Size )
+
+    -- ArrayDim immediately precedes ElementSize in supported UProperty and FProperty layouts
+    -- preserve both element size and complete field size
+    local arrayDim = readInteger( propertyAddress + layout.Size - 4 )
+
+    if type(arrayDim) == 'number' and arrayDim > 0 and arrayDim <= 0x10000 then
+      propertyMetadata.arrayDim = arrayDim
+
+      if type(propertyMetadata.size) == 'number' and propertyMetadata.size > 0 then
+        propertyMetadata.totalSize = propertyMetadata.size * arrayDim
+      end
+    end
   end
 
   if propertyMetadata.propertyType == 'BoolProperty' and type(layout.BitMaskField) == 'number' then
@@ -5469,6 +5485,40 @@ function Core.Menu.destroyUEMenu()
   if CUEDEFS then CUEDEFS.GUI = nil end
 end
 
+--- Show or hide the ceUEDumper root menu item
+-- The preference is retained in the shared runtime resources, so menu
+-- reconstructions performed by scanner-state transitions preserve it.
+-- @param enabled boolean @ true to show the menu; false to hide it
+-- @return boolean @ resulting configured visibility
+function Core.Menu.setMenuVisible(enabled)
+  assert( type(enabled) == 'boolean', 'enabled must be a boolean' )
+
+  resources.options.menuVisible = enabled
+
+  Core.Runtime.onMainThread(
+    function()
+      local menuRoot = MainForm and MainForm.Menu and MainForm.Menu.Items
+      if not menuRoot then return end
+
+      for index = menuRoot.Count - 1, 0, -1 do
+        local menuItem = menuRoot[index]
+
+        if menuItem and menuItem.Name == 'miCeUEDumper' then
+          menuItem.Visible = enabled
+        end
+      end
+    end
+  )
+
+  return resources.options.menuVisible
+end
+
+--- Return the configured ceUEDumper root-menu visibility
+-- @return boolean @ true when current and future menu instances are visible
+function Core.Menu.isMenuVisible()
+  return resources.options.menuVisible ~= false
+end
+
 --- Create a menu item
 -- @param scanning boolean|nil @ show worker progress controls when true
 -- @return void
@@ -5495,13 +5545,18 @@ function Core.Menu.createUEMenu(scanning, cancellationThread)
 
   --- Add main menu items
   local function addPersistentMenuActions(gui)
-    gui.miAttach = createMenuItem(gui.miUnrealEngine)
+    gui.miDebug = createMenuItem(gui.miUnrealEngine)
+    gui.miDebug.Name = 'miCeUEDumperDebug'
+    gui.miDebug.Caption = 'Debug'
+    gui.miUnrealEngine.add(gui.miDebug)
+
+    gui.miAttach = createMenuItem(gui.miDebug)
     gui.miAttach.Name = 'miCeUEDumperAttach'
     gui.miAttach.Caption = 'Attach script to table'
     gui.miAttach.OnClick = attachDumperToTable
-    gui.miUnrealEngine.add( gui.miAttach )
+    gui.miDebug.add( gui.miAttach )
 
-    gui.miReflectionMetadata = createMenuItem( gui.miUnrealEngine )
+    gui.miReflectionMetadata = createMenuItem( gui.miDebug )
     gui.miReflectionMetadata.Name = 'miCeUEDumperReflectionMetadata'
     gui.miReflectionMetadata.Caption = 'Dissect UClass/UProperty metadata?'
     gui.miReflectionMetadata.Checked = resources.options.showReflectionMetadata == true
@@ -5515,12 +5570,12 @@ function Core.Menu.createUEMenu(scanning, cancellationThread)
       menuItem.Checked = enabled
     end
 
-    gui.miUnrealEngine.add(gui.miReflectionMetadata)
+    gui.miDebug.add(gui.miReflectionMetadata)
 
     gui.miSupport = createMenuItem( gui.miUnrealEngine )
     gui.miSupport.Name = 'miCeUEDumperSupportDevelopment'
     gui.miSupport.Caption = 'Support development'
-    gui.miSupport.OnClick = function() shellExecute('https://ko-fi.com/vesperpallens') end
+    gui.miSupport.OnClick = function() shellExecute('https://www.patreon.com/c/palepine') end
     gui.miUnrealEngine.add(gui.miSupport)
   end
 
@@ -5577,6 +5632,7 @@ function Core.Menu.createUEMenu(scanning, cancellationThread)
     end
 
     MainForm.Menu.Items.insert( MainForm.miHelp.MenuIndex, CUEDEFS.GUI.miUnrealEngine )
+    CUEDEFS.GUI.miUnrealEngine.Visible = resources.options.menuVisible ~= false
   end)
 
 end
@@ -5654,7 +5710,7 @@ function Core.Menu.showCompletedState(cancellationThread)
       gui.miAutomaticStructureDissect.destroy()
     end
 
-    gui.miAutomaticStructureDissect = createMenuItem( gui.miUnrealEngine )
+    gui.miAutomaticStructureDissect = createMenuItem( gui.miDebug )
     gui.miAutomaticStructureDissect.Caption = 'Toggle Struct Guessing'
     gui.miAutomaticStructureDissect.Name = 'miCeUEDumperAutomaticStructureDissect'
     gui.miAutomaticStructureDissect.Checked = type(ue_isStructureDissectEnabled) == 'function'
@@ -5676,7 +5732,7 @@ function Core.Menu.showCompletedState(cancellationThread)
       menuItem.Checked = enabled
     end
 
-    gui.miUnrealEngine.add( gui.miAutomaticStructureDissect )
+    gui.miDebug.add( gui.miAutomaticStructureDissect )
 
   end)
 
@@ -6934,6 +6990,8 @@ Core.API.propertyMetadata = Core.Reflection.readPropertyMetadata
 Core.API.findContainingObject = Core.Objects.findContainingObject
 Core.API.status = Core.API.ue_getScannerStatusInternal
 Core.API.processEvent = Core.Signatures.resolveProcessEvent
+Core.API.setMenuVisible = Core.Menu.setMenuVisible
+Core.API.isMenuVisible = Core.Menu.isMenuVisible
 Core.API.subsystems = Core
 
 return Core.API

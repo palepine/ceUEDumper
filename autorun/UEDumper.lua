@@ -33,6 +33,7 @@ local Dumper =
   Offsets = {},
   Functions = {},
   Invocation = {},
+  Dumps = {},
   StructureDissect = {},
   API = {},
   State = {},
@@ -666,6 +667,26 @@ end
 -- @return boolean @ true when UProperty chains are exposed
 function Dumper.Lifecycle.ue_isReflectionMetadataVisible()
   return Backend.showsReflectionMetadata()
+end
+
+--- Show/hide ceUEDumper root menu item
+-- @param enabled boolean @ true to show the menu; false to hide it
+-- @return boolean @ resulting configured visibility
+function Dumper.Lifecycle.ue_setMenuVisible(enabled)
+  assert( type(enabled) == 'boolean', 'enabled must be a boolean' )
+  return Backend.setMenuVisible(enabled)
+end
+
+--- Return configured ceUEDumper root-menu visibility
+-- @return boolean @ true when current and future menu instances are visible
+function Dumper.Lifecycle.ue_isMenuVisible()
+  return Backend.isMenuVisible()
+end
+
+--- Return internal dumper object
+-- @return table @ internal Dumper namespace and state object
+function Dumper.Lifecycle.ue_getDumper()
+  return Dumper
 end
 
 --- Whether the configured init readiness requirement is satisfied
@@ -2811,6 +2832,419 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
   return callResult
 end
 
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// TEXT DUMPS
+
+--- Get executable path
+-- @param fileName string @ dump file name without a directory
+-- @return string|nil @ absolute output path
+-- @return string|nil @ path error
+function Dumper.Dumps.defaultOutputPath(fileName)
+  local modules = enumModules()
+  local executable = modules and modules[1]
+  local executablePath = executable and executable.PathToFile
+
+  if type(executablePath) ~= 'string' or executablePath == '' then return nil, 'Target executable path is unavailable' end
+
+  local directory = executablePath:match('^(.*[\\/])')
+  if not directory then return nil, 'Target executable directory is unavailable' end
+  return directory .. fileName
+end
+
+--- Write one CRLF-terminated dump line or raise a file error
+-- @param file file* @ open Lua file
+-- @param line string|nil @ line text
+function Dumper.Dumps.writeLine(file, line)
+  local written, writeError = file:write( line or '', '\r\n' )
+  if not written then error( 'Dump write failed: ' .. tostring(writeError), 0 ) end
+end
+
+--- Open, populate, close a text dump
+-- @param outputPath string|nil @ explicit path
+-- @param defaultName string @ executable-directory file name
+-- @param writer function @ callback receiving the open file
+-- @return string|nil @ written absolute path
+-- @return number|string|nil @ writer result, or error
+function Dumper.Dumps.writeFile(outputPath, defaultName, writer)
+  if outputPath ~= nil then assert( type(outputPath) == 'string' and outputPath ~= '', 'output path must be a non-empty string or nil' ) end
+
+  local path, pathError = outputPath, nil
+  if not path then path, pathError = Dumper.Dumps.defaultOutputPath(defaultName) end
+  if not path then return nil, pathError end
+
+  local file, openError = io.open( path, 'wb' )
+  if not file then return nil, ('Unable to open %s: %s'):format( path, tostring(openError) ) end
+
+  pcall( file.setvbuf, file, 'full', 0x100000 )
+
+  local succeeded, result = xpcall( function() return writer(file) end, debug.traceback )
+  local closed, closeError = file:close()
+
+  if not succeeded then return nil, result end
+  if not closed then return nil, ('Unable to close %s: %s'):format( path, tostring(closeError) ) end
+  return path, result
+end
+
+--- Escape line-breaking characters in reflected names
+-- @param value any @ reflected text
+-- @return string @ single-line representation
+function Dumper.Dumps.singleLine(value)
+  return tostring(value or '<unnamed>'):gsub('\r', '\\r'):gsub('\n', '\\n')
+end
+
+--- Construct UObject path from Outer chain
+-- Package/name topology is rendered as Package.TopLevel:Nested.Child.
+-- @param objectAddress number @ UObject address
+-- @return string @ best-effort full path
+function Dumper.Dumps.objectPath(objectAddress)
+  local layout = Backend.objectHeaderLayout()
+  local outerOffset = layout.Outer
+  local segments = {}
+  local visited = {}
+  local currentAddress = objectAddress
+
+  if type(outerOffset) ~= 'number' then return Dumper.Dumps.singleLine( Backend.objectName(objectAddress) ) end
+
+  for _ = 1, 128 do
+    if type(currentAddress) ~= 'number' or currentAddress == 0 or visited[currentAddress] then break end
+
+    visited[currentAddress] = true
+    segments[ #segments + 1 ] = Dumper.Dumps.singleLine( Backend.objectName(currentAddress) )
+    currentAddress = readPointer( currentAddress + outerOffset )
+  end
+
+  for left = 1, math.floor(#segments / 2) do
+    local right = #segments - left + 1
+    segments[left], segments[right] = segments[right], segments[left]
+  end
+
+  if #segments == 0 then return ('<object@0x%X>'):format(objectAddress) end
+  if #segments == 1 then return segments[1] end
+
+  local path = segments[1] .. '.' .. segments[2]
+  if #segments >= 3 then path = path .. ':' .. table.concat( segments, '.', 3 ) end
+  return path
+end
+
+--- Format property type (+ referenced and container types)
+-- @param property table|nil @ decoded property metadata
+-- @param active table|nil @ descriptor recursion guard
+-- @param cppStyle boolean|nil @ use C++ scalar spellings
+-- @return string @ readable type expression
+function Dumper.Dumps.propertyType(property, active, cppStyle)
+  if type(property) ~= 'table' then return '<?>' end
+
+  local propertyType = property.propertyType or '<?Property>'
+  local propertyAddress = property.propertyAddress or property.innerAddress
+  active = active or {}
+
+  if propertyAddress and active[propertyAddress] then return propertyType .. '<recursive>' end
+  if propertyAddress then active[propertyAddress] = true end
+
+  local cppScalarTypes =
+  {
+    BoolProperty = 'bool', ByteProperty = 'uint8', Int8Property = 'int8', UInt8Property = 'uint8',
+    Int16Property = 'int16', UInt16Property = 'uint16', IntProperty = 'int32', Int32Property = 'int32',
+    UInt32Property = 'uint32', Int64Property = 'int64', UInt64Property = 'uint64',
+    FloatProperty = 'float', DoubleProperty = 'double', NameProperty = 'FName',
+    StrProperty = 'FString', TextProperty = 'FText',
+  }
+  local formatted = cppStyle and cppScalarTypes[propertyType] or propertyType
+  formatted = formatted or propertyType
+
+  if propertyType == 'StructProperty' then
+    local structAddress = property.structAddress or propertyAddress and Backend.propertyStruct(propertyAddress)
+    formatted = ('StructProperty<%s>'):format( Backend.objectName(structAddress) or '?' )
+
+  elseif propertyType == 'EnumProperty' or propertyType == 'ByteProperty' then
+    local enumAddress = propertyAddress and Backend.propertyEnum( propertyAddress, propertyType )
+    if enumAddress then formatted = ('%s<%s>'):format( propertyType, Backend.objectName(enumAddress) or '?' ) end
+
+  elseif propertyType == 'ArrayProperty' then
+    local inner = property.innerProperty or propertyAddress and Backend.propertyArrayInner(propertyAddress)
+    formatted = ('TArray<%s>'):format( Dumper.Dumps.propertyType( inner, active, true ) )
+
+  elseif propertyType == 'SetProperty' then
+    local element = property.elementProperty or propertyAddress and Backend.propertySetElement(propertyAddress)
+    formatted = ('TSet<%s>'):format( Dumper.Dumps.propertyType( element, active, true ) )
+
+  elseif propertyType == 'MapProperty' then
+    local keyProperty = property.keyProperty
+    local valueProperty = property.valueProperty
+
+    if (not keyProperty or not valueProperty) and propertyAddress then keyProperty, valueProperty = Backend.propertyMapMembers(propertyAddress) end
+
+    formatted = ('TMap<%s, %s>'):format(
+                                        Dumper.Dumps.propertyType( keyProperty, active, true ),
+                                        Dumper.Dumps.propertyType( valueProperty, active, true )
+                                      )
+
+  elseif propertyAddress then
+    local referencedClass = Backend.propertyClassReference( propertyAddress, propertyType )
+    if referencedClass then formatted = ('%s<%s>'):format( propertyType, Backend.objectName(referencedClass) or '?' ) end
+  end
+
+  if propertyAddress then active[propertyAddress] = nil end
+  return formatted
+end
+
+--- Return property entries ordered by internal offset and reflected name
+-- @param properties table<string, table>|nil @ property map
+-- @return table[] @ name/property records
+function Dumper.Dumps.orderedProperties(properties)
+  local ordered = {}
+  for name, property in pairs(properties or {}) do ordered[ #ordered + 1 ] = { name = name, property = property } end
+
+  table.sort( ordered,
+    function(left, right)
+      local leftOffset = left.property.offset or math.maxinteger
+      local rightOffset = right.property.offset or math.maxinteger
+      if leftOffset ~= rightOffset then return leftOffset < rightOffset end
+      return left.name < right.name
+    end
+  )
+
+  return ordered
+end
+
+--- Format UFunction
+-- @param functionAddress number @ UFunction descriptor
+-- @param functionName string @ reflected function name
+-- @return string @ declaration and implementation annotation
+function Dumper.Dumps.functionDeclaration(functionAddress, functionName)
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+
+  if not metadata then
+    return ('void %s(/* metadata unavailable */); // %s'):format(
+                                                                  Dumper.Dumps.singleLine(functionName),
+                                                                  Dumper.Dumps.singleLine(metadataError or 'unknown layout')
+                                                                )
+  end
+
+  local returnType = 'void'
+  local parameters = {}
+
+  for _, entry in ipairs( Dumper.Invocation.orderedParameters(metadata) ) do
+    local property = entry.property
+    local formattedType = Dumper.Dumps.propertyType( property, nil, true )
+
+    if property.isReturnParameter then
+      returnType = formattedType
+    else
+      if property.isConstParameter then formattedType = 'const ' .. formattedType end
+      if property.isOutParameter or property.isReferenceParameter then formattedType = formattedType .. '&' end
+      parameters[ #parameters + 1 ] = formattedType .. ' ' .. Dumper.Dumps.singleLine( entry.name )
+    end
+  end
+
+  local declaration = ('%s %s(%s)'):format( returnType, Dumper.Dumps.singleLine(functionName), table.concat( parameters, ', ' ) )
+  if metadata.functionFlags and metadata.functionFlags & 0x40000000 ~= 0 then declaration = declaration .. ' const' end
+  declaration = declaration .. ';'
+
+  local annotations = {}
+  if metadata.native then annotations[ #annotations + 1 ] = metadata.functionPointer and ('Native thunk=0x%X'):format(metadata.functionPointer) or 'Native' end
+  if metadata.bytecodeSize and metadata.bytecodeSize > 0 then annotations[ #annotations + 1 ] = ('Blueprint bytecode=%d bytes'):format(metadata.bytecodeSize) end
+  if #annotations > 0 then declaration = declaration .. ' // ' .. table.concat( annotations, ', ' ) end
+  return declaration
+end
+
+--- Dump decoded FName strings in comparison-index order
+-- @param outputPath string|nil @ optional output path; defaults beside target executable
+-- @return string|nil @ written path
+-- @return number|string|nil @ name count, or error
+function Dumper.Dumps.ue_dumpFNames(outputPath)
+  local namesByIndex = Backend.namesByIndex()
+  if type(namesByIndex) ~= 'table' then return nil, 'Runtime FName cache is unavailable' end
+
+  return Dumper.Dumps.writeFile( outputPath, 'ceUEDumper_FNames.txt',
+    function(file)
+      local entries = {}
+
+      for nameIndex, name in pairs(namesByIndex) do
+        if type(nameIndex) == 'number' and type(name) == 'string' then entries[ #entries + 1 ] = { index = nameIndex, name = name } end
+      end
+
+      table.sort( entries, function(left, right) return left.index < right.index end )
+      for _, entry in ipairs(entries) do Dumper.Dumps.writeLine( file, Dumper.Dumps.singleLine(entry.name) ) end
+      return #entries
+    end
+  )
+
+end
+
+--- Write one UClass/UScriptStruct declaration block
+-- @param file file* @ output file
+-- @param typeAddress number @ reflected type descriptor
+-- @param kind string @ Class or ScriptStruct
+-- @param propertyCache table @ shared declared-property cache
+function Dumper.Dumps.writeStructuredType(file, typeAddress, kind, propertyCache)
+  local writeLine = Dumper.Dumps.writeLine
+  local layout = Backend.classHeaderLayout()
+  local typeName = Backend.objectName(typeAddress) or ('Type_%X'):format(typeAddress)
+  local superclass = type(layout.SuperStruct) == 'number' and readPointer( typeAddress + layout.SuperStruct ) or nil
+  local superclassName = superclass and superclass ~= 0 and Backend.objectName(superclass) or nil
+  local propertiesSize = type(layout.PropertiesSize) == 'number' and readInteger( typeAddress + layout.PropertiesSize ) or nil
+  local keyword = kind == 'Class' and 'class' or 'struct'
+  local declaration = keyword .. ' ' .. Dumper.Dumps.singleLine(typeName)
+
+  if superclassName then declaration = declaration .. ' : ' .. Dumper.Dumps.singleLine(superclassName) end
+  declaration = declaration .. (' // 0x%X, path=%s'):format( typeAddress, Dumper.Dumps.objectPath(typeAddress) )
+  if propertiesSize then declaration = declaration .. (', size=0x%X'):format(propertiesSize) end
+
+  writeLine(file, declaration)
+  writeLine(file, '{')
+  writeLine(file, '    // Fields')
+
+  local properties, propertyError = Backend.declaredProperties( typeAddress, propertyCache )
+
+  if not properties then
+    writeLine( file, '    // Unavailable: ' .. Dumper.Dumps.singleLine(propertyError) )
+  else
+    for _, entry in ipairs( Dumper.Dumps.orderedProperties(properties) ) do
+      local property = entry.property
+      local offset = type(property.offset) == 'number' and ('0x%X'):format( property.offset ) or '?'
+      local fieldSize = property.totalSize or property.size
+      local size = type(fieldSize) == 'number' and ('0x%X'):format(fieldSize) or '?'
+      local fieldName = Dumper.Dumps.singleLine(entry.name)
+
+      if type(property.arrayDim) == 'number' and property.arrayDim > 1 then
+        fieldName = ('%s[%d]'):format( fieldName, property.arrayDim )
+      end
+
+      writeLine( file, ('    [%s] [size=%s] %s %s;'):format( offset, size, Dumper.Dumps.propertyType( property, nil, true ), fieldName ) )
+    end
+  end
+
+  writeLine(file, '')
+  writeLine(file, '    // Functions')
+
+  local functions, functionError = Backend.functions(typeAddress)
+
+  if not functions then
+    writeLine( file, '    // Unavailable: ' .. Dumper.Dumps.singleLine(functionError) )
+  else
+    local functionNames = {}
+    for functionName in pairs(functions) do functionNames[ #functionNames + 1 ] = functionName end
+    table.sort(functionNames)
+
+    for _, functionName in ipairs(functionNames) do
+      writeLine( file, '    ' .. Dumper.Dumps.functionDeclaration( functions[functionName], functionName ) )
+    end
+  end
+
+  writeLine(file, '}')
+  writeLine(file, '')
+end
+
+--- Write one UEnum declaration block
+-- @param file file* @ output file
+-- @param enumAddress number @ UEnum descriptor
+function Dumper.Dumps.writeEnum(file, enumAddress)
+  local writeLine = Dumper.Dumps.writeLine
+  local enumName = Backend.objectName(enumAddress) or ('Enum_%X'):format(enumAddress)
+  local values, valuesError = Backend.enumValues(enumAddress)
+
+  writeLine( file, ('enum %s // 0x%X, path=%s'):format( Dumper.Dumps.singleLine(enumName), enumAddress, Dumper.Dumps.objectPath(enumAddress) ) )
+  writeLine(file, '{')
+
+  if not values then
+    writeLine( file, '    // Unavailable: ' .. Dumper.Dumps.singleLine(valuesError) )
+  else
+    for _, entry in ipairs(values) do
+      writeLine( file, ('    %s = %s,'):format( Dumper.Dumps.singleLine(entry.name), tostring(entry.value) ) )
+    end
+  end
+
+  writeLine(file, '}')
+  writeLine(file, '')
+end
+
+--- Dump UClass/UScriptStruct/UEnum/properties/UFunctions
+-- @param outputPath string|nil @ optional output path; defaults beside target executable
+-- @return string|nil @ written path
+-- @return number|string|nil @ type count, or error
+function Dumper.Dumps.ue_dumpTypes(outputPath)
+  if not Backend.isReady() then return nil, 'UE reflection is not initialized' end
+
+  local classes = Backend.reflectedTypes('Class')
+  local structs = Backend.reflectedTypes('ScriptStruct')
+  local enums = Backend.reflectedTypes('Enum')
+
+  if not classes or not structs or not enums then return nil, 'Reflected types could not be enumerated' end
+
+  return Dumper.Dumps.writeFile( outputPath, 'ceUEDumper_Types.txt',
+    function(file)
+      local records = {}
+
+      for _, address in ipairs(classes) do records[ #records + 1 ] = { address = address, kind = 'Class' } end
+      for _, address in ipairs(structs) do records[ #records + 1 ] = { address = address, kind = 'ScriptStruct' } end
+      for _, address in ipairs(enums) do records[ #records + 1 ] = { address = address, kind = 'Enum' } end
+      for _, record in ipairs(records) do record.path = Dumper.Dumps.objectPath(record.address) end
+
+      table.sort( records,
+        function(left, right)
+          if left.path ~= right.path then return left.path < right.path end
+          if left.kind ~= right.kind then return left.kind < right.kind end
+          return left.address < right.address
+        end
+      )
+
+      local propertyCache = {}
+
+      for _, record in ipairs(records) do
+        if record.kind == 'Enum' then Dumper.Dumps.writeEnum( file, record.address )
+        else Dumper.Dumps.writeStructuredType( file, record.address, record.kind, propertyCache )
+        end
+      end
+
+      return #records
+    end
+  )
+
+end
+
+--- Format runtime UObject type, enriching reflected property descriptors
+-- @param objectAddress number @ UObject address
+-- @return string @ reflected runtime type
+function Dumper.Dumps.objectType(objectAddress)
+  local classAddress = Backend.objectClass(objectAddress)
+  local className = classAddress and Backend.objectName(classAddress)
+
+  if type(className) ~= 'string' then return '<?>' end
+
+  if className:sub(-8) == 'Property' then
+    local _, property = Backend.propertyMetadata(objectAddress)
+    if property then return Dumper.Dumps.propertyType(property) end
+  end
+
+  return className
+end
+
+--- Dump every readable GUObjectArray entry with address, type, full path
+-- @param outputPath string|nil @ optional output path; defaults beside target executable
+-- @return string|nil @ written path
+-- @return number|string|nil @ dumped object count, or error
+function Dumper.Dumps.ue_dumpObjects(outputPath)
+  if not Backend.isReady() then return nil, 'UE reflection is not initialized' end
+
+  local objectIterator, objectCountOrError = Backend.objectIterator()
+  if not objectIterator then return nil, objectCountOrError end
+
+  return Dumper.Dumps.writeFile( outputPath, 'ceUEDumper_UObjects.txt',
+    function(file)
+      local dumpedCount = 0
+
+      for _, objectAddress in objectIterator do
+        if type(objectAddress) == 'number' and objectAddress ~= 0 then
+          Dumper.Dumps.writeLine( file, ('0x%016X  %s  %s'):format( objectAddress, Dumper.Dumps.objectType(objectAddress), Dumper.Dumps.objectPath(objectAddress) ) )
+          dumpedCount = dumpedCount + 1
+        end
+      end
+
+      return dumpedCount
+    end
+  )
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// API EXPORT
 
 Dumper.API =
@@ -2841,10 +3275,16 @@ Dumper.API =
   ue_findFunction = Dumper.Functions.ue_findFunction,
   ue_getFunctionMetadata = Dumper.Functions.ue_getFunctionMetadata,
   ue_callFunction = Dumper.Invocation.ue_callFunction,
+  ue_dumpFNames = Dumper.Dumps.ue_dumpFNames,
+  ue_dumpTypes = Dumper.Dumps.ue_dumpTypes,
+  ue_dumpObjects = Dumper.Dumps.ue_dumpObjects,
   ue_registerClassOffsets = Dumper.Offsets.ue_registerClassOffsets,
   ue_registerObjectOffsets = Dumper.Offsets.ue_registerObjectOffsets,
   ue_registerObjectPath = Dumper.Offsets.ue_registerObjectPath,
   ue_unregisterAllOffsets = Dumper.Offsets.ue_unregisterAllOffsets,
+  ue_setMenuVisible = Dumper.Lifecycle.ue_setMenuVisible,
+  ue_isMenuVisible = Dumper.Lifecycle.ue_isMenuVisible,
+  ue_getDumper = Dumper.Lifecycle.ue_getDumper,
 }
 
 -- make api global
