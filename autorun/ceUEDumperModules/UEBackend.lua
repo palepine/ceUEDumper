@@ -29,6 +29,7 @@ local Module =
 
 local CHUNK_SIZE = 0x10000
 local MAX_OBJECTS = 0x1000000
+local MAX_SCRIPT_BYTECODE_SIZE = 0x4000000
 local PTR_SIZE = 0x8
 
 --- Execute CE registry/UI resource mutations on the main thread
@@ -855,6 +856,97 @@ function Module.Functions.processEvent()
   return Core.processEvent()
 end
 
+--- Read and validate one possible UStruct::Script TArray<uint8>
+-- @param functionAddress number @ UFunction UObject address
+-- @param scriptOffset number @ candidate UStruct::Script byte offset
+-- @return table|nil @ validated Script array metadata
+local function readScriptArray(functionAddress, scriptOffset)
+  if type(scriptOffset) ~= 'number' or scriptOffset < 0 then return nil end
+
+  local bytecodeAddress = readPointer( functionAddress + scriptOffset )
+  local bytecodeSize = readInteger( functionAddress + scriptOffset + PTR_SIZE )
+  local bytecodeCapacity = readInteger( functionAddress + scriptOffset + PTR_SIZE + 4 )
+
+  if type(bytecodeSize) ~= 'number' or type(bytecodeCapacity) ~= 'number' then return nil end
+  if bytecodeSize < 0 or bytecodeCapacity < bytecodeSize or bytecodeCapacity > MAX_SCRIPT_BYTECODE_SIZE then return nil end
+
+  if bytecodeSize == 0 then
+    if bytecodeCapacity ~= 0 or (bytecodeAddress and bytecodeAddress ~= 0) then return nil end
+  else
+    if not bytecodeAddress or bytecodeAddress == 0 then return nil end
+    if readByte(bytecodeAddress) == nil or readByte( bytecodeAddress + bytecodeSize - 1 ) == nil then return nil end
+  end
+
+  return
+  {
+    scriptOffset = scriptOffset,
+    bytecode = bytecodeAddress,
+    bytecodeSize = bytecodeSize,
+    bytecodeCapacity = bytecodeCapacity,
+  }
+end
+
+--- Resolve UStruct::Script
+-- @param functionAddress number @ UFunction UObject address
+-- @param definitions table @ current runtime definitions
+-- @return table|nil @ validated Script array metadata
+local function resolveScriptArray(functionAddress, definitions)
+  local classLayout = definitions.UClass or {}
+  local candidates = {}
+  local seen = {}
+
+  -- once a non-empty Script array established engine-wide member offset,
+  -- later UFunctions need only one validated read, including native functions whose Script array is empty
+  if type(classLayout.Script) == 'number' then
+    local cachedScript = readScriptArray( functionAddress, classLayout.Script )
+    if cachedScript then return cachedScript end
+
+    classLayout.Script = nil
+  end
+
+  local function addCandidate(offset)
+    if type(offset) == 'number' and offset >= 0 and not seen[offset] then
+      seen[offset] = true
+      candidates[ #candidates + 1 ] = offset
+    end
+  end
+
+  -- these alternate roots are Children/ChildProperties in layouts probed by core
+  -- UStruct::Script follows their intervening size/alignment data
+  if classLayout.PropertyLinkAlt == 0x38 or classLayout.PropertyLinkAlt == 0x48 or classLayout.PropertyLinkAlt == 0x50 then
+    addCandidate( classLayout.PropertyLinkAlt + 0x10 )
+  end
+
+  -- canonical PropertyLink offsets from supported stock layouts
+  -- not applying this relation to arbitrary roots discovered from linked-list length
+  if classLayout.PropertyLink == 0x58 or classLayout.PropertyLink == 0x68 or classLayout.PropertyLink == 0x70 then
+    addCandidate( classLayout.PropertyLink - 0x10 )
+  end
+
+  -- runtime inference may identify another valid property chain as primary root
+  -- cover supported UStruct layouts directly and validate data
+  addCandidate(0x60)
+  addCandidate(0x58)
+  addCandidate(0x48)
+
+  local emptyScript
+
+  for _, scriptOffset in ipairs(candidates) do
+    local script = readScriptArray( functionAddress, scriptOffset )
+
+    if script then
+      if script.bytecodeSize > 0 then
+        classLayout.Script = scriptOffset
+        return script
+      end
+
+      emptyScript = emptyScript or script
+    end
+  end
+
+  return emptyScript
+end
+
 --- Decode stable UFunction member group & inherited UStruct script array
 -- Candidate starts cover stock UE4/UE5 + shifted layouts
 -- First candidate satisfying parameter bounds, return bounds and a readable thunk selected
@@ -941,11 +1033,13 @@ function Module.Functions.functionMetadata(functionAddress)
 
   if not selected then return nil, 'UFunction member layout was not recognized' end
 
-  if type(propertyLink) == 'number' then
-    selected.scriptOffset = propertyLink - 0x10
-    selected.bytecode = readPointer( functionAddress + selected.scriptOffset )
-    selected.bytecodeSize = readInteger( functionAddress + selected.scriptOffset + PTR_SIZE )
-    selected.bytecodeCapacity = readInteger( functionAddress + selected.scriptOffset + PTR_SIZE + 4 )
+  local script = resolveScriptArray( functionAddress, definitions )
+
+  if script then
+    selected.scriptOffset = script.scriptOffset
+    selected.bytecode = script.bytecode
+    selected.bytecodeSize = script.bytecodeSize
+    selected.bytecodeCapacity = script.bytecodeCapacity
   end
 
   selected.parameters = Module.Reflection.properties(functionAddress) or {}
@@ -1006,9 +1100,16 @@ function Module.Reflection.classHeaderLayout()
   end
 
   if type(result.PropertyLink) == 'number' then
-    result.Script = result.Script or result.PropertyLink - 0x10
     result.PropertiesSize = result.PropertiesSize or result.Children + PTR_SIZE * 2
     result.MinAlignment = result.MinAlignment or result.PropertiesSize + 4
+  end
+
+  if type(result.Script) ~= 'number' then
+    if result.PropertyLinkAlt == 0x38 or result.PropertyLinkAlt == 0x48 or result.PropertyLinkAlt == 0x50 then
+      result.Script = result.PropertyLinkAlt + 0x10
+    elseif result.PropertyLink == 0x58 or result.PropertyLink == 0x68 or result.PropertyLink == 0x70 then
+      result.Script = result.PropertyLink - 0x10
+    end
   end
 
   return result
