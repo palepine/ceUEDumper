@@ -8,6 +8,9 @@
 | `ue_isReady()`                                     | Get ready status                                       |
 | `ue_isNameReady()`                                 | Get cached names status                                |
 | `ue_getStatus()`                                   | Get verbose dumper state                               |
+| `ue_dumpFNames(path)`                              | Dump decoded FName strings                             |
+| `ue_dumpTypes(path)`                               | Dump classes, structs, enums, fields, and functions    |
+| `ue_dumpObjects(path)`                             | Dump GUObjectArray addresses, types, and paths          |
 | `ue_findClass(name)`                               | Find a `UClass` by short name, eg 'GameInstance        |
 | `ue_findObjectsOfClass(class, options)`            | Find live objects with an exact or derived class       |
 | `ue_findClassReferences(class, options)`           | Find class fields declared with a referenced UClass    |
@@ -577,6 +580,46 @@ end
 
 #### `ue_clearCache()`
   > drop UClass addr cache
+
+
+## Text dumps
+
+These functions are synchronous and return
+`outputPath, entryCount` on success or `nil, errorMessage` on failure.
+`outputPath` is optional, defaults to executable folder
+
+#### `ue_dumpFNames(outputPath)`
+> Write one decoded FName string per line in comparison-index order
+
+```lua
+local path, count = ue_dumpFNames()
+assert(path, count)
+print( ('Dumped %d names to %s'):format( count, path ) )
+```
+
+#### `ue_dumpTypes(outputPath)`
+> Dump indexed `UClass`, `UScriptStruct`, `UEnum`
+
+```lua
+local path, count = ue_dumpTypes()
+assert(path, count)
+print( ('Dumped %d reflected types to %s'):format(count, path) )
+```
+
+#### `ue_dumpObjects(outputPath)`
+> Dump readable GUObjectArray entry
+
+```lua
+local path, count = ue_dumpObjects()
+assert(path, count)
+print( ('Dumped %d UObjects to %s'):format( count, path ) )
+```
+
+Explicit writable destination can be supplied too:
+
+```lua
+assert(ue_dumpTypes([[C:\Dumps\MyGame_Types.txt]]))
+```
 
 
 ## Portability
