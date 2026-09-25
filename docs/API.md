@@ -515,7 +515,7 @@ assert( ue_restoreFunctionPatch(patch) ) -- reverting
 ```
 
 #### ue_restoreFunctionPatch(patch, options )
-> tries to safely restore a patch via a handler
+> tries to safely restore a patch via a func address
 `ue_restoreFunctionPatch(patch, { force = true })` or `ue_restoreAllFunctionPatches({ force = true })` to force-patch
 
 ```lua
@@ -688,7 +688,3 @@ Can also be set via:
 ue_setReflectionMetadataVisible( true )
 print( ue_isReflectionMetadataVisible() ) -- true
 ```
-
-## TODOs
-- fname/object descryption
-- array limit setting
