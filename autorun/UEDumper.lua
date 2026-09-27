@@ -35,6 +35,7 @@ local Dumper =
   Structures = {},
   MetadataViews = {},
   Bytecode = {},
+  Decompiler = {},
   Patching = {},
   Offsets = {},
   Functions = {},
@@ -64,6 +65,7 @@ Dumper.State.typeCache = {}
 Dumper.State.classMetadataStructure = nil
 Dumper.State.propertyMetadataStructure = nil
 Dumper.State.classReferenceIndex = nil
+Dumper.State.bytecodeConstantWidths = nil
 Dumper.State.cacheProcessId = getOpenedProcessID()
 local typeCache = Dumper.State.typeCache
 
@@ -246,6 +248,7 @@ function Dumper.Helpers.resolveType(typeNameOrAddress, kind)
     Dumper.State.classMetadataStructure = nil
     Dumper.State.propertyMetadataStructure = nil
     Dumper.State.classReferenceIndex = nil
+    Dumper.State.bytecodeConstantWidths = nil
     Backend.clearTypeLookupCache()
   end
 
@@ -666,6 +669,7 @@ function Dumper.Lifecycle.ue_clearCache()
   Dumper.State.classMetadataStructure = nil
   Dumper.State.propertyMetadataStructure = nil
   Dumper.State.classReferenceIndex = nil
+  Dumper.State.bytecodeConstantWidths = nil
 end
 
 --- Enable or disable UClass/UProperty metadata expansion in new structures
@@ -2471,11 +2475,277 @@ function Dumper.Bytecode.createStructure(functionMetadata)
     {
       describePointer = Dumper.Bytecode.describePointer,
       hasFNameCustomType = Backend.hasCustomType('FName'),
+      constantWidths = Dumper.Decompiler.constantWidths(),
     }
   )
 
   if structure and feedback then structure.Name = structure.Name .. ' [partial]' end
   return structure, feedback
+end
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// PSEUDOCODE DECOMPILER
+
+--- Resolve linked bytecode pointer into reflected display metadata
+-- @param address number|nil @ linked UObject/FField address
+-- @param role string @ expected operand role
+-- @return table|string|nil @ resolved name and optional metadata
+function Dumper.Decompiler.resolvePointer(address, role)
+  if type(address) ~= 'number' or address == 0 then return nil end
+
+  if role == 'Property' or role == 'Member' then
+    local decoded, propertyName, property = pcall( Backend.propertyMetadata, address )
+    if decoded and propertyName then return { name = propertyName, property = property } end
+  elseif role == 'Function' then
+    local decoded, metadata = pcall( Backend.functionMetadata, address )
+    if decoded and metadata and metadata.name then return { name = metadata.name, metadata = metadata } end
+  end
+
+  local decoded, objectName = pcall( Backend.objectName, address )
+  return decoded and objectName or nil
+end
+
+--- Resolve serialized FScriptName through cached name pool
+-- @param nameIndex number|nil @ comparison index
+-- @param number number|nil @ FName instance number
+-- @return string|nil @ readable name
+function Dumper.Decompiler.resolveName(nameIndex, number)
+  local name = type(nameIndex) == 'number' and (Backend.namesByIndex() or {})[nameIndex]
+  if not name then return nil end
+  if type(number) == 'number' and number > 0 then return name .. '_' .. tostring(number - 1) end
+  return name
+end
+
+--- Select UE4 float vs UE5 LWC double constant serialization
+-- EExprToken values stayed stable when Large World Coordinates
+-- changed native Vector, Rotator and Transform components from float to double
+-- Their reflected UScriptStruct sizes provide a deterministic runtime discriminator:
+-- Vector/Rotator 0xC -> 0x18 and Transform 0x30 -> 0x60
+-- @return table @ component widths keyed by vector, rotator and transform
+function Dumper.Decompiler.constantWidths()
+  local processId = getOpenedProcessID()
+  local cached = Dumper.State.bytecodeConstantWidths
+  if cached and cached.processId == processId then return cached end
+
+  local layout = Backend.classHeaderLayout()
+  local definitions =
+  {
+    vector = { typeName = 'Vector', doubleSize = 0x18 },
+    rotator = { typeName = 'Rotator', doubleSize = 0x18 },
+    transform = { typeName = 'Transform', doubleSize = 0x60 },
+  }
+
+  local widths = { processId = processId, vector = 4, rotator = 4, transform = 4 }
+
+  if type(layout.PropertiesSize) == 'number' then
+    for key, definition in pairs(definitions) do
+      local structAddress = Dumper.Helpers.resolveType( definition.typeName, 'ScriptStruct' )
+      local structSize = structAddress and readInteger( structAddress + layout.PropertiesSize )
+      if type(structSize) == 'number' and structSize >= definition.doubleSize then widths[key] = 8 end
+    end
+  end
+
+  Dumper.State.bytecodeConstantWidths = widths
+  return widths
+end
+
+--- Build C++-ish UFunction signature
+-- @param functionAddress number @ UFunction descriptor
+-- @param metadata table @ decoded metadata
+-- @param options table|nil @ qualified=false omits owning class
+-- @return string @ signature without semicolon
+function Dumper.Decompiler.functionSignature(functionAddress, metadata, options)
+  options = options or {}
+  local returnType = 'void'
+  local parameters = {}
+
+  for _, entry in ipairs( Dumper.Invocation.orderedParameters(metadata) ) do
+    local property = entry.property
+    local formattedType = Dumper.Dumps.propertyType( property, nil, true )
+
+    if property.isReturnParameter then
+      returnType = formattedType
+    else
+      if property.isConstParameter then formattedType = 'const ' .. formattedType end
+      if property.isOutParameter or property.isReferenceParameter then formattedType = formattedType .. '&' end
+      parameters[ #parameters + 1 ] = formattedType .. ' ' .. Bytecode.Decompiler.identifier(entry.name)
+    end
+  end
+
+  local functionName = Bytecode.Decompiler.identifier( metadata.name or Backend.objectName(functionAddress) )
+  local qualifiedName = functionName
+
+  if options.qualified ~= false then
+    local layout = Backend.objectHeaderLayout()
+    local outerAddress = type(layout.Outer) == 'number' and readPointer( functionAddress + layout.Outer )
+    local ownerName = outerAddress and Backend.objectName(outerAddress)
+    if ownerName then qualifiedName = Bytecode.Decompiler.identifier(ownerName) .. '::' .. functionName end
+  end
+
+  local prefix = metadata.functionFlags and metadata.functionFlags & 0x00002000 ~= 0 and 'static ' or ''
+  local signature = ('%s%s %s(%s)'):format( prefix, returnType, qualifiedName, table.concat(parameters, ', ') )
+  if metadata.functionFlags and metadata.functionFlags & 0x40000000 ~= 0 then signature = signature .. ' const' end
+  return signature
+end
+
+--- Render reflected local-variable declarations for one UFunction
+-- @param metadata table @ function metadata
+-- @return string[] @ comment lines
+function Dumper.Decompiler.localVariableComments(metadata)
+  local locals = {}
+
+  for propertyName, property in pairs(metadata.parameters or {}) do
+    if not property.isParameter then
+      locals[ #locals + 1 ] =
+      {
+        name = propertyName,
+        offset = property.offset or math.maxinteger,
+        text = ('%s %s; // frame +0x%X, property=0x%X'):format(
+                                                                Dumper.Dumps.propertyType( property, nil, true ),
+                                                                Bytecode.Decompiler.identifier(propertyName),
+                                                                property.offset or 0,
+                                                                property.propertyAddress or 0
+                                                              ),
+      }
+    end
+  end
+
+  table.sort( locals,
+    function(left, right)
+      if left.offset ~= right.offset then return left.offset < right.offset end
+      return left.name < right.name
+    end
+  )
+
+  local lines = {}
+  for _, entry in ipairs(locals) do lines[ #lines + 1 ] = entry.text end
+  return lines
+end
+
+--- Decompile validated metadata and compose complete C++-ish function
+-- @param functionAddress number @ UFunction descriptor
+-- @param metadata table @ decoded UFunction metadata
+-- @param options table|nil @ trace/offset/signature rendering controls
+-- @return string|nil @ generated pseudocode
+-- @return table|string|nil @ decompiler model or error
+function Dumper.Decompiler.decompileMetadata(functionAddress, metadata, options)
+  options = options or {}
+  local pointerCache = {}
+  local namesByIndex = Backend.namesByIndex() or {}
+
+  local function resolvePointer(address, role)
+    local cacheKey = tostring(role) .. ':' .. tostring(address)
+    local cached = pointerCache[cacheKey]
+    if cached ~= nil then return cached ~= false and cached or nil end
+
+    local resolved = Dumper.Decompiler.resolvePointer( address, role )
+    pointerCache[cacheKey] = resolved or false
+    return resolved
+  end
+
+  local function resolveName(nameIndex, number)
+    local name = namesByIndex[nameIndex]
+    if not name then return nil end
+    if type(number) == 'number' and number > 0 then return name .. '_' .. tostring(number - 1) end
+    return name
+  end
+
+  local model, decompileError = Bytecode.Decompiler.decompile(
+    metadata,
+    {
+      resolvePointer = resolvePointer,
+      resolveName = resolveName,
+      includeStatementOffsets = options.includeStatementOffsets,
+      constantWidths = Dumper.Decompiler.constantWidths(),
+    }
+  )
+
+  if not model then return nil, decompileError end
+
+  local lines =
+  {
+    Dumper.Decompiler.functionSignature( functionAddress, metadata, options ),
+  }
+
+  if options.includeMetadata ~= false then
+    lines[ #lines + 1 ] = ('// UFunction=0x%X Script.Data=0x%X Script.Num=0x%X'):format( functionAddress, metadata.bytecode, metadata.bytecodeSize )
+
+    local localVariables = Dumper.Decompiler.localVariableComments(metadata)
+    if #localVariables > 0 then
+      lines[ #lines + 1 ] = '/* Reflected locals'
+      for _, localDeclaration in ipairs(localVariables) do lines[ #lines + 1 ] = '   ' .. localDeclaration end
+      lines[ #lines + 1 ] = '*/'
+    end
+  end
+
+  if options.includeOpcodeTrace == true then
+    lines[ #lines + 1 ] = '/* Opcode trace'
+    for _, operation in ipairs(model.trace) do
+      lines[ #lines + 1 ] = ('   +0x%04X  [%02X]  %s'):format( operation.offset, operation.value, operation.opcode )
+    end
+    lines[ #lines + 1 ] = '*/'
+  end
+
+  lines[ #lines + 1 ] = model.body
+  return table.concat( lines, '\n' ), model
+end
+
+--- Decompile one Blueprint UFunction
+-- Single-function output includes an opcode trace by default for debugging.
+-- @param functionAddress number @ UFunction descriptor
+-- @param options table|nil @ includeOpcodeTrace/includeMetadata/includeStatementOffsets
+-- @return string|nil @ C++-style pseudocode
+-- @return table|string|nil @ decompiler model or error
+function Dumper.Decompiler.ue_decompileFunction(functionAddress, options)
+  assert( type(functionAddress) == 'number' and functionAddress ~= 0, 'function address must be non-zero' )
+  local renderOptions = {}
+  for key, value in pairs(options or {}) do renderOptions[key] = value end
+  if renderOptions.includeOpcodeTrace == nil then renderOptions.includeOpcodeTrace = true end
+
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+  if not metadata then return nil, metadataError end
+  return Dumper.Decompiler.decompileMetadata( functionAddress, metadata, renderOptions )
+end
+
+--- Decompile every directly declared Blueprint function of a class/struct
+-- Empty and native remain annotated declarations
+-- @param classNameOrAddress string|number @ reflected owner type
+-- @param options table|nil @ decompiler rendering controls
+-- @return string|nil @ concatenated C++-style pseudocode
+-- @return string|nil @ error
+function Dumper.Decompiler.ue_decompileClass(classNameOrAddress, options)
+  local typeAddress = Dumper.Helpers.resolveType(classNameOrAddress)
+  if not typeAddress then return nil, 'UClass or script struct not found' end
+
+  local functions, functionsError = Backend.functions(typeAddress)
+  if not functions then return nil, functionsError end
+
+  options = options or {}
+  local renderOptions = {}
+  for key, value in pairs(options) do renderOptions[key] = value end
+  if renderOptions.includeOpcodeTrace == nil then renderOptions.includeOpcodeTrace = false end
+
+  local names = {}
+  for functionName in pairs(functions) do names[ #names + 1 ] = functionName end
+  table.sort(names)
+
+  local output = {}
+  for _, functionName in ipairs(names) do
+    local functionAddress = functions[functionName]
+    local metadata, metadataError = Backend.functionMetadata(functionAddress)
+
+    if not metadata then
+      output[ #output + 1 ] = ('// %s: %s'):format( Bytecode.Decompiler.identifier(functionName), tostring(metadataError) )
+    elseif metadata.native or not metadata.bytecode or metadata.bytecodeSize <= 0 then
+      output[ #output + 1 ] = Dumper.Decompiler.functionSignature( functionAddress, metadata, renderOptions ) .. '; // '
+                              .. (metadata.native and 'native thunk' or 'no Blueprint bytecode')
+    else
+      local source, decompileError = Dumper.Decompiler.decompileMetadata( functionAddress, metadata, renderOptions )
+      output[ #output + 1 ] = source or ('// %s: %s'):format( Bytecode.Decompiler.identifier(functionName), tostring(decompileError) )
+    end
+  end
+
+  return table.concat( output, '\n\n' )
 end
 
 
@@ -3279,7 +3549,8 @@ end
 -- @param typeAddress number @ reflected type descriptor
 -- @param kind string @ Class or ScriptStruct
 -- @param propertyCache table @ shared declared-property cache
-function Dumper.Dumps.writeStructuredType(file, typeAddress, kind, propertyCache)
+-- @param options table|nil @ dump/decompiler options
+function Dumper.Dumps.writeStructuredType(file, typeAddress, kind, propertyCache, options)
   local writeLine = Dumper.Dumps.writeLine
   local layout = Backend.classHeaderLayout()
   local typeName = Backend.objectName(typeAddress) or ('Type_%X'):format(typeAddress)
@@ -3330,7 +3601,33 @@ function Dumper.Dumps.writeStructuredType(file, typeAddress, kind, propertyCache
     table.sort(functionNames)
 
     for _, functionName in ipairs(functionNames) do
-      writeLine( file, '    ' .. Dumper.Dumps.functionDeclaration( functions[functionName], functionName ) )
+      local functionAddress = functions[functionName]
+      local metadata = Backend.functionMetadata(functionAddress)
+      local isUbergraph = functionName:match('^ExecuteUbergraph_') ~= nil
+      local shouldDecompile = options and options.decompileFunctions ~= false and (not isUbergraph or options.decompileUbergraphs == true)
+
+      if shouldDecompile and metadata and not metadata.native and metadata.bytecode and metadata.bytecodeSize and metadata.bytecodeSize > 0
+      then
+        local source, decompileError = Dumper.Decompiler.decompileMetadata(
+                                                                            functionAddress,
+                                                                            metadata,
+                                                                            {
+                                                                              qualified = false,
+                                                                              includeOpcodeTrace = options.includeOpcodeTrace == true,
+                                                                              includeStatementOffsets = options.includeStatementOffsets,
+                                                                              includeMetadata = options.includeMetadata,
+                                                                            }
+                                                                          )
+
+        if source then
+          for line in (source .. '\n'):gmatch('(.-)\n') do writeLine( file, '    ' .. line ) end
+        else
+          writeLine( file, '    ' .. Dumper.Dumps.functionDeclaration( functionAddress, functionName ) )
+          writeLine( file, '    // Decompiler unavailable: ' .. Dumper.Dumps.singleLine(decompileError) )
+        end
+      else
+        writeLine( file, '    ' .. Dumper.Dumps.functionDeclaration( functionAddress, functionName ) )
+      end
     end
   end
 
@@ -3363,10 +3660,15 @@ end
 
 --- Dump UClass/UScriptStruct/UEnum/properties/UFunctions
 -- @param outputPath string|nil @ optional output path; defaults beside target executable
+-- @param options table|nil @ decompileFunctions/decompileUbergraphs/includeOpcodeTrace/includeMetadata
 -- @return string|nil @ written path
 -- @return number|string|nil @ type count, or error
-function Dumper.Dumps.ue_dumpTypes(outputPath)
+function Dumper.Dumps.ue_dumpTypes(outputPath, options)
   if not Backend.isReady() then return nil, 'UE reflection is not initialized' end
+  local dumpOptions = {}
+  for key, value in pairs(options or {}) do dumpOptions[key] = value end
+  if dumpOptions.decompileFunctions == nil then dumpOptions.decompileFunctions = true end
+  if dumpOptions.decompileUbergraphs == nil then dumpOptions.decompileUbergraphs = false end
 
   local classes = Backend.reflectedTypes('Class')
   local structs = Backend.reflectedTypes('ScriptStruct')
@@ -3395,7 +3697,7 @@ function Dumper.Dumps.ue_dumpTypes(outputPath)
 
       for _, record in ipairs(records) do
         if record.kind == 'Enum' then Dumper.Dumps.writeEnum( file, record.address )
-        else Dumper.Dumps.writeStructuredType( file, record.address, record.kind, propertyCache )
+        else Dumper.Dumps.writeStructuredType( file, record.address, record.kind, propertyCache, dumpOptions )
         end
       end
 
@@ -3477,6 +3779,8 @@ Dumper.API =
   ue_enumFunctions = Dumper.Functions.ue_enumFunctions,
   ue_findFunction = Dumper.Functions.ue_findFunction,
   ue_getFunctionMetadata = Dumper.Functions.ue_getFunctionMetadata,
+  ue_decompileFunction = Dumper.Decompiler.ue_decompileFunction,
+  ue_decompileClass = Dumper.Decompiler.ue_decompileClass,
   ue_patchFunction = Dumper.Patching.ue_patchFunction,
   ue_nopFunction = Dumper.Patching.ue_nopFunction,
   ue_restoreFunctionPatch = Dumper.Patching.ue_restoreFunctionPatch,
