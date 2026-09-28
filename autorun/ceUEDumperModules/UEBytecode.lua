@@ -24,7 +24,7 @@ Module.Patches.VOID_RETURN = { 0x04, 0x0B, 0x53 }
 
 local PTR_SIZE = 0x8
 local MAX_EXPRESSION_DEPTH = 0x100
-local MAX_INSTRUCTION_COUNT = 0x10000
+local MIN_INSTRUCTION_LIMIT = 0x10000
 local MAX_RAW_TAIL_BYTES = 0x10000
 
 local function opcode(value, name, operation)
@@ -212,12 +212,16 @@ end
 -- @param options table|nil @ optional pointer-name resolver
 -- @return table @ decoder context
 function Module.Decoder.newContext(scriptAddress, scriptSize, options)
+  local configuredLimit = options and options.maxInstructionCount
+  local instructionLimit = type(configuredLimit) == 'number' and configuredLimit or math.max( MIN_INSTRUCTION_LIMIT, scriptSize )
+
   return
   {
     address = scriptAddress,
     size = scriptSize,
     cursor = 0,
     instructionCount = 0,
+    instructionLimit = instructionLimit,
     elements = {},
     errors = {},
     stopped = false,
@@ -356,7 +360,7 @@ function Module.Decoder.decodeExpression(context, depth)
   if depth > MAX_EXPRESSION_DEPTH then Module.Decoder.fail( context, 'expression nesting limit exceeded' ); return nil end
 
   context.instructionCount = context.instructionCount + 1
-  if context.instructionCount > MAX_INSTRUCTION_COUNT then Module.Decoder.fail( context, 'instruction limit exceeded' ); return nil end
+  if context.instructionCount > context.instructionLimit then Module.Decoder.fail( context, 'instruction limit exceeded' ); return nil end
 
   local opcodeOffset = context.cursor
   local opcodeValue = readByte( context.address + opcodeOffset )
@@ -624,6 +628,9 @@ end
 -- @param options table|nil @ metadata callbacks and rendering options
 -- @return table @ parser context
 function Module.Decompiler.newContext(scriptAddress, scriptSize, options)
+  local configuredLimit = options and options.maxInstructionCount
+  local instructionLimit = type(configuredLimit) == 'number' and configuredLimit or math.max( MIN_INSTRUCTION_LIMIT, scriptSize )
+
   return
   {
     address = scriptAddress,
@@ -633,6 +640,7 @@ function Module.Decompiler.newContext(scriptAddress, scriptSize, options)
     errors = {},
     trace = {},
     instructionCount = 0,
+    instructionLimit = instructionLimit,
     options = options or {},
     symbolByAddress = {},
     symbolOwnerByName = {},
@@ -837,7 +845,7 @@ function Module.Decompiler.parseExpression(context, depth)
   if depth > MAX_EXPRESSION_DEPTH then Module.Decompiler.fail( context, 'expression nesting limit exceeded' ); return nil end
 
   context.instructionCount = context.instructionCount + 1
-  if context.instructionCount > MAX_INSTRUCTION_COUNT then Module.Decompiler.fail( context, 'instruction limit exceeded' ); return nil end
+  if context.instructionCount > context.instructionLimit then Module.Decompiler.fail( context, 'instruction limit exceeded' ); return nil end
 
   local startOffset = context.cursor
   local opcodeValue = Module.Decompiler.readUnsigned( context, 1 )

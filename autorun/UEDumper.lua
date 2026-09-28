@@ -2657,6 +2657,7 @@ function Dumper.Decompiler.decompileMetadata(functionAddress, metadata, options)
       resolveName = resolveName,
       includeStatementOffsets = options.includeStatementOffsets,
       constantWidths = Dumper.Decompiler.constantWidths(),
+      maxInstructionCount = options.maxInstructionCount,
     }
   )
 
