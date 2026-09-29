@@ -16,6 +16,7 @@ local Module =
   Decoder = {},
   Structures = {},
   Patches = {},
+  Decompiler = {},
 }
 
 -- EX_Return, EX_Nothing, EX_EndOfScript for NOPing and returning function prologue
@@ -23,7 +24,7 @@ Module.Patches.VOID_RETURN = { 0x04, 0x0B, 0x53 }
 
 local PTR_SIZE = 0x8
 local MAX_EXPRESSION_DEPTH = 0x100
-local MAX_INSTRUCTION_COUNT = 0x10000
+local MIN_INSTRUCTION_LIMIT = 0x10000
 local MAX_RAW_TAIL_BYTES = 0x10000
 
 local function opcode(value, name, operation)
@@ -211,16 +212,21 @@ end
 -- @param options table|nil @ optional pointer-name resolver
 -- @return table @ decoder context
 function Module.Decoder.newContext(scriptAddress, scriptSize, options)
+  local configuredLimit = options and options.maxInstructionCount
+  local instructionLimit = type(configuredLimit) == 'number' and configuredLimit or math.max( MIN_INSTRUCTION_LIMIT, scriptSize )
+
   return
   {
     address = scriptAddress,
     size = scriptSize,
     cursor = 0,
     instructionCount = 0,
+    instructionLimit = instructionLimit,
     elements = {},
     errors = {},
     stopped = false,
     describePointer = options and options.describePointer,
+    constantWidths = options and options.constantWidths or {},
   }
 end
 
@@ -354,7 +360,7 @@ function Module.Decoder.decodeExpression(context, depth)
   if depth > MAX_EXPRESSION_DEPTH then Module.Decoder.fail( context, 'expression nesting limit exceeded' ); return nil end
 
   context.instructionCount = context.instructionCount + 1
-  if context.instructionCount > MAX_INSTRUCTION_COUNT then Module.Decoder.fail( context, 'instruction limit exceeded' ); return nil end
+  if context.instructionCount > context.instructionLimit then Module.Decoder.fail( context, 'instruction limit exceeded' ); return nil end
 
   local opcodeOffset = context.cursor
   local opcodeValue = readByte( context.address + opcodeOffset )
@@ -466,14 +472,24 @@ function Module.Decoder.decodeExpression(context, depth)
   elseif operation == 'EX_NameConst' or operation == 'EX_InstanceDelegate' then Module.Decoder.consumeScriptName( context, 'Name', nestedDepth )
 
   elseif operation == 'EX_RotationConst' then
-    consume( context, 4, 'dword', 'Pitch', nestedDepth ); consume( context, 4, 'dword', 'Yaw', nestedDepth ); consume( context, 4, 'dword', 'Roll', nestedDepth )
+    local componentSize = context.constantWidths.rotator or 4
+    local componentKind = componentSize == 8 and 'double' or 'dword'
+    consume( context, componentSize, componentKind, 'Pitch', nestedDepth )
+    consume( context, componentSize, componentKind, 'Yaw', nestedDepth )
+    consume( context, componentSize, componentKind, 'Roll', nestedDepth )
 
   elseif operation == 'EX_VectorConst' or operation == 'EX_Vector3fConst' then
-    consume( context, 4, 'float', 'X', nestedDepth ); consume( context, 4, 'float', 'Y', nestedDepth ); consume( context, 4, 'float', 'Z', nestedDepth )
+    local componentSize = operation == 'EX_Vector3fConst' and 4 or context.constantWidths.vector or 4
+    local componentKind = componentSize == 8 and 'double' or 'float'
+    consume( context, componentSize, componentKind, 'X', nestedDepth )
+    consume( context, componentSize, componentKind, 'Y', nestedDepth )
+    consume( context, componentSize, componentKind, 'Z', nestedDepth )
 
   elseif operation == 'EX_TransformConst' then
+    local componentSize = context.constantWidths.transform or 4
+    local componentKind = componentSize == 8 and 'double' or 'float'
     for _, label in ipairs({ 'Rotation.X', 'Rotation.Y', 'Rotation.Z', 'Rotation.W', 'Translation.X', 'Translation.Y', 'Translation.Z', 'Scale.X', 'Scale.Y', 'Scale.Z' }) do
-      consume( context, 4, 'float', label, nestedDepth )
+      consume( context, componentSize, componentKind, label, nestedDepth )
     end
 
   elseif operation == 'EX_StructConst' then
@@ -590,6 +606,633 @@ function Module.decode(scriptAddress, scriptSize, options)
   end
 
   context.truncatedRawTail = rawTailEnd < context.size
+  return context
+end
+
+-- ///---///--///---///--///---///--/// KISMET PSEUDOCODE DECOMPILER
+
+--- Convert reflected name into stable C++-like identifier
+-- @param name any @ reflected or fallback name
+-- @return string @ sanitized identifier
+function Module.Decompiler.identifier(name)
+  local value = tostring( name or 'Unknown' )
+  value = value:gsub('[^%w_]', '_'):gsub('_+', '_'):gsub('^_+', ''):gsub('_+$', '')
+  if value == '' then value = 'Unknown' end
+  if value:match('^%d') then value = '_' .. value end
+  return value
+end
+
+--- Construct bounded pseudocode parser context
+-- @param scriptAddress number @ Script.Data pointer
+-- @param scriptSize number @ Script.Num
+-- @param options table|nil @ metadata callbacks and rendering options
+-- @return table @ parser context
+function Module.Decompiler.newContext(scriptAddress, scriptSize, options)
+  local configuredLimit = options and options.maxInstructionCount
+  local instructionLimit = type(configuredLimit) == 'number' and configuredLimit or math.max( MIN_INSTRUCTION_LIMIT, scriptSize )
+
+  return
+  {
+    address = scriptAddress,
+    size = scriptSize,
+    cursor = 0,
+    stopped = false,
+    errors = {},
+    trace = {},
+    instructionCount = 0,
+    instructionLimit = instructionLimit,
+    options = options or {},
+    symbolByAddress = {},
+    symbolOwnerByName = {},
+    nextSymbolSuffix = {},
+  }
+end
+
+--- Stop parsing at the first unknown/truncated operand boundary
+-- @param context table @ parser context
+-- @param message string @ diagnostic
+function Module.Decompiler.fail(context, message)
+  if context.stopped then return end
+  context.stopped = true
+  context.errors[ #context.errors + 1 ] = ('+0x%X: %s'):format( context.cursor, message )
+end
+
+--- Reserve bytes while enforcing Script.Num
+-- @param context table @ parser context
+-- @param byteCount number @ requested bytes
+-- @return number|nil @ starting byte offset
+function Module.Decompiler.consume(context, byteCount)
+  if context.stopped then return nil end
+  if context.cursor + byteCount > context.size then
+    Module.Decompiler.fail( context, ('truncated operand requiring %d byte(s)'):format(byteCount) )
+    return nil
+  end
+
+  local offset = context.cursor
+  context.cursor = context.cursor + byteCount
+  return offset
+end
+
+--- Read bounded unsigned integer assembled from bytes
+-- @param context table @ parser context
+-- @param byteCount number @ integer width
+-- @return number|nil @ decoded value
+function Module.Decompiler.readUnsigned(context, byteCount)
+  local offset = Module.Decompiler.consume( context, byteCount )
+  if not offset then return nil end
+
+  local value = 0
+  for index = byteCount - 1, 0, -1 do
+    local byteValue = readByte( context.address + offset + index )
+    if byteValue == nil then Module.Decompiler.fail( context, 'unreadable operand' ); return nil end
+    value = value * 0x100 + byteValue
+  end
+
+  return value
+end
+
+--- Read bounded signed integer
+-- @param context table @ parser context
+-- @param byteCount number @ 1, 2, 4 or 8
+-- @return number|nil @ signed value
+function Module.Decompiler.readSigned(context, byteCount)
+  local offset = Module.Decompiler.consume( context, byteCount )
+  if not offset then return nil end
+
+  if byteCount == 8 then return readQword( context.address + offset ) end
+
+  local value = 0
+  for index = byteCount - 1, 0, -1 do
+    local byteValue = readByte( context.address + offset + index )
+    if byteValue == nil then Module.Decompiler.fail( context, 'unreadable signed operand' ); return nil end
+    value = value * 0x100 + byteValue
+  end
+
+  local signBit = 2 ^ (byteCount * 8 - 1)
+  if value >= signBit then value = value - 2 ^ (byteCount * 8) end
+  return value
+end
+
+--- Read one serialized floating-point component
+-- @param context table @ parser context
+-- @param byteCount number @ four for float or eight for double
+-- @return number|nil @ decoded component
+function Module.Decompiler.readReal(context, byteCount)
+  local offset = Module.Decompiler.consume( context, byteCount )
+  if not offset then return nil end
+  if byteCount == 8 then return readDouble( context.address + offset ) end
+  return readFloat( context.address + offset )
+end
+
+
+--- Read bounded runtime pointer operand
+-- @param context table @ parser context
+-- @return number|nil @ pointer value
+function Module.Decompiler.readPointer(context)
+  local offset = Module.Decompiler.consume( context, PTR_SIZE )
+  if not offset then return nil end
+  return readPointer( context.address + offset )
+end
+
+--- Resolve linked pointer through the caller's metadata adapter
+-- @param context table @ parser context
+-- @param address number|nil @ linked address
+-- @param role string @ property/function/object/class role
+-- @return string @ readable identifier
+function Module.Decompiler.pointerName(context, address, role)
+  if address and context.symbolByAddress[address] then return context.symbolByAddress[address] end
+
+  local resolver = context.options.resolvePointer
+  local resolved = type(resolver) == 'function' and resolver( address, role )
+  if type(resolved) == 'table' then resolved = resolved.name end
+
+  local baseName
+  if type(resolved) == 'string' and resolved ~= '' then
+    baseName = Module.Decompiler.identifier(resolved)
+  else
+    baseName = address and ('%s_0x%X'):format( Module.Decompiler.identifier(role), address ) or Module.Decompiler.identifier(role)
+  end
+
+  if not address then return baseName end
+
+  local symbolName = baseName
+  local owner = context.symbolOwnerByName[symbolName]
+
+  if owner and owner ~= address then
+    local suffix = context.nextSymbolSuffix[baseName] or 1
+
+    repeat
+      symbolName = baseName .. '_' .. suffix
+      suffix = suffix + 1
+      owner = context.symbolOwnerByName[symbolName]
+    until not owner or owner == address
+
+    context.nextSymbolSuffix[baseName] = suffix
+  end
+
+  context.symbolByAddress[address] = symbolName
+  context.symbolOwnerByName[symbolName] = address
+  return symbolName
+end
+
+--- Read current-target FScriptName (FName plus serialized extra dword)
+-- @param context table @ parser context
+-- @return string @ resolved or indexed name
+function Module.Decompiler.readScriptName(context)
+  local offset = Module.Decompiler.consume( context, 12 )
+  if not offset then return 'UnknownName' end
+
+  local nameIndex = readInteger( context.address + offset )
+  local number = readInteger( context.address + offset + 4 ) or 0
+  local resolver = context.options.resolveName
+  local name = type(resolver) == 'function' and resolver( nameIndex, number )
+  if not name then name = ('Name_%s_%d'):format( tostring(nameIndex or '?'), number ) end
+  return Module.Decompiler.identifier(name)
+end
+
+--- Read null-terminated ANSI/UTF-16 string literal
+-- @param context table @ parser context
+-- @param wide boolean @ UTF-16 when true
+-- @return string @ escaped C++ literal
+function Module.Decompiler.readString(context, wide)
+  local characters = {}
+  local unitSize = wide and 2 or 1
+
+  while not context.stopped and context.cursor + unitSize <= context.size do
+    local offset = Module.Decompiler.consume( context, unitSize )
+    local value = wide and readSmallInteger( context.address + offset ) or readByte( context.address + offset )
+    if value == nil then Module.Decompiler.fail( context, 'unreadable string literal' ); break end
+    if value == 0 then return (wide and 'L"' or '"') .. table.concat(characters) .. '"' end
+
+    if value == 0x22 then characters[ #characters + 1 ] = '\\"'
+    elseif value == 0x5C then characters[ #characters + 1 ] = '\\\\'
+    elseif value >= 0x20 and value < 0x7F then characters[ #characters + 1 ] = string.char(value)
+    else characters[ #characters + 1 ] = ('\\x%X'):format(value)
+    end
+  end
+
+  Module.Decompiler.fail( context, 'unterminated string literal' )
+  return wide and 'L"<unterminated>"' or '"<unterminated>"'
+end
+
+--- Parse expressions until delimiter token is consumed
+-- @param context table @ parser context
+-- @param delimiter string @ canonical delimiter opcode
+-- @param depth number @ recursion depth
+-- @return table[] @ child nodes excluding delimiter
+function Module.Decompiler.parseUntil(context, delimiter, depth)
+  local nodes = {}
+
+  while not context.stopped and context.cursor < context.size do
+    local node = Module.Decompiler.parseExpression( context, depth )
+    if not node then break end
+    if node.opcode == delimiter then return nodes end
+    nodes[ #nodes + 1 ] = node
+  end
+
+  if not context.stopped then Module.Decompiler.fail( context, 'missing ' .. delimiter ) end
+  return nodes
+end
+
+--- Parse one Kismet expression into semantic intermediate node
+-- Unsupported operations terminate parsing at known byte
+-- @param context table @ parser context
+-- @param depth number|nil @ recursive expression depth
+-- @return table|nil @ intermediate expression node
+function Module.Decompiler.parseExpression(context, depth)
+  depth = depth or 0
+  if context.stopped or context.cursor >= context.size then return nil end
+  if depth > MAX_EXPRESSION_DEPTH then Module.Decompiler.fail( context, 'expression nesting limit exceeded' ); return nil end
+
+  context.instructionCount = context.instructionCount + 1
+  if context.instructionCount > context.instructionLimit then Module.Decompiler.fail( context, 'instruction limit exceeded' ); return nil end
+
+  local startOffset = context.cursor
+  local opcodeValue = Module.Decompiler.readUnsigned( context, 1 )
+  if opcodeValue == nil then return nil end
+
+  local definition = Module.Opcodes[opcodeValue]
+  local operation = definition and definition.operation
+  local node = { opcode = operation or ('EX_Unknown_%02X'):format(opcodeValue), value = opcodeValue, offset = startOffset }
+  context.trace[ #context.trace + 1 ] = { offset = startOffset, value = opcodeValue, opcode = node.opcode, depth = depth }
+
+  if not operation then Module.Decompiler.fail( context, ('unknown opcode 0x%02X'):format(opcodeValue) ); return node end
+
+  local nestedDepth = depth + 1
+  local parse = Module.Decompiler.parseExpression
+
+  if PROPERTY_OPERAND[operation] then
+    node.kind = 'variable'
+    node.property = Module.Decompiler.readPointer(context)
+    node.name = Module.Decompiler.pointerName( context, node.property, 'Property' )
+    node.scope = operation
+
+  elseif operation == 'EX_Self' then node.kind, node.text = 'literal', 'this'
+  elseif operation == 'EX_NoObject' or operation == 'EX_NoInterface' then node.kind, node.text = 'literal', 'nullptr'
+  elseif operation == 'EX_Nothing' then node.kind, node.text = 'nothing', ''
+  elseif operation == 'EX_IntZero' then node.kind, node.text = 'literal', '0'
+  elseif operation == 'EX_IntOne' then node.kind, node.text = 'literal', '1'
+  elseif operation == 'EX_True' then node.kind, node.text = 'literal', 'true'
+  elseif operation == 'EX_False' then node.kind, node.text = 'literal', 'false'
+  elseif operation == 'EX_IntConst' then node.kind, node.text = 'literal', tostring(Module.Decompiler.readSigned(context, 4) or 0)
+  elseif operation == 'EX_IntConstByte' or operation == 'EX_ByteConst' then node.kind, node.text = 'literal', tostring(Module.Decompiler.readUnsigned(context, 1) or 0)
+  elseif operation == 'EX_Int64Const' then node.kind, node.text = 'literal', tostring(Module.Decompiler.readSigned(context, 8) or 0)
+  elseif operation == 'EX_UInt64Const' then node.kind, node.text = 'literal', ('0x%XULL'):format(Module.Decompiler.readUnsigned(context, 8) or 0)
+  elseif operation == 'EX_FloatConst' then
+    local offset = Module.Decompiler.consume(context, 4)
+    node.kind, node.text = 'literal', offset and ('%.9gF'):format(readFloat( context.address + offset )) or '0.0F'
+  elseif operation == 'EX_DoubleConst' then
+    local offset = Module.Decompiler.consume(context, 8)
+    node.kind, node.text = 'literal', offset and ('%.17g'):format(readDouble( context.address + offset )) or '0.0'
+  elseif operation == 'EX_StringConst' or operation == 'EX_UnicodeStringConst' then
+    node.kind, node.text = 'literal', Module.Decompiler.readString( context, operation == 'EX_UnicodeStringConst' )
+  elseif operation == 'EX_NameConst' or operation == 'EX_InstanceDelegate' then
+    node.kind, node.text = 'literal', ('FName("%s")'):format(Module.Decompiler.readScriptName(context))
+  elseif operation == 'EX_ObjectConst' then
+    node.kind = 'literal'
+    local objectAddress = Module.Decompiler.readPointer(context)
+    node.text = Module.Decompiler.pointerName( context, objectAddress, 'Object' )
+  elseif operation == 'EX_TextConst' then
+    node.kind, node.literalType = 'text', Module.Decompiler.readUnsigned(context, 1)
+    node.values = {}
+    local valueCount = node.literalType == 1 and 3 or (node.literalType == 2 or node.literalType == 3) and 1 or node.literalType == 4 and 2 or 0
+    if node.literalType == 4 then node.stringTable = Module.Decompiler.readPointer(context) end
+    for _ = 1, valueCount do node.values[ #node.values + 1 ] = parse( context, nestedDepth ) end
+    if node.literalType and node.literalType > 4 then Module.Decompiler.fail( context, 'unknown text literal type ' .. tostring(node.literalType) ) end
+  elseif operation == 'EX_RotationConst' then
+    local values = {}
+    local componentSize = context.options.constantWidths and context.options.constantWidths.rotator or 4
+
+    for index = 1, 3 do
+      if componentSize == 8 then
+        values[index] = ('%.17g'):format(Module.Decompiler.readReal(context, 8) or 0)
+      else
+        values[index] = tostring(Module.Decompiler.readSigned(context, 4) or 0)
+      end
+    end
+
+    node.kind, node.text = 'literal', 'FRotator{ ' .. table.concat(values, ', ') .. ' }'
+  elseif operation == 'EX_VectorConst' or operation == 'EX_Vector3fConst' then
+    local values = {}
+    local componentSize = operation == 'EX_Vector3fConst' and 4
+                                        or context.options.constantWidths and context.options.constantWidths.vector or 4
+
+    for index = 1, 3 do
+      local value = Module.Decompiler.readReal( context, componentSize ) or 0
+      values[index] = componentSize == 8 and ('%.17g'):format(value) or ('%.9g'):format(value)
+    end
+
+    node.kind, node.text = 'literal', 'FVector{ ' .. table.concat(values, ', ') .. ' }'
+  elseif operation == 'EX_TransformConst' then
+    local values = {}
+    local componentSize = context.options.constantWidths and context.options.constantWidths.transform or 4
+
+    for index = 1, 10 do
+      local value = Module.Decompiler.readReal( context, componentSize ) or 0
+      values[index] = componentSize == 8 and ('%.17g'):format(value) or ('%.9g'):format(value)
+    end
+
+    node.kind, node.text = 'literal', 'FTransform{ ' .. table.concat(values, ', ') .. ' }'
+
+  elseif operation == 'EX_Return' then node.kind, node.expression = 'return', parse( context, nestedDepth )
+  elseif operation == 'EX_Jump' then node.kind, node.target = 'jump', Module.Decompiler.readUnsigned(context, 4)
+  elseif operation == 'EX_JumpIfNot' then
+    node.kind = 'jump_if_not'
+    node.target = Module.Decompiler.readUnsigned(context, 4)
+    node.condition = parse( context, nestedDepth )
+  elseif operation == 'EX_ComputedJump' then node.kind, node.expression = 'computed_jump', parse( context, nestedDepth )
+  elseif operation == 'EX_PushExecutionFlow' or operation == 'EX_SkipOffsetConst' then
+    node.kind, node.target = 'flow_offset', Module.Decompiler.readUnsigned(context, 4)
+  elseif operation == 'EX_PopExecutionFlowIfNot' then node.kind, node.condition = 'pop_if_not', parse( context, nestedDepth )
+  elseif operation == 'EX_PopExecutionFlow' then node.kind = 'pop_flow'
+
+  elseif operation == 'EX_Let' then
+    node.kind = 'assign'
+    node.assignmentProperty = Module.Decompiler.readPointer(context)
+    node.left = parse( context, nestedDepth )
+    node.right = parse( context, nestedDepth )
+  elseif TWO_EXPRESSION_LET[operation] then
+    node.kind = 'assign'
+    node.left = parse( context, nestedDepth )
+    node.right = parse( context, nestedDepth )
+  elseif operation == 'EX_LetValueOnPersistentFrame' then
+    node.kind = 'assign'
+    local propertyAddress = Module.Decompiler.readPointer(context)
+    node.left = { kind = 'variable', name = Module.Decompiler.pointerName( context, propertyAddress, 'Property' ), scope = 'EX_LocalVariable' }
+    node.right = parse( context, nestedDepth )
+
+  elseif operation == 'EX_StructMemberContext' then
+    node.kind = 'member'
+    node.property = Module.Decompiler.readPointer(context)
+    node.name = Module.Decompiler.pointerName( context, node.property, 'Member' )
+    node.context = parse( context, nestedDepth )
+  elseif operation == 'EX_Context' or operation == 'EX_Context_FailSilent' or operation == 'EX_ClassContext' then
+    node.kind = 'context'
+    node.context = parse( context, nestedDepth )
+    node.skipOffset = Module.Decompiler.readUnsigned(context, 4)
+    node.resultProperty = Module.Decompiler.readPointer(context)
+    node.expression = parse( context, nestedDepth )
+    node.failSilent = operation == 'EX_Context_FailSilent'
+    node.classContext = operation == 'EX_ClassContext'
+  elseif operation == 'EX_InterfaceContext' then node.kind, node.expression = 'passthrough', parse( context, nestedDepth )
+
+  elseif FINAL_CALL[operation] then
+    node.kind = operation == 'EX_CallMulticastDelegate' and 'delegate_call' or 'call'
+    node.callOpcode = operation
+    node.functionAddress = Module.Decompiler.readPointer(context)
+    node.name = Module.Decompiler.pointerName( context, node.functionAddress, 'Function' )
+    node.arguments = Module.Decompiler.parseUntil( context, 'EX_EndFunctionParms', nestedDepth )
+  elseif VIRTUAL_CALL[operation] then
+    node.kind = 'call'
+    node.callOpcode = operation
+    node.name = Module.Decompiler.readScriptName(context)
+    node.virtual = true
+    node.arguments = Module.Decompiler.parseUntil( context, 'EX_EndFunctionParms', nestedDepth )
+  elseif operation == 'EX_AddMulticastDelegate' or operation == 'EX_RemoveMulticastDelegate' then
+    node.kind = 'binary_call'
+    node.name = operation == 'EX_AddMulticastDelegate' and 'AddDelegate' or 'RemoveDelegate'
+    node.left = parse( context, nestedDepth ); node.right = parse( context, nestedDepth )
+  elseif operation == 'EX_ClearMulticastDelegate' then node.kind, node.expression = 'unary_call', parse( context, nestedDepth ); node.name = 'ClearDelegate'
+  elseif operation == 'EX_BindDelegate' then
+    node.kind, node.name = 'bind_delegate', Module.Decompiler.readScriptName(context)
+    node.left = parse( context, nestedDepth ); node.right = parse( context, nestedDepth )
+
+  elseif operation == 'EX_MetaCast' or operation == 'EX_DynamicCast' or INTERFACE_CAST[operation] then
+    node.kind = 'cast'
+    local classAddress = Module.Decompiler.readPointer(context)
+    node.typeName = Module.Decompiler.pointerName( context, classAddress, 'Class' )
+    node.expression = parse( context, nestedDepth )
+  elseif operation == 'EX_Cast' then
+    node.kind, node.conversion = 'cast', Module.Decompiler.readUnsigned(context, 1)
+    node.typeName = ('Conversion_%02X'):format(node.conversion or 0)
+    node.expression = parse( context, nestedDepth )
+  elseif operation == 'EX_Skip' then
+    node.kind, node.skipOffset = 'passthrough', Module.Decompiler.readUnsigned(context, 4)
+    node.expression = parse( context, nestedDepth )
+  elseif operation == 'EX_Assert' then
+    node.kind = 'assert'
+    node.line = Module.Decompiler.readUnsigned(context, 2)
+    node.debugMode = Module.Decompiler.readUnsigned(context, 1)
+    node.expression = parse( context, nestedDepth )
+
+  elseif operation == 'EX_StructConst' then
+    node.kind = 'aggregate'
+    local structAddress = Module.Decompiler.readPointer(context)
+    node.typeName = Module.Decompiler.pointerName( context, structAddress, 'Struct' )
+    node.serializedSize = Module.Decompiler.readUnsigned(context, 4)
+    node.values = Module.Decompiler.parseUntil( context, 'EX_EndStructConst', nestedDepth )
+  elseif operation == 'EX_ArrayConst' or operation == 'EX_SetConst' then
+    node.kind = 'aggregate'
+    node.typeName = operation == 'EX_ArrayConst' and 'TArray' or 'TSet'
+    node.innerProperty = Module.Decompiler.readPointer(context)
+    node.elementCount = Module.Decompiler.readUnsigned(context, 4)
+    node.values = Module.Decompiler.parseUntil( context, operation == 'EX_ArrayConst' and 'EX_EndArrayConst' or 'EX_EndSetConst', nestedDepth )
+  elseif operation == 'EX_MapConst' then
+    node.kind, node.typeName = 'aggregate', 'TMap'
+    node.keyProperty = Module.Decompiler.readPointer(context)
+    node.valueProperty = Module.Decompiler.readPointer(context)
+    node.elementCount = Module.Decompiler.readUnsigned(context, 4)
+    node.values = Module.Decompiler.parseUntil( context, 'EX_EndMapConst', nestedDepth )
+  elseif operation == 'EX_SetArray' or operation == 'EX_SetSet' or operation == 'EX_SetMap' then
+    node.kind = 'container_set'
+    node.container = parse( context, nestedDepth )
+    if operation ~= 'EX_SetArray' then node.elementCount = Module.Decompiler.readUnsigned(context, 4) end
+    local delimiter = operation == 'EX_SetArray' and 'EX_EndArray' or operation == 'EX_SetSet' and 'EX_EndSet' or 'EX_EndMap'
+    node.values = Module.Decompiler.parseUntil( context, delimiter, nestedDepth )
+  elseif operation == 'EX_ArrayGetByRef' then
+    node.kind = 'index'; node.left = parse( context, nestedDepth ); node.right = parse( context, nestedDepth )
+  elseif operation == 'EX_SwitchValue' then
+    node.kind = 'switch_value'
+    local caseCount = Module.Decompiler.readUnsigned(context, 2) or 0
+    node.switchEndOffset = Module.Decompiler.readUnsigned(context, 4)
+    node.index = parse( context, nestedDepth )
+    node.cases = {}
+
+    if caseCount > 0x1000 then
+      Module.Decompiler.fail( context, 'implausible switch case count' )
+    else
+      for caseIndex = 1, caseCount do
+        node.cases[caseIndex] =
+        {
+          match = parse( context, nestedDepth ),
+          nextOffset = Module.Decompiler.readUnsigned(context, 4),
+          value = parse( context, nestedDepth ),
+        }
+      end
+
+      node.default = parse( context, nestedDepth )
+    end
+  elseif operation == 'EX_SoftObjectConst' or operation == 'EX_FieldPathConst' then node.kind, node.expression = 'passthrough', parse( context, nestedDepth )
+
+  elseif operation == 'EX_EndOfScript' or operation:match('^EX_End') then node.kind = 'delimiter'
+  elseif operation == 'EX_NothingInt32' then node.kind, node.text = 'literal', tostring(Module.Decompiler.readUnsigned(context, 4) or 0)
+  elseif operation == 'EX_BitFieldConst' then
+    node.kind = 'literal'
+    local propertyAddress = Module.Decompiler.readPointer(context)
+    local mask = Module.Decompiler.readUnsigned(context, 1) or 0
+    node.text = ('BitField(%s, 0x%X)'):format( Module.Decompiler.pointerName( context, propertyAddress, 'Property' ), mask )
+  elseif operation == 'EX_Breakpoint' or operation == 'EX_Tracepoint' or operation == 'EX_WireTracepoint' or operation == 'EX_DeprecatedOp4A' or operation == 'EX_EndParmValue' then
+    node.kind, node.text = 'debug', operation
+  else
+    node.kind = 'unsupported'
+    Module.Decompiler.fail( context, 'pseudocode operand layout is unsupported for ' .. operation )
+  end
+
+  node.endOffset = context.cursor
+  return node
+end
+
+--- Render one intermediate expression as C++-style pseudocode
+-- @param node table|nil @ parsed node
+-- @param memberOnly boolean|nil @ suppress this-> on member side of context
+-- @return string @ expression text
+function Module.Decompiler.renderExpression(node, memberOnly)
+  if not node then return '/* missing expression */' end
+  local render = Module.Decompiler.renderExpression
+  local kind = node.kind
+
+  if kind == 'literal' or kind == 'debug' then return node.text or node.opcode
+  elseif kind == 'nothing' then return ''
+  elseif kind == 'variable' then
+    if node.scope == 'EX_InstanceVariable' or node.scope == 'EX_ClassSparseDataVariable' then return memberOnly and node.name or 'this->' .. node.name end
+    if node.scope == 'EX_DefaultVariable' then return memberOnly and node.name or 'DefaultObject->' .. node.name end
+    return node.name
+  elseif kind == 'assign' then return render(node.left) .. ' = ' .. render(node.right)
+  elseif kind == 'member' then return render(node.context) .. '.' .. node.name
+  elseif kind == 'context' then
+    local separator = node.classContext and '::' or '->'
+    return render(node.context) .. separator .. render( node.expression, true )
+  elseif kind == 'passthrough' then return render(node.expression)
+  elseif kind == 'cast' then return ('Cast<%s>(%s)'):format( node.typeName or 'Unknown', render(node.expression) )
+  elseif kind == 'call' or kind == 'delegate_call' then
+    local arguments = {}
+    for _, argument in ipairs(node.arguments or {}) do arguments[ #arguments + 1 ] = render(argument) end
+    local memberCall = node.virtual or node.callOpcode == 'EX_FinalFunction' or node.callOpcode == 'EX_LocalFinalFunction'
+    local prefix = memberCall and not memberOnly and 'this->' or ''
+    if kind == 'delegate_call' then prefix = '' end
+    return prefix .. (node.name or 'UnknownFunction') .. '(' .. table.concat( arguments, ', ' ) .. ')'
+  elseif kind == 'binary_call' then return ('%s(%s, %s)'):format( node.name, render(node.left), render(node.right) )
+  elseif kind == 'unary_call' then return ('%s(%s)'):format( node.name, render(node.expression) )
+  elseif kind == 'bind_delegate' then return ('BindDelegate(%s, %s, &%s)'):format( render(node.left), render(node.right), node.name )
+  elseif kind == 'aggregate' then
+    local values = {}
+    for _, value in ipairs(node.values or {}) do values[ #values + 1 ] = render(value) end
+    return (node.typeName or 'Aggregate') .. '{ ' .. table.concat( values, ', ' ) .. ' }'
+  elseif kind == 'container_set' then
+    local values = {}
+    for _, value in ipairs(node.values or {}) do values[ #values + 1 ] = render(value) end
+    return render(node.container) .. ' = { ' .. table.concat( values, ', ' ) .. ' }'
+  elseif kind == 'index' then return render(node.left) .. '[' .. render(node.right) .. ']'
+  elseif kind == 'text' then
+    local values = {}
+    for _, value in ipairs(node.values or {}) do values[ #values + 1 ] = render(value) end
+    return ('FText::FromLiteral(%s)'):format(table.concat(values, ', '))
+  elseif kind == 'switch_value' then
+    local cases = {}
+    for _, case in ipairs(node.cases or {}) do cases[ #cases + 1 ] = render(case.match) .. ' : ' .. render(case.value) end
+    return ('SwitchValue(%s, { %s }, %s)'):format( render(node.index), table.concat(cases, ', '), render(node.default) )
+  elseif kind == 'assert' then return 'ensure(' .. render(node.expression) .. ')'
+  elseif kind == 'return' then
+    local expression = render(node.expression)
+    return expression ~= '' and 'return ' .. expression or 'return'
+  elseif kind == 'computed_jump' then return 'goto /* computed */ ' .. render(node.expression)
+  elseif kind == 'pop_if_not' then return 'if (!(' .. render(node.condition) .. ')) /* pop execution flow */'
+  elseif kind == 'flow_offset' then return ('/* execution-flow target L_%04X */'):format(node.target or 0)
+  elseif kind == 'pop_flow' then return '/* pop execution flow */'
+  elseif kind == 'delimiter' then return ''
+  end
+
+  return '/* ' .. (node.opcode or 'unsupported') .. ' */'
+end
+
+--- Format complete Script array as one hex line for parser investigations
+-- @param context table @ parser context
+-- @return string @ space-separated bytes from Script.Data through Script.Num
+function Module.Decompiler.formatBytecode(context)
+  local bytes = {}
+
+  for offset = 0, context.size - 1 do
+    local byteValue = readByte( context.address + offset )
+    bytes[ #bytes + 1 ] = byteValue and ('%02X'):format(byteValue) or '??'
+  end
+
+  return table.concat( bytes, ' ' )
+end
+
+--- Render parsed top-level bytecode with explicit labels and gotos
+-- preserves branch destinations
+-- @param context table @ completed parser context
+-- @return string @ pseudocode function body
+function Module.Decompiler.renderBody(context)
+  local lines = {}
+  local labels = {}
+
+  local function appendSpaced(line)
+    lines[ #lines + 1 ] = line
+    lines[ #lines + 1 ] = ''
+  end
+
+  for _, statement in ipairs(context.statements or {}) do
+    if statement.kind == 'jump' or statement.kind == 'jump_if_not' then labels[statement.target] = true end
+  end
+
+  appendSpaced('{')
+
+  for _, statement in ipairs(context.statements or {}) do
+    if labels[statement.offset] then appendSpaced( ('L_%04X:'):format(statement.offset) ) end
+
+    local prefix = context.options.includeStatementOffsets == false and '    ' or ('    /* +0x%04X */ '):format(statement.offset)
+
+    if statement.kind == 'jump' then
+      appendSpaced( prefix .. ('goto L_%04X;'):format(statement.target or 0) )
+    elseif statement.kind == 'jump_if_not' then
+      appendSpaced( prefix .. ('if (!(%s)) goto L_%04X;'):format( Module.Decompiler.renderExpression(statement.condition), statement.target or 0 ) )
+    elseif statement.opcode ~= 'EX_EndOfScript' and statement.kind ~= 'delimiter' then
+      local expression = Module.Decompiler.renderExpression(statement)
+      if expression ~= '' then appendSpaced( prefix .. expression .. ';' ) end
+    end
+  end
+
+  if context.stopped then
+    lines[ #lines + 1 ] = '    /*'
+    lines[ #lines + 1 ] = ('       Partial decompilation stopped at +0x%X: %s'):format( context.cursor, table.concat(context.errors, '; ') )
+    lines[ #lines + 1 ] = '       Bytecode: ' .. Module.Decompiler.formatBytecode(context)
+    lines[ #lines + 1 ] = '    */'
+    lines[ #lines + 1 ] = ''
+  end
+
+  if lines[#lines] == '' then lines[#lines] = nil end
+  lines[ #lines + 1 ] = '}'
+  return table.concat( lines, '\n' )
+end
+
+--- Decompile one UFunction Script array into intermediate model and body
+-- @param functionMetadata table @ validated UFunction metadata
+-- @param options table|nil @ metadata resolvers and rendering options
+-- @return table|nil @ decompilation result
+-- @return string|nil @ error
+function Module.Decompiler.decompile(functionMetadata, options)
+  if type(functionMetadata) ~= 'table'
+     or type(functionMetadata.bytecode) ~= 'number'
+     or type(functionMetadata.bytecodeSize) ~= 'number'
+     or functionMetadata.bytecodeSize <= 0
+  then
+    return nil, 'UFunction has no validated Blueprint bytecode'
+  end
+
+  local context = Module.Decompiler.newContext( functionMetadata.bytecode, functionMetadata.bytecodeSize, options )
+  context.statements = {}
+
+  while not context.stopped and context.cursor < context.size do
+    local statement = Module.Decompiler.parseExpression( context, 0 )
+    if not statement then break end
+    context.statements[ #context.statements + 1 ] = statement
+    if statement.opcode == 'EX_EndOfScript' then context.terminated = true; break end
+  end
+
+  if not context.terminated and not context.stopped then Module.Decompiler.fail( context, 'Script ended without EX_EndOfScript' ) end
+
+  context.body = Module.Decompiler.renderBody(context)
   return context
 end
 

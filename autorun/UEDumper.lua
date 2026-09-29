@@ -21,11 +21,11 @@
 -- TODO: search for properties by name
 -- TODO: search for objects by fname
 -- TODO: fname/object descryption
--- TODO: more option for limiting
 
 local Dumper =
 {
   Runtime = {},
+  Configuration = {},
   Portable = {},
   Helpers = {},
   Lifecycle = {},
@@ -35,6 +35,7 @@ local Dumper =
   Structures = {},
   MetadataViews = {},
   Bytecode = {},
+  Decompiler = {},
   Patching = {},
   Offsets = {},
   Functions = {},
@@ -52,7 +53,7 @@ local PTR_SIZE = 0x8 -- targetIs64Bit() and 0x8 or 0x4 -- 32 bit unsupported, ha
 local INIT_WAIT_TIME = 30000
 local ceDirectory = getCheatEngineDir() or ''
 
--- { ["objName.property"] = true }
+-- { ["objName.property"] = numericOffset }
 Dumper.State.registeredSymbols = {}
 local registeredSymbols = Dumper.State.registeredSymbols
 
@@ -64,12 +65,24 @@ Dumper.State.typeCache = {}
 Dumper.State.classMetadataStructure = nil
 Dumper.State.propertyMetadataStructure = nil
 Dumper.State.classReferenceIndex = nil
+Dumper.State.bytecodeConstantWidths = nil
 Dumper.State.cacheProcessId = getOpenedProcessID()
+Dumper.State.config = {}
 local typeCache = Dumper.State.typeCache
+
+local CONFIG_SETTINGS_KEY = [[ceUEDumper\Configuration]]
+local CONFIG_DEFINITIONS =
+{
+  maxArrayElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  maxMapElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  maxSetElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  maxDelegateElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  decompileUbergraphs = { default = false, kind = 'boolean' },
+}
 
 local PORTABLE_FILES =
 {
-  { name = 'ceUEDumper',                  path = [[autorun\UEDumper.lua]] },
+  { name = 'ceUEDumper',              path = [[autorun\UEDumper.lua]] },
   { name = 'ceUEDumper.UEBackend',    path = [[autorun\ceUEDumperModules\UEBackend.lua]] },
   { name = 'ceUEDumper.UEBytecode',   path = [[autorun\ceUEDumperModules\UEBytecode.lua]] },
   { name = 'ceUEDumper.UEDumperCore', path = [[autorun\ceUEDumperModules\UEDumperCore.lua]] },
@@ -84,6 +97,118 @@ function Dumper.Runtime.onMainThread(callback, ...)
   if inMainThread() then return callback(...) end
   return synchronize( callback, ... )
 end
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CONFIGURATION
+
+--- Validate and normalize one public configuration value
+-- @param key string @ CONFIG_DEFINITIONS key
+-- @param value any @ caller or persisted value
+-- @return any|nil @ normalized value
+-- @return string|nil @ validation error
+function Dumper.Configuration.normalize(key, value)
+  local definition = CONFIG_DEFINITIONS[key]
+  if not definition then return nil, 'Unknown ceUEDumper configuration key: ' .. tostring(key) end
+
+  if definition.kind == 'boolean' then
+    if type(value) == 'boolean' then return value end
+    if value == 'true' or value == '1' or value == 1 then return true end
+    if value == 'false' or value == '0' or value == 0 then return false end
+    return nil, key .. ' must be a boolean'
+  end
+
+  local numericValue = type(value) == 'number' and value or tonumber(value)
+  if not numericValue or numericValue % 1 ~= 0 then return nil, key .. ' must be an integer' end
+  if numericValue < definition.minimum or numericValue > definition.maximum then
+    return nil, ('%s must be between %d and %d'):format( key, definition.minimum, definition.maximum )
+  end
+
+  return numericValue
+end
+
+--- Persist values through CE settings store
+-- @param values table @ configuration values keyed by public names
+function Dumper.Configuration.persist(values)
+  local function writeSettings()
+    local settings = getSettings( CONFIG_SETTINGS_KEY, true )
+    for key, value in pairs(values) do settings[key] = tostring(value) end
+  end
+
+  Dumper.Runtime.onMainThread(writeSettings)
+end
+
+--- Load persistent config, replacing malformed entries with defaults
+function Dumper.Configuration.load()
+  local function readSettings()
+    local settings = getSettings( CONFIG_SETTINGS_KEY, true )
+    local values = {}
+
+    for key, definition in pairs(CONFIG_DEFINITIONS) do
+      local value = Dumper.Configuration.normalize( key, settings[key] )
+      values[key] = value ~= nil and value or definition.default
+    end
+
+    return values
+  end
+
+  Dumper.State.config = Dumper.Runtime.onMainThread(readSettings)
+end
+
+--- Read one persistent option or a copy of all current options
+-- @param key string|nil @ configuration key; nil returns all values
+-- @return any|table|nil @ current value or independent configuration table
+-- @return string|nil @ unknown-key error
+function Dumper.Configuration.ue_getConfig(key)
+  if key ~= nil then
+    if not CONFIG_DEFINITIONS[key] then return nil, 'Unknown ceUEDumper configuration key: ' .. tostring(key) end
+    return Dumper.State.config[key]
+  end
+
+  local values = {}
+  for configKey in pairs(CONFIG_DEFINITIONS) do values[configKey] = Dumper.State.config[configKey] end
+  return values
+end
+
+--- Validate, apply, persist one option
+-- @param key string @ configuration key
+-- @param value any @ new typed value
+-- @return boolean|nil @ true when persisted
+-- @return any|string|nil @ normalized value, or validation/persistence error
+function Dumper.Configuration.ue_setConfig(key, value)
+  local normalized, validationError = Dumper.Configuration.normalize( key, value )
+  if normalized == nil then return nil, validationError end
+
+  local persisted, persistenceError = pcall( Dumper.Configuration.persist, { [key] = normalized } )
+  if not persisted then return nil, 'Failed persisting ceUEDumper configuration: ' .. tostring(persistenceError) end
+
+  Dumper.State.config[key] = normalized
+  return true, normalized
+end
+
+--- Reset one option or the complete persistent configuration to defaults
+-- @param key string|nil @ option to reset; nil resets all options
+-- @return boolean|nil @ true when persisted
+-- @return any|table|string|nil @ reset value/table, or error
+function Dumper.Configuration.ue_resetConfig(key)
+  if key ~= nil and not CONFIG_DEFINITIONS[key] then
+    return nil, 'Unknown ceUEDumper configuration key: ' .. tostring(key)
+  end
+
+  local defaults = {}
+  if key ~= nil then
+    defaults[key] = CONFIG_DEFINITIONS[key].default
+  else
+    for configKey, definition in pairs(CONFIG_DEFINITIONS) do defaults[configKey] = definition.default end
+  end
+
+  local persisted, persistenceError = pcall( Dumper.Configuration.persist, defaults )
+  if not persisted then return nil, 'Failed persisting ceUEDumper configuration: ' .. tostring(persistenceError) end
+
+  for configKey, value in pairs(defaults) do Dumper.State.config[configKey] = value end
+  if key ~= nil then return true, Dumper.State.config[key] end
+  return true, Dumper.Configuration.ue_getConfig()
+end
+
+Dumper.Configuration.load()
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// PORTABLE MODULES
 
@@ -246,6 +371,7 @@ function Dumper.Helpers.resolveType(typeNameOrAddress, kind)
     Dumper.State.classMetadataStructure = nil
     Dumper.State.propertyMetadataStructure = nil
     Dumper.State.classReferenceIndex = nil
+    Dumper.State.bytecodeConstantWidths = nil
     Backend.clearTypeLookupCache()
   end
 
@@ -356,7 +482,7 @@ function Dumper.Offsets.registerProperties(properties, objectName, propertyNames
 
   for name, offset in pairs(result) do
     Backend.registerSymbol(name, offset)
-    registeredSymbols[name] = true
+    registeredSymbols[name] = offset
   end
 
   return result
@@ -622,7 +748,7 @@ function Dumper.Offsets.ue_registerObjectPath(rootObject, propertyPath, namespac
 
   for name, offset in pairs(result) do
     Backend.registerSymbol(name, offset)
-    registeredSymbols[name] = true
+    registeredSymbols[name] = offset
   end
 
   return result
@@ -633,6 +759,171 @@ function Dumper.Offsets.ue_unregisterAllOffsets()
   for name in pairs(registeredSymbols) do Backend.unregisterSymbol(name) end
   Dumper.State.registeredSymbols = {}
   registeredSymbols = Dumper.State.registeredSymbols
+end
+
+--- Test if byte can continue CE symbol identifier
+-- @param character string @ one-byte substring
+-- @return boolean @ true for common CE symbol-name characters
+function Dumper.Offsets.isSymbolCharacter(character)
+  return character ~= '' and character:match('[%w_%.%$%?@]') ~= nil
+end
+
+--- Replace one symbol as a complete token in a CE address expression
+-- Matching is case-insensitive to mirror CE symbol lookup
+-- @param expression string @ address or pointer-offset expression
+-- @param symbolName string @ registered symbol to replace
+-- @param replacement string @ numeric expression
+-- @return string @ rewritten expression
+-- @return number @ replacement count
+function Dumper.Offsets.replaceSymbolToken(expression, symbolName, replacement)
+  local isSymbolCharacter = Dumper.Offsets.isSymbolCharacter
+  local rewritten = tostring(expression or '')
+  local lowerSymbol = symbolName:lower()
+  local searchFrom = 1
+  local replacementCount = 0
+
+  while true do
+    local lowerExpression = rewritten:lower()
+    local startIndex, endIndex = lowerExpression:find( lowerSymbol, searchFrom, true )
+    if not startIndex then break end
+
+    local preceding = startIndex > 1 and rewritten:sub( startIndex - 1, startIndex - 1 ) or ''
+    local following = endIndex < #rewritten and rewritten:sub( endIndex + 1, endIndex + 1 ) or ''
+
+    if not isSymbolCharacter(preceding) and not isSymbolCharacter(following) then
+      rewritten = rewritten:sub( 1, startIndex - 1 ) .. replacement .. rewritten:sub( endIndex + 1 )
+      replacementCount = replacementCount + 1
+      searchFrom = startIndex + #replacement
+    else
+      searchFrom = endIndex + 1
+    end
+  end
+
+  return rewritten, replacementCount
+end
+
+--- Replace every owned symbol token in one expression
+-- @param expression string @ CE address/offset text
+-- @param symbols table[] @ longest-first symbol descriptors
+-- @return string @ numeric expression
+-- @return number @ total replacements
+function Dumper.Offsets.materializeExpression(expression, symbols)
+  local rewritten = tostring(expression or '')
+  local replacementCount = 0
+  local replaceSymbolToken = Dumper.Offsets.replaceSymbolToken
+
+  for _, symbol in ipairs(symbols) do
+    local replacements
+    rewritten, replacements = replaceSymbolToken( rewritten, symbol.name, symbol.numericText )
+    replacementCount = replacementCount + replacements
+  end
+
+  return rewritten, replacementCount
+end
+
+--- Replace owned offset symbols in every table memory record
+-- @return table|nil @ visited/changed/replacement statistics
+-- @return string|nil @ rewrite error
+function Dumper.Offsets.ue_replaceRegisteredSymbolsWithOffsets()
+  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Offsets.ue_replaceRegisteredSymbolsWithOffsets ) end
+
+  local exclusions = { gengine = true, gworld = true, pgengine = true, pgworld = true }
+  local symbols = {}
+
+  for symbolName, registeredValue in pairs(registeredSymbols) do
+
+    if not exclusions[ symbolName:lower() ] then
+      local numericValue = type(registeredValue) == 'number' and registeredValue or getAddressSafe(symbolName)
+
+      if type(numericValue) == 'number' then
+        symbols[ #symbols + 1 ] =
+        {
+          name = symbolName,
+          numericText = ('%X'):format(numericValue),
+        }
+      end
+    end
+  end
+
+  table.sort( symbols,
+    function(left, right)
+      if #left.name ~= #right.name then return #left.name > #right.name end
+      return left.name < right.name
+    end
+  )
+
+  local statistics =
+  {
+    registeredSymbolCount = #symbols,
+    recordsVisited = 0,
+    recordsChanged = 0,
+    addressReplacements = 0,
+    offsetReplacements = 0,
+    totalReplacements = 0,
+  }
+
+  if #symbols == 0 then return statistics end
+
+  local addressList = getAddressList()
+  if not addressList then return nil, 'Cheat Engine address list is unavailable' end
+
+  local listControl = addressList.List
+  local updateSuspended = listControl and type(listControl.beginUpdate) == 'function'
+  if updateSuspended then listControl.beginUpdate() end
+
+  local completed, rewriteError = xpcall(
+    function()
+      local materializeExpression = Dumper.Offsets.materializeExpression
+
+      for recordIndex = 0, addressList.getCount() - 1 do
+        local memoryRecord = addressList.getMemoryRecord(recordIndex)
+        statistics.recordsVisited = statistics.recordsVisited + 1
+
+        if not memoryRecord or memoryRecord.Type == vtAutoAssembler then goto continue end
+
+        local offsetCount = memoryRecord.getOffsetCount()
+        local rewrittenOffsets = {}
+        local offsetReplacementCount = 0
+
+        for offsetIndex = 0, offsetCount - 1 do
+          local rewrittenOffset, replacements = materializeExpression( memoryRecord.OffsetText[offsetIndex], symbols )
+          rewrittenOffsets[offsetIndex] = rewrittenOffset
+          offsetReplacementCount = offsetReplacementCount + replacements
+        end
+
+        local originalAddress = memoryRecord.getAddress()
+        local rewrittenAddress, addressReplacementCount = materializeExpression( originalAddress, symbols )
+        local addressChanged = addressReplacementCount > 0
+        local offsetsChanged = offsetReplacementCount > 0
+
+        if not addressChanged and not offsetsChanged then goto continue end
+
+        -- setAddress can reset pointer offsets
+        -- restore every level after a base-address rewrite and apply all numeric offset texts together
+        if addressChanged then
+          memoryRecord.setAddress(rewrittenAddress)
+          memoryRecord.setOffsetCount(offsetCount)
+        end
+
+        for offsetIndex = 0, offsetCount - 1 do
+          memoryRecord.OffsetText[offsetIndex] = rewrittenOffsets[offsetIndex]
+        end
+
+        statistics.recordsChanged = statistics.recordsChanged + 1
+        statistics.addressReplacements = statistics.addressReplacements + addressReplacementCount
+        statistics.offsetReplacements = statistics.offsetReplacements + offsetReplacementCount
+
+        ::continue::
+      end
+    end,
+    debug.traceback
+  )
+
+  if updateSuspended then listControl.endUpdate() end
+  if not completed then return nil, rewriteError end
+
+  statistics.totalReplacements = statistics.addressReplacements + statistics.offsetReplacements
+  return statistics
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// STATUS
@@ -666,6 +957,16 @@ function Dumper.Lifecycle.ue_clearCache()
   Dumper.State.classMetadataStructure = nil
   Dumper.State.propertyMetadataStructure = nil
   Dumper.State.classReferenceIndex = nil
+  Dumper.State.bytecodeConstantWidths = nil
+end
+
+--- Clear saved reflection offsets/globals for attached executable version
+-- General persistent configuration and the current in-memory layout are kept
+-- @return boolean|nil @ true when cleared
+-- @return number|string|nil @ removed setting count, or error
+-- @return string|nil @ cleared target-specific settings key
+function Dumper.Lifecycle.ue_clearSavedLayout()
+  return Backend.clearSavedLayout()
 end
 
 --- Enable or disable UClass/UProperty metadata expansion in new structures
@@ -1384,7 +1685,7 @@ function Dumper.Structures.createMulticastDelegateDataStructure(invocationCount)
   if type(invocationCount) ~= 'number' or invocationCount < 0 or invocationCount > 0x1000000 then return nil end
 
   local invocationList = createStructure('ceUE.FMulticastScriptDelegate.InvocationList')
-  local renderedCount = math.min( invocationCount, 256 )
+  local renderedCount = math.min( invocationCount, Dumper.State.config.maxDelegateElements )
   local addScriptDelegateEntry = Dumper.Structures.addScriptDelegateEntry
 
   for index = 0, renderedCount - 1 do
@@ -1518,7 +1819,7 @@ function Dumper.Structures.createArrayDataStructure(property, arrayHeaderAddress
 
   if not dataAddress or dataAddress == 0 then return nil, 'TArray data pointer is null' end
 
-  local renderedCount = math.min( elementCount, 256 )
+  local renderedCount = math.min( elementCount, Dumper.State.config.maxArrayElements )
   local elementStride = innerProperty.size
 
   for index = 0, renderedCount - 1 do
@@ -1801,7 +2102,7 @@ function Dumper.Structures.createSetDataStructure(property, containerAddress)
   local setStructure = createStructure('ceUE.TSet<' .. elementProperty.propertyType .. '>')
   if header.elementCount == 0 then return setStructure end
 
-  local indices, indexError = Dumper.Structures.sparseContainerIndices(header)
+  local indices, indexError = Dumper.Structures.sparseContainerIndices( header, Dumper.State.config.maxSetElements )
   if not indices then return nil, indexError end
 
   for _, sparseIndex in ipairs(indices) do
@@ -1836,7 +2137,7 @@ function Dumper.Structures.createMapDataStructure(property, containerAddress)
   local mapStructure = createStructure( ('ceUE.TMap<%s,%s>'):format( keyProperty.propertyType, valueProperty.propertyType ) )
   if header.elementCount == 0 then return mapStructure end
 
-  local indices, indexError = Dumper.Structures.sparseContainerIndices(header)
+  local indices, indexError = Dumper.Structures.sparseContainerIndices( header, Dumper.State.config.maxMapElements )
   if not indices then return nil, indexError end
 
   for _, sparseIndex in ipairs(indices) do
@@ -2471,11 +2772,278 @@ function Dumper.Bytecode.createStructure(functionMetadata)
     {
       describePointer = Dumper.Bytecode.describePointer,
       hasFNameCustomType = Backend.hasCustomType('FName'),
+      constantWidths = Dumper.Decompiler.constantWidths(),
     }
   )
 
   if structure and feedback then structure.Name = structure.Name .. ' [partial]' end
   return structure, feedback
+end
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// PSEUDOCODE DECOMPILER
+
+--- Resolve linked bytecode pointer into reflected display metadata
+-- @param address number|nil @ linked UObject/FField address
+-- @param role string @ expected operand role
+-- @return table|string|nil @ resolved name and optional metadata
+function Dumper.Decompiler.resolvePointer(address, role)
+  if type(address) ~= 'number' or address == 0 then return nil end
+
+  if role == 'Property' or role == 'Member' then
+    local decoded, propertyName, property = pcall( Backend.propertyMetadata, address )
+    if decoded and propertyName then return { name = propertyName, property = property } end
+  elseif role == 'Function' then
+    local decoded, metadata = pcall( Backend.functionMetadata, address )
+    if decoded and metadata and metadata.name then return { name = metadata.name, metadata = metadata } end
+  end
+
+  local decoded, objectName = pcall( Backend.objectName, address )
+  return decoded and objectName or nil
+end
+
+--- Resolve serialized FScriptName through cached name pool
+-- @param nameIndex number|nil @ comparison index
+-- @param number number|nil @ FName instance number
+-- @return string|nil @ readable name
+function Dumper.Decompiler.resolveName(nameIndex, number)
+  local name = type(nameIndex) == 'number' and (Backend.namesByIndex() or {})[nameIndex]
+  if not name then return nil end
+  if type(number) == 'number' and number > 0 then return name .. '_' .. tostring(number - 1) end
+  return name
+end
+
+--- Select UE4 float vs UE5 LWC double constant serialization
+-- EExprToken values stayed stable when Large World Coordinates
+-- changed native Vector, Rotator and Transform components from float to double
+-- Their reflected UScriptStruct sizes provide a deterministic runtime discriminator:
+-- Vector/Rotator 0xC -> 0x18 and Transform 0x30 -> 0x60
+-- @return table @ component widths keyed by vector, rotator and transform
+function Dumper.Decompiler.constantWidths()
+  local processId = getOpenedProcessID()
+  local cached = Dumper.State.bytecodeConstantWidths
+  if cached and cached.processId == processId then return cached end
+
+  local layout = Backend.classHeaderLayout()
+  local definitions =
+  {
+    vector = { typeName = 'Vector', doubleSize = 0x18 },
+    rotator = { typeName = 'Rotator', doubleSize = 0x18 },
+    transform = { typeName = 'Transform', doubleSize = 0x60 },
+  }
+
+  local widths = { processId = processId, vector = 4, rotator = 4, transform = 4 }
+
+  if type(layout.PropertiesSize) == 'number' then
+    for key, definition in pairs(definitions) do
+      local structAddress = Dumper.Helpers.resolveType( definition.typeName, 'ScriptStruct' )
+      local structSize = structAddress and readInteger( structAddress + layout.PropertiesSize )
+      if type(structSize) == 'number' and structSize >= definition.doubleSize then widths[key] = 8 end
+    end
+  end
+
+  Dumper.State.bytecodeConstantWidths = widths
+  return widths
+end
+
+--- Build C++-ish UFunction signature
+-- @param functionAddress number @ UFunction descriptor
+-- @param metadata table @ decoded metadata
+-- @param options table|nil @ qualified=false omits owning class
+-- @return string @ signature without semicolon
+function Dumper.Decompiler.functionSignature(functionAddress, metadata, options)
+  options = options or {}
+  local returnType = 'void'
+  local parameters = {}
+
+  for _, entry in ipairs( Dumper.Invocation.orderedParameters(metadata) ) do
+    local property = entry.property
+    local formattedType = Dumper.Dumps.propertyType( property, nil, true )
+
+    if property.isReturnParameter then
+      returnType = formattedType
+    else
+      if property.isConstParameter then formattedType = 'const ' .. formattedType end
+      if property.isOutParameter or property.isReferenceParameter then formattedType = formattedType .. '&' end
+      parameters[ #parameters + 1 ] = formattedType .. ' ' .. Bytecode.Decompiler.identifier(entry.name)
+    end
+  end
+
+  local functionName = Bytecode.Decompiler.identifier( metadata.name or Backend.objectName(functionAddress) )
+  local qualifiedName = functionName
+
+  if options.qualified ~= false then
+    local layout = Backend.objectHeaderLayout()
+    local outerAddress = type(layout.Outer) == 'number' and readPointer( functionAddress + layout.Outer )
+    local ownerName = outerAddress and Backend.objectName(outerAddress)
+    if ownerName then qualifiedName = Bytecode.Decompiler.identifier(ownerName) .. '::' .. functionName end
+  end
+
+  local prefix = metadata.functionFlags and metadata.functionFlags & 0x00002000 ~= 0 and 'static ' or ''
+  local signature = ('%s%s %s(%s)'):format( prefix, returnType, qualifiedName, table.concat(parameters, ', ') )
+  if metadata.functionFlags and metadata.functionFlags & 0x40000000 ~= 0 then signature = signature .. ' const' end
+  return signature
+end
+
+--- Render reflected local-variable declarations for one UFunction
+-- @param metadata table @ function metadata
+-- @return string[] @ comment lines
+function Dumper.Decompiler.localVariableComments(metadata)
+  local locals = {}
+
+  for propertyName, property in pairs(metadata.parameters or {}) do
+    if not property.isParameter then
+      locals[ #locals + 1 ] =
+      {
+        name = propertyName,
+        offset = property.offset or math.maxinteger,
+        text = ('%s %s; // frame +0x%X, property=0x%X'):format(
+                                                                Dumper.Dumps.propertyType( property, nil, true ),
+                                                                Bytecode.Decompiler.identifier(propertyName),
+                                                                property.offset or 0,
+                                                                property.propertyAddress or 0
+                                                              ),
+      }
+    end
+  end
+
+  table.sort( locals,
+    function(left, right)
+      if left.offset ~= right.offset then return left.offset < right.offset end
+      return left.name < right.name
+    end
+  )
+
+  local lines = {}
+  for _, entry in ipairs(locals) do lines[ #lines + 1 ] = entry.text end
+  return lines
+end
+
+--- Decompile validated metadata and compose complete C++-ish function
+-- @param functionAddress number @ UFunction descriptor
+-- @param metadata table @ decoded UFunction metadata
+-- @param options table|nil @ trace/offset/signature rendering controls
+-- @return string|nil @ generated pseudocode
+-- @return table|string|nil @ decompiler model or error
+function Dumper.Decompiler.decompileMetadata(functionAddress, metadata, options)
+  options = options or {}
+  local pointerCache = {}
+  local namesByIndex = Backend.namesByIndex() or {}
+
+  local function resolvePointer(address, role)
+    local cacheKey = tostring(role) .. ':' .. tostring(address)
+    local cached = pointerCache[cacheKey]
+    if cached ~= nil then return cached ~= false and cached or nil end
+
+    local resolved = Dumper.Decompiler.resolvePointer( address, role )
+    pointerCache[cacheKey] = resolved or false
+    return resolved
+  end
+
+  local function resolveName(nameIndex, number)
+    local name = namesByIndex[nameIndex]
+    if not name then return nil end
+    if type(number) == 'number' and number > 0 then return name .. '_' .. tostring(number - 1) end
+    return name
+  end
+
+  local model, decompileError = Bytecode.Decompiler.decompile(
+    metadata,
+    {
+      resolvePointer = resolvePointer,
+      resolveName = resolveName,
+      includeStatementOffsets = options.includeStatementOffsets,
+      constantWidths = Dumper.Decompiler.constantWidths(),
+      maxInstructionCount = options.maxInstructionCount,
+    }
+  )
+
+  if not model then return nil, decompileError end
+
+  local lines =
+  {
+    Dumper.Decompiler.functionSignature( functionAddress, metadata, options ),
+  }
+
+  if options.includeMetadata ~= false then
+    lines[ #lines + 1 ] = ('// UFunction=0x%X Script.Data=0x%X Script.Num=0x%X'):format( functionAddress, metadata.bytecode, metadata.bytecodeSize )
+
+    local localVariables = Dumper.Decompiler.localVariableComments(metadata)
+    if #localVariables > 0 then
+      lines[ #lines + 1 ] = '/* Reflected locals'
+      for _, localDeclaration in ipairs(localVariables) do lines[ #lines + 1 ] = '   ' .. localDeclaration end
+      lines[ #lines + 1 ] = '*/'
+    end
+  end
+
+  if options.includeOpcodeTrace == true then
+    lines[ #lines + 1 ] = '/* Opcode trace'
+    for _, operation in ipairs(model.trace) do
+      lines[ #lines + 1 ] = ('   +0x%04X  [%02X]  %s'):format( operation.offset, operation.value, operation.opcode )
+    end
+    lines[ #lines + 1 ] = '*/'
+  end
+
+  lines[ #lines + 1 ] = model.body
+  return table.concat( lines, '\n' ), model
+end
+
+--- Decompile one Blueprint UFunction
+-- Single-function output includes an opcode trace by default for debugging.
+-- @param functionAddress number @ UFunction descriptor
+-- @param options table|nil @ includeOpcodeTrace/includeMetadata/includeStatementOffsets
+-- @return string|nil @ C++-style pseudocode
+-- @return table|string|nil @ decompiler model or error
+function Dumper.Decompiler.ue_decompileFunction(functionAddress, options)
+  assert( type(functionAddress) == 'number' and functionAddress ~= 0, 'function address must be non-zero' )
+  local renderOptions = {}
+  for key, value in pairs(options or {}) do renderOptions[key] = value end
+  if renderOptions.includeOpcodeTrace == nil then renderOptions.includeOpcodeTrace = true end
+
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+  if not metadata then return nil, metadataError end
+  return Dumper.Decompiler.decompileMetadata( functionAddress, metadata, renderOptions )
+end
+
+--- Decompile every directly declared Blueprint function of a class/struct
+-- Empty and native remain annotated declarations
+-- @param classNameOrAddress string|number @ reflected owner type
+-- @param options table|nil @ decompiler rendering controls
+-- @return string|nil @ concatenated C++-style pseudocode
+-- @return string|nil @ error
+function Dumper.Decompiler.ue_decompileClass(classNameOrAddress, options)
+  local typeAddress = Dumper.Helpers.resolveType(classNameOrAddress)
+  if not typeAddress then return nil, 'UClass or script struct not found' end
+
+  local functions, functionsError = Backend.functions(typeAddress)
+  if not functions then return nil, functionsError end
+
+  options = options or {}
+  local renderOptions = {}
+  for key, value in pairs(options) do renderOptions[key] = value end
+  if renderOptions.includeOpcodeTrace == nil then renderOptions.includeOpcodeTrace = false end
+
+  local names = {}
+  for functionName in pairs(functions) do names[ #names + 1 ] = functionName end
+  table.sort(names)
+
+  local output = {}
+  for _, functionName in ipairs(names) do
+    local functionAddress = functions[functionName]
+    local metadata, metadataError = Backend.functionMetadata(functionAddress)
+
+    if not metadata then
+      output[ #output + 1 ] = ('// %s: %s'):format( Bytecode.Decompiler.identifier(functionName), tostring(metadataError) )
+    elseif metadata.native or not metadata.bytecode or metadata.bytecodeSize <= 0 then
+      output[ #output + 1 ] = Dumper.Decompiler.functionSignature( functionAddress, metadata, renderOptions ) .. '; // '
+                              .. (metadata.native and 'native thunk' or 'no Blueprint bytecode')
+    else
+      local source, decompileError = Dumper.Decompiler.decompileMetadata( functionAddress, metadata, renderOptions )
+      output[ #output + 1 ] = source or ('// %s: %s'):format( Bytecode.Decompiler.identifier(functionName), tostring(decompileError) )
+    end
+  end
+
+  return table.concat( output, '\n\n' )
 end
 
 
@@ -3279,7 +3847,8 @@ end
 -- @param typeAddress number @ reflected type descriptor
 -- @param kind string @ Class or ScriptStruct
 -- @param propertyCache table @ shared declared-property cache
-function Dumper.Dumps.writeStructuredType(file, typeAddress, kind, propertyCache)
+-- @param options table|nil @ dump/decompiler options
+function Dumper.Dumps.writeStructuredType(file, typeAddress, kind, propertyCache, options)
   local writeLine = Dumper.Dumps.writeLine
   local layout = Backend.classHeaderLayout()
   local typeName = Backend.objectName(typeAddress) or ('Type_%X'):format(typeAddress)
@@ -3330,7 +3899,33 @@ function Dumper.Dumps.writeStructuredType(file, typeAddress, kind, propertyCache
     table.sort(functionNames)
 
     for _, functionName in ipairs(functionNames) do
-      writeLine( file, '    ' .. Dumper.Dumps.functionDeclaration( functions[functionName], functionName ) )
+      local functionAddress = functions[functionName]
+      local metadata = Backend.functionMetadata(functionAddress)
+      local isUbergraph = functionName:match('^ExecuteUbergraph_') ~= nil
+      local shouldDecompile = options and options.decompileFunctions ~= false and (not isUbergraph or options.decompileUbergraphs == true)
+
+      if shouldDecompile and metadata and not metadata.native and metadata.bytecode and metadata.bytecodeSize and metadata.bytecodeSize > 0
+      then
+        local source, decompileError = Dumper.Decompiler.decompileMetadata(
+                                                                            functionAddress,
+                                                                            metadata,
+                                                                            {
+                                                                              qualified = false,
+                                                                              includeOpcodeTrace = options.includeOpcodeTrace == true,
+                                                                              includeStatementOffsets = options.includeStatementOffsets,
+                                                                              includeMetadata = options.includeMetadata,
+                                                                            }
+                                                                          )
+
+        if source then
+          for line in (source .. '\n'):gmatch('(.-)\n') do writeLine( file, '    ' .. line ) end
+        else
+          writeLine( file, '    ' .. Dumper.Dumps.functionDeclaration( functionAddress, functionName ) )
+          writeLine( file, '    // Decompiler unavailable: ' .. Dumper.Dumps.singleLine(decompileError) )
+        end
+      else
+        writeLine( file, '    ' .. Dumper.Dumps.functionDeclaration( functionAddress, functionName ) )
+      end
     end
   end
 
@@ -3363,10 +3958,15 @@ end
 
 --- Dump UClass/UScriptStruct/UEnum/properties/UFunctions
 -- @param outputPath string|nil @ optional output path; defaults beside target executable
+-- @param options table|nil @ decompileFunctions/decompileUbergraphs/includeOpcodeTrace/includeMetadata
 -- @return string|nil @ written path
 -- @return number|string|nil @ type count, or error
-function Dumper.Dumps.ue_dumpTypes(outputPath)
+function Dumper.Dumps.ue_dumpTypes(outputPath, options)
   if not Backend.isReady() then return nil, 'UE reflection is not initialized' end
+  local dumpOptions = {}
+  for key, value in pairs(options or {}) do dumpOptions[key] = value end
+  if dumpOptions.decompileFunctions == nil then dumpOptions.decompileFunctions = true end
+  if dumpOptions.decompileUbergraphs == nil then dumpOptions.decompileUbergraphs = Dumper.State.config.decompileUbergraphs end
 
   local classes = Backend.reflectedTypes('Class')
   local structs = Backend.reflectedTypes('ScriptStruct')
@@ -3395,7 +3995,7 @@ function Dumper.Dumps.ue_dumpTypes(outputPath)
 
       for _, record in ipairs(records) do
         if record.kind == 'Enum' then Dumper.Dumps.writeEnum( file, record.address )
-        else Dumper.Dumps.writeStructuredType( file, record.address, record.kind, propertyCache )
+        else Dumper.Dumps.writeStructuredType( file, record.address, record.kind, propertyCache, dumpOptions )
         end
       end
 
@@ -3452,6 +4052,9 @@ end
 
 Dumper.API =
 {
+  ue_getConfig = Dumper.Configuration.ue_getConfig,
+  ue_setConfig = Dumper.Configuration.ue_setConfig,
+  ue_resetConfig = Dumper.Configuration.ue_resetConfig,
   ue_isReady = Dumper.Lifecycle.ue_isReady,
   ue_isNameReady = Dumper.Lifecycle.ue_isNameReady,
   ue_getStatus = Dumper.Lifecycle.ue_getStatus,
@@ -3459,6 +4062,7 @@ Dumper.API =
   ue_setReflectionMetadataVisible = Dumper.Lifecycle.ue_setReflectionMetadataVisible,
   ue_isReflectionMetadataVisible = Dumper.Lifecycle.ue_isReflectionMetadataVisible,
   ue_clearCache = Dumper.Lifecycle.ue_clearCache,
+  ue_clearSavedLayout = Dumper.Lifecycle.ue_clearSavedLayout,
   ue_initDumper = Dumper.Lifecycle.ue_initDumper,
   ue_findClass = Dumper.Reflection.ue_findClass,
   ue_findObjectsOfClass = Dumper.Objects.ue_findObjectsOfClass,
@@ -3477,6 +4081,8 @@ Dumper.API =
   ue_enumFunctions = Dumper.Functions.ue_enumFunctions,
   ue_findFunction = Dumper.Functions.ue_findFunction,
   ue_getFunctionMetadata = Dumper.Functions.ue_getFunctionMetadata,
+  ue_decompileFunction = Dumper.Decompiler.ue_decompileFunction,
+  ue_decompileClass = Dumper.Decompiler.ue_decompileClass,
   ue_patchFunction = Dumper.Patching.ue_patchFunction,
   ue_nopFunction = Dumper.Patching.ue_nopFunction,
   ue_restoreFunctionPatch = Dumper.Patching.ue_restoreFunctionPatch,
@@ -3489,6 +4095,7 @@ Dumper.API =
   ue_registerClassOffsets = Dumper.Offsets.ue_registerClassOffsets,
   ue_registerObjectOffsets = Dumper.Offsets.ue_registerObjectOffsets,
   ue_registerObjectPath = Dumper.Offsets.ue_registerObjectPath,
+  ue_replaceRegisteredSymbolsWithOffsets = Dumper.Offsets.ue_replaceRegisteredSymbolsWithOffsets,
   ue_unregisterAllOffsets = Dumper.Offsets.ue_unregisterAllOffsets,
   ue_setMenuVisible = Dumper.Lifecycle.ue_setMenuVisible,
   ue_isMenuVisible = Dumper.Lifecycle.ue_isMenuVisible,
