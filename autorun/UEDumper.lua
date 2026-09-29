@@ -53,7 +53,7 @@ local PTR_SIZE = 0x8 -- targetIs64Bit() and 0x8 or 0x4 -- 32 bit unsupported, ha
 local INIT_WAIT_TIME = 30000
 local ceDirectory = getCheatEngineDir() or ''
 
--- { ["objName.property"] = true }
+-- { ["objName.property"] = numericOffset }
 Dumper.State.registeredSymbols = {}
 local registeredSymbols = Dumper.State.registeredSymbols
 
@@ -482,7 +482,7 @@ function Dumper.Offsets.registerProperties(properties, objectName, propertyNames
 
   for name, offset in pairs(result) do
     Backend.registerSymbol(name, offset)
-    registeredSymbols[name] = true
+    registeredSymbols[name] = offset
   end
 
   return result
@@ -748,7 +748,7 @@ function Dumper.Offsets.ue_registerObjectPath(rootObject, propertyPath, namespac
 
   for name, offset in pairs(result) do
     Backend.registerSymbol(name, offset)
-    registeredSymbols[name] = true
+    registeredSymbols[name] = offset
   end
 
   return result
@@ -759,6 +759,171 @@ function Dumper.Offsets.ue_unregisterAllOffsets()
   for name in pairs(registeredSymbols) do Backend.unregisterSymbol(name) end
   Dumper.State.registeredSymbols = {}
   registeredSymbols = Dumper.State.registeredSymbols
+end
+
+--- Test if byte can continue CE symbol identifier
+-- @param character string @ one-byte substring
+-- @return boolean @ true for common CE symbol-name characters
+function Dumper.Offsets.isSymbolCharacter(character)
+  return character ~= '' and character:match('[%w_%.%$%?@]') ~= nil
+end
+
+--- Replace one symbol as a complete token in a CE address expression
+-- Matching is case-insensitive to mirror CE symbol lookup
+-- @param expression string @ address or pointer-offset expression
+-- @param symbolName string @ registered symbol to replace
+-- @param replacement string @ numeric expression
+-- @return string @ rewritten expression
+-- @return number @ replacement count
+function Dumper.Offsets.replaceSymbolToken(expression, symbolName, replacement)
+  local isSymbolCharacter = Dumper.Offsets.isSymbolCharacter
+  local rewritten = tostring(expression or '')
+  local lowerSymbol = symbolName:lower()
+  local searchFrom = 1
+  local replacementCount = 0
+
+  while true do
+    local lowerExpression = rewritten:lower()
+    local startIndex, endIndex = lowerExpression:find( lowerSymbol, searchFrom, true )
+    if not startIndex then break end
+
+    local preceding = startIndex > 1 and rewritten:sub( startIndex - 1, startIndex - 1 ) or ''
+    local following = endIndex < #rewritten and rewritten:sub( endIndex + 1, endIndex + 1 ) or ''
+
+    if not isSymbolCharacter(preceding) and not isSymbolCharacter(following) then
+      rewritten = rewritten:sub( 1, startIndex - 1 ) .. replacement .. rewritten:sub( endIndex + 1 )
+      replacementCount = replacementCount + 1
+      searchFrom = startIndex + #replacement
+    else
+      searchFrom = endIndex + 1
+    end
+  end
+
+  return rewritten, replacementCount
+end
+
+--- Replace every owned symbol token in one expression
+-- @param expression string @ CE address/offset text
+-- @param symbols table[] @ longest-first symbol descriptors
+-- @return string @ numeric expression
+-- @return number @ total replacements
+function Dumper.Offsets.materializeExpression(expression, symbols)
+  local rewritten = tostring(expression or '')
+  local replacementCount = 0
+  local replaceSymbolToken = Dumper.Offsets.replaceSymbolToken
+
+  for _, symbol in ipairs(symbols) do
+    local replacements
+    rewritten, replacements = replaceSymbolToken( rewritten, symbol.name, symbol.numericText )
+    replacementCount = replacementCount + replacements
+  end
+
+  return rewritten, replacementCount
+end
+
+--- Replace owned offset symbols in every table memory record
+-- @return table|nil @ visited/changed/replacement statistics
+-- @return string|nil @ rewrite error
+function Dumper.Offsets.ue_replaceRegisteredSymbolsWithOffsets()
+  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Offsets.ue_replaceRegisteredSymbolsWithOffsets ) end
+
+  local exclusions = { gengine = true, gworld = true, pgengine = true, pgworld = true }
+  local symbols = {}
+
+  for symbolName, registeredValue in pairs(registeredSymbols) do
+
+    if not exclusions[ symbolName:lower() ] then
+      local numericValue = type(registeredValue) == 'number' and registeredValue or getAddressSafe(symbolName)
+
+      if type(numericValue) == 'number' then
+        symbols[ #symbols + 1 ] =
+        {
+          name = symbolName,
+          numericText = ('%X'):format(numericValue),
+        }
+      end
+    end
+  end
+
+  table.sort( symbols,
+    function(left, right)
+      if #left.name ~= #right.name then return #left.name > #right.name end
+      return left.name < right.name
+    end
+  )
+
+  local statistics =
+  {
+    registeredSymbolCount = #symbols,
+    recordsVisited = 0,
+    recordsChanged = 0,
+    addressReplacements = 0,
+    offsetReplacements = 0,
+    totalReplacements = 0,
+  }
+
+  if #symbols == 0 then return statistics end
+
+  local addressList = getAddressList()
+  if not addressList then return nil, 'Cheat Engine address list is unavailable' end
+
+  local listControl = addressList.List
+  local updateSuspended = listControl and type(listControl.beginUpdate) == 'function'
+  if updateSuspended then listControl.beginUpdate() end
+
+  local completed, rewriteError = xpcall(
+    function()
+      local materializeExpression = Dumper.Offsets.materializeExpression
+
+      for recordIndex = 0, addressList.getCount() - 1 do
+        local memoryRecord = addressList.getMemoryRecord(recordIndex)
+        statistics.recordsVisited = statistics.recordsVisited + 1
+
+        if not memoryRecord or memoryRecord.Type == vtAutoAssembler then goto continue end
+
+        local offsetCount = memoryRecord.getOffsetCount()
+        local rewrittenOffsets = {}
+        local offsetReplacementCount = 0
+
+        for offsetIndex = 0, offsetCount - 1 do
+          local rewrittenOffset, replacements = materializeExpression( memoryRecord.OffsetText[offsetIndex], symbols )
+          rewrittenOffsets[offsetIndex] = rewrittenOffset
+          offsetReplacementCount = offsetReplacementCount + replacements
+        end
+
+        local originalAddress = memoryRecord.getAddress()
+        local rewrittenAddress, addressReplacementCount = materializeExpression( originalAddress, symbols )
+        local addressChanged = addressReplacementCount > 0
+        local offsetsChanged = offsetReplacementCount > 0
+
+        if not addressChanged and not offsetsChanged then goto continue end
+
+        -- setAddress can reset pointer offsets
+        -- restore every level after a base-address rewrite and apply all numeric offset texts together
+        if addressChanged then
+          memoryRecord.setAddress(rewrittenAddress)
+          memoryRecord.setOffsetCount(offsetCount)
+        end
+
+        for offsetIndex = 0, offsetCount - 1 do
+          memoryRecord.OffsetText[offsetIndex] = rewrittenOffsets[offsetIndex]
+        end
+
+        statistics.recordsChanged = statistics.recordsChanged + 1
+        statistics.addressReplacements = statistics.addressReplacements + addressReplacementCount
+        statistics.offsetReplacements = statistics.offsetReplacements + offsetReplacementCount
+
+        ::continue::
+      end
+    end,
+    debug.traceback
+  )
+
+  if updateSuspended then listControl.endUpdate() end
+  if not completed then return nil, rewriteError end
+
+  statistics.totalReplacements = statistics.addressReplacements + statistics.offsetReplacements
+  return statistics
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// STATUS
@@ -3930,6 +4095,7 @@ Dumper.API =
   ue_registerClassOffsets = Dumper.Offsets.ue_registerClassOffsets,
   ue_registerObjectOffsets = Dumper.Offsets.ue_registerObjectOffsets,
   ue_registerObjectPath = Dumper.Offsets.ue_registerObjectPath,
+  ue_replaceRegisteredSymbolsWithOffsets = Dumper.Offsets.ue_replaceRegisteredSymbolsWithOffsets,
   ue_unregisterAllOffsets = Dumper.Offsets.ue_unregisterAllOffsets,
   ue_setMenuVisible = Dumper.Lifecycle.ue_setMenuVisible,
   ue_isMenuVisible = Dumper.Lifecycle.ue_isMenuVisible,
