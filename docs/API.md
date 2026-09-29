@@ -8,6 +8,10 @@
 | `ue_isReady()`                                     | Get ready status                                       |
 | `ue_isNameReady()`                                 | Get cached names status                                |
 | `ue_getStatus()`                                   | Get verbose dumper state                               |
+| `ue_getConfig(key)`                                | Read persistent script configuration                   |
+| `ue_setConfig(key, value)`                         | Validate and persist one configuration value           |
+| `ue_resetConfig(key)`                              | Reset one or all configuration values                  |
+| `ue_clearSavedLayout()`                            | Clear current target/version reflection layout cache   |
 | `ue_dumpFNames(path)`                              | Dump decoded FName strings                             |
 | `ue_dumpTypes(path)`                               | Dump classes, structs, enums, fields, and functions    |
 | `ue_dumpObjects(path)`                             | Dump GUObjectArray addresses, types, and paths          |
@@ -17,6 +21,8 @@
 | `ue_enumFunctions(type)`                           | Enumerate `UFunctions` for type                        |
 | `ue_findFunction(type, name)`                      | Find a specific `UFunction` for type                   |
 | `ue_getFunctionMetadata(function)`                 | Get `UFunction` obj & parameter metadata               |
+| `ue_decompileFunction(function, options)`          | Decompile one Blueprint function to C++ pseudocode     |
+| `ue_decompileClass(type, options)`                 | Decompile directly declared functions of a type        |
 | `ue_patchFunction(function, bytes, offset)`        | Apply a reversible Blueprint-bytecode patch             |
 | `ue_nopFunction(function, options)`                | Replace a void Blueprint body with an immediate return  |
 | `ue_restoreFunctionPatch(patch, options)`          | Restore one bytecode patch                              |
@@ -483,6 +489,47 @@ for name, parameter in pairs( info.parameters ) do
 end
 ```
 
+### Blueprint bytecode pseudocode
+
+#### `ue_decompileFunction(functionAddress, options)`
+
+Decompiles `UFunction::Script` byte array into C++ pseudocode.
+Return source text. Second optional ret is the intermediate model
+containing `statements`, `trace`, `errors` and parser state
+
+```lua
+local functionAddress = assert( ue_findFunction( 'BP_DamageSystem_C', 'TakeDamage' ) )
+
+local source, modelOrError = ue_decompileFunction(functionAddress)
+assert(source, modelOrError)
+print(source)
+```
+
+| Option | Default | Description |
+|---|---:|---|
+| `includeOpcodeTrace` | `true` | Include offset/opcode/token list above the body |
+| `includeMetadata` | `true` | Include UFunction, Script, and reflected-local comments |
+| `includeStatementOffsets` | `true` | Prefix pseudocode statements with bytecode offsets |
+| `maxInstructionCount` | `max(0x10000, Script.Num)` | Optional explicit expression safety limit |
+
+#### `ue_decompileClass(classNameOrAddress, options)`
+
+Decompile all functions declared directly by a `UClass`/`UScriptStruct`
+Inherited functions remain attached to their declaring type.
+Opcode traces arent enabled by default, `{ includeOpcodeTrace = true }` does that.
+
+```lua
+local options =
+{
+  includeOpcodeTrace = false,
+  includeStatementOffsets = true,
+}
+local source, err = ue_decompileClass( 'BP_DamageSystem_C', options )
+
+assert(source, err)
+print(source)
+```
+
 ### Blueprint bytecode patching
 
 #### `ue_patchFunction(functionAddress, patchBytes, byteOffset)`
@@ -646,7 +693,7 @@ assert(path, count)
 print( ('Dumped %d names to %s'):format( count, path ) )
 ```
 
-#### `ue_dumpTypes(outputPath)`
+#### `ue_dumpTypes(outputPath, options)`
 > Dump indexed `UClass`, `UScriptStruct`, `UEnum`
 
 ```lua
@@ -670,6 +717,21 @@ Explicit writable destination can be supplied too:
 assert(ue_dumpTypes([[C:\Dumps\MyGame_Types.txt]]))
 ```
 
+Decompiler-related options:
+`decompileFunctions`, `decompileUbergraphs`, `includeOpcodeTrace`,
+`includeMetadata`, `includeStatementOffsets`
+
+Blueprint functions are decompiled in the type dump by default.
+`ExecuteUbergraph_*` remain as sygnatures
+unless `decompileUbergraphs` is explicitly enabled
+
+```lua
+ue_dumpTypes(nil, { decompileFunctions = false })
+
+-- Opt in when a complete Ubergraph pseudocode dump is wanted
+ue_dumpTypes(nil, { decompileUbergraphs = true })
+```
+
 
 ## Portability
 
@@ -687,4 +749,40 @@ Can also be set via:
 ```lua
 ue_setReflectionMetadataVisible( true )
 print( ue_isReflectionMetadataVisible() ) -- true
+```
+
+## Persistent configuration
+
+```lua
+local config = ue_getConfig()
+print(config.maxArrayElements)
+
+assert( ue_setConfig('maxArrayElements', 512) )
+assert( ue_setConfig('maxMapElements', 128) )
+
+-- Read one value.
+print( ue_getConfig('maxMapElements') )
+
+-- Restore one default, or omit the key to restore every default.
+assert( ue_resetConfig('maxMapElements') )
+assert( ue_resetConfig() )
+```
+
+| Key | Type | Default | Effect |
+|---|---|---:|---|
+| `maxArrayElements` | integer `0..65536` | `256` | Maximum `TArray` entries created to Struct Dissect |
+| `maxMapElements` | integer `0..65536` | `256` | Maximum occupied `TMap` entries created |
+| `maxSetElements` | integer `0..65536` | `256` | Maximum occupied `TSet` entries created |
+| `maxDelegateElements` | integer `0..65536` | `256` | Maximum multicast-delegate invocation entries created |
+| `decompileUbergraphs` | boolean | `false` | Default Ubergraph behavior for `ue_dumpTypes`; an explicit call option overrides it |
+
+## Persistent layout
+#### `ue_clearSavedLayout()`
+
+Delete saved scanned values for the attached executable with its current version identifier
+
+```lua
+local cleared, removedCountOrError, settingsKey = ue_clearSavedLayout()
+assert( cleared, removedCountOrError )
+print( ('Removed %d saved values from %s'):format( removedCountOrError, settingsKey ) )
 ```
