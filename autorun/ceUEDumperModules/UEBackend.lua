@@ -209,6 +209,15 @@ function Module.Lifecycle.status()
   return Core.status()
 end
 
+--- Clear persisted reflection layout for the currently attached target version
+-- Does not clear general ceUEDumper configuration or current runtime state
+-- @return boolean|nil @ true when cleared
+-- @return number|string|nil @ removed value count, or error
+-- @return string|nil @ cleared settings key
+function Module.Lifecycle.clearSavedLayout()
+  return Core.clearSavedLayout()
+end
+
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// GUOBJECTARRAY ACCESS
 
@@ -1813,6 +1822,7 @@ Module.initialize = Module.Lifecycle.initialize
 Module.configureSignatures = Module.Lifecycle.configureSignatures
 Module.wait = Module.Lifecycle.wait
 Module.status = Module.Lifecycle.status
+Module.clearSavedLayout = Module.Lifecycle.clearSavedLayout
 
 Module.objectCount = Module.Objects.objectCount
 Module.objectAt = Module.Objects.objectAt

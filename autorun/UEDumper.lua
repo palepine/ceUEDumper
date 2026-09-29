@@ -21,11 +21,11 @@
 -- TODO: search for properties by name
 -- TODO: search for objects by fname
 -- TODO: fname/object descryption
--- TODO: more option for limiting
 
 local Dumper =
 {
   Runtime = {},
+  Configuration = {},
   Portable = {},
   Helpers = {},
   Lifecycle = {},
@@ -67,11 +67,22 @@ Dumper.State.propertyMetadataStructure = nil
 Dumper.State.classReferenceIndex = nil
 Dumper.State.bytecodeConstantWidths = nil
 Dumper.State.cacheProcessId = getOpenedProcessID()
+Dumper.State.config = {}
 local typeCache = Dumper.State.typeCache
+
+local CONFIG_SETTINGS_KEY = [[ceUEDumper\Configuration]]
+local CONFIG_DEFINITIONS =
+{
+  maxArrayElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  maxMapElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  maxSetElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  maxDelegateElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
+  decompileUbergraphs = { default = false, kind = 'boolean' },
+}
 
 local PORTABLE_FILES =
 {
-  { name = 'ceUEDumper',                  path = [[autorun\UEDumper.lua]] },
+  { name = 'ceUEDumper',              path = [[autorun\UEDumper.lua]] },
   { name = 'ceUEDumper.UEBackend',    path = [[autorun\ceUEDumperModules\UEBackend.lua]] },
   { name = 'ceUEDumper.UEBytecode',   path = [[autorun\ceUEDumperModules\UEBytecode.lua]] },
   { name = 'ceUEDumper.UEDumperCore', path = [[autorun\ceUEDumperModules\UEDumperCore.lua]] },
@@ -86,6 +97,118 @@ function Dumper.Runtime.onMainThread(callback, ...)
   if inMainThread() then return callback(...) end
   return synchronize( callback, ... )
 end
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CONFIGURATION
+
+--- Validate and normalize one public configuration value
+-- @param key string @ CONFIG_DEFINITIONS key
+-- @param value any @ caller or persisted value
+-- @return any|nil @ normalized value
+-- @return string|nil @ validation error
+function Dumper.Configuration.normalize(key, value)
+  local definition = CONFIG_DEFINITIONS[key]
+  if not definition then return nil, 'Unknown ceUEDumper configuration key: ' .. tostring(key) end
+
+  if definition.kind == 'boolean' then
+    if type(value) == 'boolean' then return value end
+    if value == 'true' or value == '1' or value == 1 then return true end
+    if value == 'false' or value == '0' or value == 0 then return false end
+    return nil, key .. ' must be a boolean'
+  end
+
+  local numericValue = type(value) == 'number' and value or tonumber(value)
+  if not numericValue or numericValue % 1 ~= 0 then return nil, key .. ' must be an integer' end
+  if numericValue < definition.minimum or numericValue > definition.maximum then
+    return nil, ('%s must be between %d and %d'):format( key, definition.minimum, definition.maximum )
+  end
+
+  return numericValue
+end
+
+--- Persist values through CE settings store
+-- @param values table @ configuration values keyed by public names
+function Dumper.Configuration.persist(values)
+  local function writeSettings()
+    local settings = getSettings( CONFIG_SETTINGS_KEY, true )
+    for key, value in pairs(values) do settings[key] = tostring(value) end
+  end
+
+  Dumper.Runtime.onMainThread(writeSettings)
+end
+
+--- Load persistent config, replacing malformed entries with defaults
+function Dumper.Configuration.load()
+  local function readSettings()
+    local settings = getSettings( CONFIG_SETTINGS_KEY, true )
+    local values = {}
+
+    for key, definition in pairs(CONFIG_DEFINITIONS) do
+      local value = Dumper.Configuration.normalize( key, settings[key] )
+      values[key] = value ~= nil and value or definition.default
+    end
+
+    return values
+  end
+
+  Dumper.State.config = Dumper.Runtime.onMainThread(readSettings)
+end
+
+--- Read one persistent option or a copy of all current options
+-- @param key string|nil @ configuration key; nil returns all values
+-- @return any|table|nil @ current value or independent configuration table
+-- @return string|nil @ unknown-key error
+function Dumper.Configuration.ue_getConfig(key)
+  if key ~= nil then
+    if not CONFIG_DEFINITIONS[key] then return nil, 'Unknown ceUEDumper configuration key: ' .. tostring(key) end
+    return Dumper.State.config[key]
+  end
+
+  local values = {}
+  for configKey in pairs(CONFIG_DEFINITIONS) do values[configKey] = Dumper.State.config[configKey] end
+  return values
+end
+
+--- Validate, apply, persist one option
+-- @param key string @ configuration key
+-- @param value any @ new typed value
+-- @return boolean|nil @ true when persisted
+-- @return any|string|nil @ normalized value, or validation/persistence error
+function Dumper.Configuration.ue_setConfig(key, value)
+  local normalized, validationError = Dumper.Configuration.normalize( key, value )
+  if normalized == nil then return nil, validationError end
+
+  local persisted, persistenceError = pcall( Dumper.Configuration.persist, { [key] = normalized } )
+  if not persisted then return nil, 'Failed persisting ceUEDumper configuration: ' .. tostring(persistenceError) end
+
+  Dumper.State.config[key] = normalized
+  return true, normalized
+end
+
+--- Reset one option or the complete persistent configuration to defaults
+-- @param key string|nil @ option to reset; nil resets all options
+-- @return boolean|nil @ true when persisted
+-- @return any|table|string|nil @ reset value/table, or error
+function Dumper.Configuration.ue_resetConfig(key)
+  if key ~= nil and not CONFIG_DEFINITIONS[key] then
+    return nil, 'Unknown ceUEDumper configuration key: ' .. tostring(key)
+  end
+
+  local defaults = {}
+  if key ~= nil then
+    defaults[key] = CONFIG_DEFINITIONS[key].default
+  else
+    for configKey, definition in pairs(CONFIG_DEFINITIONS) do defaults[configKey] = definition.default end
+  end
+
+  local persisted, persistenceError = pcall( Dumper.Configuration.persist, defaults )
+  if not persisted then return nil, 'Failed persisting ceUEDumper configuration: ' .. tostring(persistenceError) end
+
+  for configKey, value in pairs(defaults) do Dumper.State.config[configKey] = value end
+  if key ~= nil then return true, Dumper.State.config[key] end
+  return true, Dumper.Configuration.ue_getConfig()
+end
+
+Dumper.Configuration.load()
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// PORTABLE MODULES
 
@@ -670,6 +793,15 @@ function Dumper.Lifecycle.ue_clearCache()
   Dumper.State.propertyMetadataStructure = nil
   Dumper.State.classReferenceIndex = nil
   Dumper.State.bytecodeConstantWidths = nil
+end
+
+--- Clear saved reflection offsets/globals for attached executable version
+-- General persistent configuration and the current in-memory layout are kept
+-- @return boolean|nil @ true when cleared
+-- @return number|string|nil @ removed setting count, or error
+-- @return string|nil @ cleared target-specific settings key
+function Dumper.Lifecycle.ue_clearSavedLayout()
+  return Backend.clearSavedLayout()
 end
 
 --- Enable or disable UClass/UProperty metadata expansion in new structures
@@ -1388,7 +1520,7 @@ function Dumper.Structures.createMulticastDelegateDataStructure(invocationCount)
   if type(invocationCount) ~= 'number' or invocationCount < 0 or invocationCount > 0x1000000 then return nil end
 
   local invocationList = createStructure('ceUE.FMulticastScriptDelegate.InvocationList')
-  local renderedCount = math.min( invocationCount, 256 )
+  local renderedCount = math.min( invocationCount, Dumper.State.config.maxDelegateElements )
   local addScriptDelegateEntry = Dumper.Structures.addScriptDelegateEntry
 
   for index = 0, renderedCount - 1 do
@@ -1522,7 +1654,7 @@ function Dumper.Structures.createArrayDataStructure(property, arrayHeaderAddress
 
   if not dataAddress or dataAddress == 0 then return nil, 'TArray data pointer is null' end
 
-  local renderedCount = math.min( elementCount, 256 )
+  local renderedCount = math.min( elementCount, Dumper.State.config.maxArrayElements )
   local elementStride = innerProperty.size
 
   for index = 0, renderedCount - 1 do
@@ -1805,7 +1937,7 @@ function Dumper.Structures.createSetDataStructure(property, containerAddress)
   local setStructure = createStructure('ceUE.TSet<' .. elementProperty.propertyType .. '>')
   if header.elementCount == 0 then return setStructure end
 
-  local indices, indexError = Dumper.Structures.sparseContainerIndices(header)
+  local indices, indexError = Dumper.Structures.sparseContainerIndices( header, Dumper.State.config.maxSetElements )
   if not indices then return nil, indexError end
 
   for _, sparseIndex in ipairs(indices) do
@@ -1840,7 +1972,7 @@ function Dumper.Structures.createMapDataStructure(property, containerAddress)
   local mapStructure = createStructure( ('ceUE.TMap<%s,%s>'):format( keyProperty.propertyType, valueProperty.propertyType ) )
   if header.elementCount == 0 then return mapStructure end
 
-  local indices, indexError = Dumper.Structures.sparseContainerIndices(header)
+  local indices, indexError = Dumper.Structures.sparseContainerIndices( header, Dumper.State.config.maxMapElements )
   if not indices then return nil, indexError end
 
   for _, sparseIndex in ipairs(indices) do
@@ -3669,7 +3801,7 @@ function Dumper.Dumps.ue_dumpTypes(outputPath, options)
   local dumpOptions = {}
   for key, value in pairs(options or {}) do dumpOptions[key] = value end
   if dumpOptions.decompileFunctions == nil then dumpOptions.decompileFunctions = true end
-  if dumpOptions.decompileUbergraphs == nil then dumpOptions.decompileUbergraphs = false end
+  if dumpOptions.decompileUbergraphs == nil then dumpOptions.decompileUbergraphs = Dumper.State.config.decompileUbergraphs end
 
   local classes = Backend.reflectedTypes('Class')
   local structs = Backend.reflectedTypes('ScriptStruct')
@@ -3755,6 +3887,9 @@ end
 
 Dumper.API =
 {
+  ue_getConfig = Dumper.Configuration.ue_getConfig,
+  ue_setConfig = Dumper.Configuration.ue_setConfig,
+  ue_resetConfig = Dumper.Configuration.ue_resetConfig,
   ue_isReady = Dumper.Lifecycle.ue_isReady,
   ue_isNameReady = Dumper.Lifecycle.ue_isNameReady,
   ue_getStatus = Dumper.Lifecycle.ue_getStatus,
@@ -3762,6 +3897,7 @@ Dumper.API =
   ue_setReflectionMetadataVisible = Dumper.Lifecycle.ue_setReflectionMetadataVisible,
   ue_isReflectionMetadataVisible = Dumper.Lifecycle.ue_isReflectionMetadataVisible,
   ue_clearCache = Dumper.Lifecycle.ue_clearCache,
+  ue_clearSavedLayout = Dumper.Lifecycle.ue_clearSavedLayout,
   ue_initDumper = Dumper.Lifecycle.ue_initDumper,
   ue_findClass = Dumper.Reflection.ue_findClass,
   ue_findObjectsOfClass = Dumper.Objects.ue_findObjectsOfClass,

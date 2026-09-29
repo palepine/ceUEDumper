@@ -5801,6 +5801,44 @@ function Core.Persistence.getVersionIdentifier()
   return versionIdentifier
 end
 
+--- Build settings key used by the current executable version's layout
+-- @param processName string|nil @ target executable name; defaults to process
+-- @return string|nil @ complete target-specific settings key
+-- @return string|nil @ identity error
+function Core.Persistence.getLayoutSettingsKey(processName)
+  processName = processName or process
+  if type(processName) ~= 'string' or processName == '' then return nil, 'No process selected' end
+
+  local versionIdentifier = Core.Persistence.getVersionIdentifier()
+  if versionIdentifier == nil then return nil, 'Executable identity could not be read' end
+
+  return 'ceUEDumper\\Layouts\\CUEDEFS\\' .. processName .. '-' .. versionIdentifier
+end
+
+--- Delete persisted reflection layout values for the current executable version
+-- Runtime CUEDEFS remains intact; the next script/process initialization rescans
+-- @return boolean|nil @ true when the settings values were removed
+-- @return number|string|nil @ removed value count, or error
+-- @return string|nil @ cleared settings key
+function Core.Persistence.clearCurrentLayout()
+  if not inMainThread() then return Core.Runtime.onMainThread(Core.Persistence.clearCurrentLayout) end
+  if Core.State.scannerRunning then return nil, 'Cannot clear saved layout while the UE scanner is running' end
+
+  local settingsKey, keyError = Core.Persistence.getLayoutSettingsKey()
+  if not settingsKey then return nil, keyError end
+
+  local savedSettings = getSettings( settingsKey, true )
+  local savedValues = savedSettings.getValueList() or {}
+  local removedCount = 0
+
+  for valueName in pairs(savedValues) do
+    savedSettings[valueName] = nil
+    removedCount = removedCount + 1
+  end
+
+  return true, removedCount, settingsKey
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// LAYOUT LOAD
 
 --- Restore numeric definition members from flattened settings keys
@@ -6556,12 +6594,10 @@ function Core.Scanner.UEInfoScanner(cancellationThread)
     savedSettings = run.settingsSnapshot
     persistentSettings = run.persistentSettings
   else
-    -- Direct scans execute without a managed worker and retain the historical
-    -- immediate Settings-object path.
-    local versionIdentifier = Core.Persistence.getVersionIdentifier()
-    if versionIdentifier == nil then return false, 'file and main module unreadable' end
-
-    settingsKey = 'ceUEDumper\\Layouts\\CUEDEFS\\' .. processName .. '-' .. versionIdentifier
+    -- direct scans execute without a managed worker and retain the historical immediate Settings-object path
+    local settingsError
+    settingsKey, settingsError = Core.Persistence.getLayoutSettingsKey(processName)
+    if not settingsKey then return false, settingsError end
     persistentSettings = getSettings( settingsKey, true )
     savedSettings = persistentSettings
   end
@@ -6715,11 +6751,8 @@ function Core.Scanner.LaunchUEInfoScanner()
   -- worker starts. The scanner receives only a plain table snapshot and the
   -- persistent object is touched again only during its guarded final commit.
   local processName = process
-  local versionIdentifier = Core.Persistence.getVersionIdentifier()
-
-  if versionIdentifier == nil then return nil, 'Executable identity could not be read' end
-
-  local settingsKey = 'ceUEDumper\\Layouts\\CUEDEFS\\' .. processName .. '-' .. versionIdentifier
+  local settingsKey, settingsError = Core.Persistence.getLayoutSettingsKey(processName)
+  if not settingsKey then return nil, settingsError end
   local persistentSettings = getSettings( settingsKey, true )
   local settingsSnapshot = persistentSettings.getValueList() or {}
 
@@ -6992,6 +7025,7 @@ Core.API.status = Core.API.ue_getScannerStatusInternal
 Core.API.processEvent = Core.Signatures.resolveProcessEvent
 Core.API.setMenuVisible = Core.Menu.setMenuVisible
 Core.API.isMenuVisible = Core.Menu.isMenuVisible
+Core.API.clearSavedLayout = Core.Persistence.clearCurrentLayout
 Core.API.subsystems = Core
 
 return Core.API
