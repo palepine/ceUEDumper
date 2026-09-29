@@ -37,6 +37,7 @@
 | `ue_registerClassOffsets(class, names, namespace)` | Register class property symbols                        |
 | `ue_registerObjectOffsets(this, names, namespace)` | Register class property symbols via object             |
 | `ue_registerObjectPath(this, path, namespace)`     | Register class property symbols via obj and path       |
+| `ue_replaceRegisteredSymbolsWithOffsets()`         | Convert owned symbols to their numerical values across all records |
 | `ue_unregisterAllOffsets()`                        | Clear created symbols                                  |
 | `ue_clearCache()`                                  | Clear cached `UClass` addresses                        |
 
@@ -786,3 +787,24 @@ local cleared, removedCountOrError, settingsKey = ue_clearSavedLayout()
 assert( cleared, removedCountOrError )
 print( ('Removed %d saved values from %s'):format( removedCountOrError, settingsKey ) )
 ```
+
+#### `ue_replaceRegisteredSymbolsWithOffsets()`
+
+Replace owned property symbols in all memrecords with their resolved numerical offsets.
+
+```lua
+assert( ue_registerClassOffsets( 'World', {'OwningGameInstance' } ) )
+
+local statistics, rewriteError = ue_replaceRegisteredSymbolsWithOffsets()
+
+assert( statistics, rewriteError )
+print( ('Changed %d records with %d replacements'):format( statistics.recordsChanged, statistics.totalReplacements ) )
+```
+
+Stats contain:
+- `registeredSymbolCount`
+- `recordsVisited`
+- `recordsChanged`
+- `addressReplacements`
+- `offsetReplacements`
+- `totalReplacements`
