@@ -3867,10 +3867,17 @@ function Core.Names.publishNamePoolMaps(nameMaps)
   CUEDEFS.CachedNameCount = uniqueNameCount
   CUEDEFS.NamePoolValidated = uniqueNameCount > 355 and nameToIndex.Class ~= nil and nameToIndex.Object ~= nil -- heuristic validation
 
-  Core.Runtime.log(
-        ('Core.Names.CacheNamePool: cached %d names with header shift %d; GameEngine=%s')
-        :format( uniqueNameCount, CUEDEFS.FNameHeaderShift or 6, tostring( nameToIndex['GameEngine'] ~= nil ) )
-      )
+  if CUEDEFS.NamePoolData_old then
+    Core.Runtime.log(
+                      ('Core.Names.CacheNamePool: cached %d legacy names; GameEngine=%s')
+                      :format( uniqueNameCount, tostring( nameToIndex['GameEngine'] ~= nil ) )
+                    )
+  else
+    Core.Runtime.log(
+                      ('Core.Names.CacheNamePool: cached %d names with header shift %d; GameEngine=%s')
+                      :format( uniqueNameCount, CUEDEFS.FNameHeaderShift or 6, tostring( nameToIndex['GameEngine'] ~= nil ) )
+                    )
+  end
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// CACHE ENTRY POINT
@@ -3917,8 +3924,8 @@ function Core.Names.CacheNamePool_old()
 
   if not populated then return nil, cacheError end
 
-  CUEDEFS.NameToIndex = nameMaps.nameToIndex -- CUEDEFS.NameToIndex["None"] = 0
-  CUEDEFS.IndexToName = nameMaps.indexToName -- CUEDEFS.IndexToName[0] = "None"
+  -- set lookup maps, CachedNameCount and NamePoolValidated together
+  Core.Names.publishNamePoolMaps(nameMaps)
 
   return true
 end
@@ -4111,6 +4118,57 @@ function Core.NameScan.findLegacyNameStringOffset(entryAddress)
   end
 
   return nil
+end
+
+--- Validate legacy chunk through its hardcoded names
+-- first ptr must reference None entry with subsequent ones
+-- @param chunkAddress number @ possible legacy entry-pointer chunk
+-- @return table|nil @ first entry and inferred string-member offset
+function Core.NameScan.inspectLegacyEntryPointerChunk(chunkAddress)
+  if not chunkAddress or chunkAddress <= 0 then return nil end
+
+  local firstEntryAddress = readPointer(chunkAddress)
+  if not firstEntryAddress or firstEntryAddress == 0 then return nil end
+
+  local stringOffset = Core.NameScan.findLegacyNameStringOffset(firstEntryAddress)
+  if type(stringOffset) ~= 'number' then return nil end
+  if readString( firstEntryAddress + stringOffset, 4 ) ~= 'None' then return nil end
+
+  local foundByteProperty = false
+
+  for entryIndex = 1, 31 do
+    local entryAddress = readPointer( chunkAddress + entryIndex * 8 )
+
+    if entryAddress and entryAddress ~= 0 and readString( entryAddress + stringOffset, 12 ) == 'ByteProperty'
+    then
+      foundByteProperty = true
+      break
+    end
+
+  end
+
+  if not foundByteProperty then return nil end
+
+  return
+  {
+    chunkAddress = chunkAddress,
+    firstEntryAddress = firstEntryAddress,
+    stringOffset = stringOffset,
+  }
+end
+
+--- Validate legacy GNames top-level chunk-pointer table
+-- @param poolAddress number @ possible TNameEntryArray/GNames address
+-- @return table|nil @ validated pool, first chunk and entry layout
+function Core.NameScan.inspectLegacyNamePool(poolAddress)
+  if not poolAddress or poolAddress <= 0 then return nil end
+
+  local firstChunkAddress = readPointer(poolAddress)
+  local chunk = Core.NameScan.inspectLegacyEntryPointerChunk(firstChunkAddress)
+  if not chunk then return nil end
+
+  chunk.poolAddress = poolAddress
+  return chunk
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--/// LEGACY POINTER LIST SEARCHES
@@ -4461,6 +4519,7 @@ function Core.NameScan.selectStructuralNamePool(references)
   Core.NameScan.validateNameBlock( readPointer(referenceAddress) )
 
   CUEDEFS.NamePoolData = referenceAddress - 0x10
+  CUEDEFS.NamePoolData_old = nil
   local sourceModule = Core.Modules.ue_getAddressModuleInternal(CUEDEFS.NamePoolData)
   CUEDEFS.NamePoolSourceModule = sourceModule and extractFileName( sourceModule.PathToFile or '' ) or nil
   CUEDEFS.NamePoolScanMethod = 'structural-scan'
@@ -4476,8 +4535,6 @@ end
 -- @return string|nil @ error
 function Core.NameScan.FindNamePoolData_older(cancellationThread)
   if CUEDEFS.NamePoolData then return true end
-
-  CUEDEFS.NamePoolData_old = true --todo: if more than 2 formats, change it to an identifier number
 
   local firstEntryAddress, blockError = Core.NameScan.findLegacyFirstStringBlock( cancellationThread )
 
@@ -4496,6 +4553,7 @@ function Core.NameScan.FindNamePoolData_older(cancellationThread)
   if not blockPointerList then return nil, blockListError end
 
   CUEDEFS.NamePoolData = blockPointerList
+  CUEDEFS.NamePoolData_old = true --todo: if more than 2 formats, change it to an identifier number
 
   return true
 end
@@ -5171,16 +5229,70 @@ function Core.Signatures.evaluateNamePoolTarget(targetAddress, patternIndex, sou
     ::continue::
   end
 
-  if not selectedAllocatorAddress then return nil end
+  if selectedAllocatorAddress then
+    Core.Runtime.log( ('Signature: GNames pattern %d resolved modern pool 0x%X in %s'):format( patternIndex, selectedAllocatorAddress, sourceModuleName ) )
+    return
+    {
+      address = selectedAllocatorAddress,
+      patternIndex = patternIndex,
+      sourceModule = sourceModuleName,
+      scanMethod = 'module-signature',
+      legacy = false,
+    }
+  end
 
-  Core.Runtime.log( ('Signature: GNames pattern %d resolved 0x%X in %s'):format( patternIndex, selectedAllocatorAddress, sourceModuleName ) )
-  return
-  {
-    address = selectedAllocatorAddress,
-    patternIndex = patternIndex,
-    sourceModule = sourceModuleName,
-    scanMethod = 'module-signature',
-  }
+  -- UE4.22/earlier
+  -- global -> GNames chunk table -> entry-pointer chunk -> FNameEntry
+  -- trying after every modern allocator interpretation failed
+  local legacyCandidates = { targetAddress, indirect }
+  local visitedLegacyAddresses = {}
+
+  for _, candidate in ipairs(legacyCandidates) do
+    if not candidate or candidate <= 0 or visitedLegacyAddresses[candidate] then goto legacy_continue end
+    visitedLegacyAddresses[candidate] = true
+
+    local legacyLayout = Core.NameScan.inspectLegacyNamePool(candidate)
+
+    -- some signatures resolve Blocks[0], first entry-pointer chunk, rather than the top-level GNames table
+    -- recover its unique owner
+    if not legacyLayout then
+      local chunkLayout = Core.NameScan.inspectLegacyEntryPointerChunk(candidate)
+
+      if chunkLayout then
+        local poolAddress = Core.NameScan.findLegacyBlockPointerList(candidate)
+        legacyLayout = poolAddress and Core.NameScan.inspectLegacyNamePool(poolAddress) or nil
+      end
+    end
+
+    -- a signature may resolve the first FNameEntry itself
+    -- walk its two pointer owners back to the entry chunk and then the GNames table
+    if not legacyLayout then
+      local stringOffset = Core.NameScan.findLegacyNameStringOffset(candidate)
+
+      if type(stringOffset) == 'number' and readString( candidate + stringOffset, 4 ) == 'None' then
+        local chunkAddress = Core.NameScan.findLegacyEntryPointerBlock(candidate)
+        local poolAddress = chunkAddress and Core.NameScan.findLegacyBlockPointerList(chunkAddress)
+        legacyLayout = poolAddress and Core.NameScan.inspectLegacyNamePool(poolAddress) or nil
+      end
+    end
+
+    if legacyLayout then
+      Core.Runtime.log( ('Signature: GNames pattern %d resolved legacy pool 0x%X in %s'):format( patternIndex, legacyLayout.poolAddress, sourceModuleName ) )
+      return
+      {
+        address = legacyLayout.poolAddress,
+        patternIndex = patternIndex,
+        sourceModule = sourceModuleName,
+        scanMethod = 'legacy-module-signature',
+        legacy = true,
+        stringOffset = legacyLayout.stringOffset,
+      }
+    end
+
+    ::legacy_continue::
+  end
+
+  return nil
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--/// SIGNATURE SCANNING
@@ -5216,9 +5328,21 @@ function Core.Signatures.publishNamePoolCandidate(candidate)
   CUEDEFS.NamePoolSourceModule = candidate.sourceModule
   CUEDEFS.NamePoolScanMethod = candidate.scanMethod
   CUEDEFS.NamePoolData = candidate.address
+  CUEDEFS.NamePoolData_old = candidate.legacy == true or nil
+
+  if candidate.legacy then
+    CUEDEFS.FNameEntry = CUEDEFS.FNameEntry or {}
+    CUEDEFS.FNameEntry.String = candidate.stringOffset
+  end
 
   Core.Runtime.log( ('SIG: got GNames; pattern %d sig %s'):format( candidate.patternIndex, candidate.sourceModule or '<unknown>' ) )
-  Core.Runtime.log( ('SIG: chose FName header shift %d'):format( CUEDEFS.FNameHeaderShift or 6 ) )
+
+  if candidate.legacy then
+    Core.Runtime.log( ('SIG: chose legacy FNameEntry string offset 0x%X'):format(candidate.stringOffset) )
+  else
+    Core.Runtime.log( ('SIG: chose FName header shift %d'):format( CUEDEFS.FNameHeaderShift or 6 ) )
+  end
+
   return true
 end
 
