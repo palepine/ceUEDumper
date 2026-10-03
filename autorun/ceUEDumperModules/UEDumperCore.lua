@@ -475,7 +475,10 @@ function Core.Reflection.parsePropertyChainHead(classAddress, useAlternateProper
 end
 
 --- Read one reflected property name and metadata
--- Unresolved property name is skipped without an error
+-- unresolved names/non-property UField nodes are skipped without an error
+-- Legacy UStruct::Children can contain UFunction, UEnum and UProperty nodes in
+-- the same linked list. Only classes whose reflected name ends in Property
+-- have the UProperty/FProperty members decoded below.
 -- @param propertyAddress number @ reflected property node address
 -- @return string|nil @ property name
 -- @return table|nil @ offset, address, reflected type, and optional size
@@ -491,9 +494,6 @@ function Core.Reflection.readPropertyMetadata(propertyAddress)
   -- ignore nodes whose names cannot be decoded
   if not propertyName then return nil end
 
-  -- Offset_Internal is relative to the owning object/struct
-  local propertyOffset = readInteger( propertyAddress + layout.Offset )
-
   -- the property node's class describes its reflected property type
   -- such as IntProperty, FloatProperty or ObjectProperty
   local propertyClassAddress = readPointer( propertyAddress + layout.Class )
@@ -502,11 +502,23 @@ function Core.Reflection.readPropertyMetadata(propertyAddress)
   local propertyTypeNameIndex = readInteger( propertyClassAddress + CUEDEFS.FFieldClass.Name )
   if propertyTypeNameIndex == nil then return nil, nil, ('Property type name index unreadable: %s'):format(propertyName) end
 
+  local propertyType = namesByIndex[propertyTypeNameIndex]
+
+  -- UFunction/other UField subclasses share the legacy Children chain
+  -- but without UProperty::Offset_Internal
+  if type(propertyType) ~= 'string' or propertyType:sub(-8) ~= 'Property' then return nil end
+
+  -- Offset_Internal is relative to the owning object/struct
+  local propertyOffset = readInteger( propertyAddress + layout.Offset )
+  if type(propertyOffset) ~= 'number' then
+    return nil, nil, ('Property offset unreadable: %s'):format(propertyName)
+  end
+
   local propertyMetadata =
   {
     offset = propertyOffset, -- 0x...
     propertyAddress = propertyAddress, -- 0x...
-    propertyType = namesByIndex[ propertyTypeNameIndex ], -- e.g. IntProperty
+    propertyType = propertyType, -- e.g. IntProperty
   }
 
   -- some found layouts expose ElementSize, others don't
