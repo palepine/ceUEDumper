@@ -25,6 +25,7 @@
 | `ue_decompileClass(type, options)`                 | Decompile directly declared functions of a type        |
 | `ue_patchFunction(function, bytes, offset)`        | Apply a reversible Blueprint-bytecode patch             |
 | `ue_nopFunction(function, options)`                | Replace a void Blueprint body with an immediate return  |
+| `ue_patchFunctionOutputs(function, values)`        | Replace a Blueprint body with fixed output assignments  |
 | `ue_restoreFunctionPatch(patch, options)`          | Restore one bytecode patch                              |
 | `ue_restoreAllFunctionPatches(options)`            | Restore all active bytecode patches                     |
 | `ue_getFunctionPatches(function)`                  | List active reversible patches                          |
@@ -560,6 +561,28 @@ local patch, patchError = ue_nopFunction(functionAddress)
 assert(patch, patchError)
 
 assert( ue_restoreFunctionPatch(patch) ) -- reverting
+```
+
+#### `ue_patchFunctionOutputs(functionAddress, outputValues)`
+
+Replace BP function body with assignments to selected output parameters with a return followed.
+Keys in `outputValues` must match the UFunction parameter names.
+
+| Property | Lua value |
+|---|---|
+| `BoolProperty` | `true` or `false` |
+| `ByteProperty`, `UInt8Property` | Integer from `0` through `255` |
+| `IntProperty`, `Int32Property` | Signed 32-bit integer |
+| `Int64Property`, `UInt64Property` | Lua integer in the corresponding range |
+| `FloatProperty`, `DoubleProperty` | Lua number |
+| `ObjectProperty`, `ClassProperty`, `ClassPtrProperty` | Raw address; use `0` for null |
+
+```lua
+local functionAddress = assert( ue_findFunction( 'BP_ThirdPersonCharacter_C', 'CheckStuff' ) )
+
+local patch, patchError = ue_patchFunctionOutputs( functionAddress, { HaveBullets = true } )
+
+assert( ue_restoreFunctionPatch(patch) ) -- restoring
 ```
 
 #### ue_restoreFunctionPatch(patch, options )
