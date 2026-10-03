@@ -1308,6 +1308,138 @@ function Module.Patches.rangesOverlap(leftStart, leftSize, rightStart, rightSize
   return leftStart < rightStart + rightSize and rightStart < leftStart + leftSize
 end
 
+--- Append little-endian integer to a byte array
+-- @param bytes number[] @ destination byte array
+-- @param value number @ integer value
+-- @param byteCount number @ encoded width
+function Module.Patches.appendInteger(bytes, value, byteCount)
+  for _ = 1, byteCount do
+    bytes[ #bytes + 1 ] = value & 0xFF
+    value = value >> 8
+  end
+end
+
+--- Append Lua-packed scalar to a byte array
+-- @param bytes number[] @ destination byte array
+-- @param format string @ string.pack format
+-- @param value number @ scalar value
+-- @return boolean|nil @ true when packed
+-- @return string|nil @ packing error
+function Module.Patches.appendPacked(bytes, format, value)
+  if type(string.pack) ~= 'function' then return nil, 'This Lua build does not provide string.pack' end
+
+  local packed, packError
+  local packedSuccessfully
+
+  packedSuccessfully, packed = pcall( string.pack, format, value )
+  if not packedSuccessfully then packError = packed; packed = nil end
+  if not packed then return nil, tostring(packError) end
+
+  for byteIndex = 1, #packed do bytes[ #bytes + 1 ] = packed:byte(byteIndex) end
+  return true
+end
+
+--- Encode one assignment to a output parameter
+-- It writes through EX_LocalOutVariable
+-- @param bytes number[] @ destination byte array
+-- @param assignment table @ name, property and requested value
+-- @return boolean|nil @ true when encoded
+-- @return string|nil @ unsupported type/value error
+function Module.Patches.appendOutParameterAssignment(bytes, assignment)
+  local property = assignment.property
+  local propertyAddress = property and property.propertyAddress
+  local propertyType = property and property.propertyType
+  local value = assignment.value
+
+  if type(propertyAddress) ~= 'number' or propertyAddress == 0 then return nil, 'reflected property address is unavailable' end
+
+  local appendInteger = Module.Patches.appendInteger
+
+  if propertyType == 'BoolProperty' then
+    if type(value) ~= 'boolean' then return nil, 'BoolProperty output requires true or false' end
+
+    bytes[ #bytes + 1 ] = 0x14 -- EX_LetBool
+    bytes[ #bytes + 1 ] = 0x48 -- EX_LocalOutVariable
+    appendInteger( bytes, propertyAddress, PTR_SIZE )
+    bytes[ #bytes + 1 ] = value and 0x27 or 0x28 -- EX_True / EX_False
+    return true
+  end
+
+  if propertyType == 'ObjectProperty' or propertyType == 'ClassProperty' or propertyType == 'ClassPtrProperty' then
+    if type(value) ~= 'number' or value % 1 ~= 0 or value < 0 then return nil, propertyType .. ' output requires a raw address or zero' end
+
+    bytes[ #bytes + 1 ] = 0x5F -- EX_LetObj
+    bytes[ #bytes + 1 ] = 0x48 -- EX_LocalOutVariable
+    appendInteger( bytes, propertyAddress, PTR_SIZE )
+
+    if value == 0 then
+      bytes[ #bytes + 1 ] = 0x2A -- EX_NoObject
+    else
+      bytes[ #bytes + 1 ] = 0x20 -- EX_ObjectConst
+      appendInteger( bytes, value, PTR_SIZE )
+    end
+
+    return true
+  end
+
+  if type(value) ~= 'number' then return nil, tostring(propertyType) .. ' output requires a number' end
+
+  bytes[ #bytes + 1 ] = 0x0F -- EX_Let
+  appendInteger( bytes, propertyAddress, PTR_SIZE ) -- assignment FProperty*
+  bytes[ #bytes + 1 ] = 0x48 -- EX_LocalOutVariable
+  appendInteger( bytes, propertyAddress, PTR_SIZE )
+
+  if propertyType == 'ByteProperty' or propertyType == 'UInt8Property' then
+    if value % 1 ~= 0 or value < 0 or value > 0xFF then return nil, propertyType .. ' output must be an integer in the 0..255 range' end
+    bytes[ #bytes + 1 ] = 0x24 -- EX_ByteConst
+    appendInteger( bytes, value, 1 )
+    return true
+  elseif propertyType == 'IntProperty' or propertyType == 'Int32Property' then
+    if value % 1 ~= 0 or value < -0x80000000 or value > 0x7FFFFFFF then return nil, propertyType .. ' output exceeds int32 range' end
+    bytes[ #bytes + 1 ] = 0x1D -- EX_IntConst
+    appendInteger( bytes, value, 4 )
+    return true
+  elseif propertyType == 'Int64Property' then
+    if value % 1 ~= 0 then return nil, 'Int64Property output requires an integer' end
+    bytes[ #bytes + 1 ] = 0x35 -- EX_Int64Const
+    appendInteger( bytes, value, 8 )
+    return true
+  elseif propertyType == 'UInt64Property' then
+    if value % 1 ~= 0 or value < 0 then return nil, 'UInt64Property output requires a non-negative integer' end
+    bytes[ #bytes + 1 ] = 0x36 -- EX_UInt64Const
+    appendInteger( bytes, value, 8 )
+    return true
+  elseif propertyType == 'FloatProperty' then
+    bytes[ #bytes + 1 ] = 0x1E -- EX_FloatConst
+    return Module.Patches.appendPacked( bytes, '<f', value )
+  elseif propertyType == 'DoubleProperty' then
+    bytes[ #bytes + 1 ] = 0x37 -- EX_DoubleConst
+    return Module.Patches.appendPacked( bytes, '<d', value )
+  end
+
+  return nil, 'unsupported output type ' .. tostring(propertyType)
+end
+
+--- Build BP function stub assigning outputs and returning
+-- @param assignments table[] @ ordered reflected output assignments
+-- @return number[]|nil @ complete replacement bytecode
+-- @return string|nil @ encoding error
+function Module.Patches.buildOutParameterStub(assignments)
+  if type(assignments) ~= 'table' or #assignments == 0 then return nil, 'At least one output assignment is required' end
+
+  local bytes = {}
+
+  for _, assignment in ipairs(assignments) do
+    local encoded, encodingError = Module.Patches.appendOutParameterAssignment( bytes, assignment )
+    if not encoded then return nil, ('%s: %s'):format( tostring(assignment.name), tostring(encodingError) ) end
+  end
+
+  bytes[ #bytes + 1 ] = 0x04 -- EX_Return
+  bytes[ #bytes + 1 ] = 0x0B -- EX_Nothing
+  bytes[ #bytes + 1 ] = 0x53 -- EX_EndOfScript
+  return bytes
+end
+
 --- Apply reversible patch inside validated UFunction Script array
 -- returned handle has original bytes
 -- @param functionMetadata table @ validated UFunction metadata

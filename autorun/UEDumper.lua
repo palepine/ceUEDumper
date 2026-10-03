@@ -3139,6 +3139,64 @@ function Dumper.Patching.ue_nopFunction(functionAddress, options)
   return Dumper.Patching.ue_patchFunction( functionAddress, Bytecode.Patches.VOID_RETURN, 0 )
 end
 
+--- Replace BP function body with fixed output assignments and return
+-- @param functionAddress number @ UFunction descriptor address
+-- @param outputValues table<string, boolean|number> @ desired output values
+-- @return table|nil @ reversible patch handle
+-- @return string|nil @ validation or patching error
+function Dumper.Patching.ue_patchFunctionOutputs(functionAddress, outputValues)
+  assert( type(functionAddress) == 'number' and functionAddress ~= 0, 'function address must be non-zero' )
+  if type(outputValues) ~= 'table' then return nil, 'Output values must be a table keyed by reflected parameter name' end
+
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+  if not metadata then return nil, metadataError end
+  if metadata.native then return nil, 'Native UFunction thunks cannot be replaced with Blueprint output bytecode' end
+  if type(metadata.bytecode) ~= 'number' or metadata.bytecode == 0 or not metadata.bytecodeSize or metadata.bytecodeSize <= 0 then
+    return nil, 'UFunction has no validated Blueprint bytecode'
+  end
+
+  local assignments = {}
+
+  for parameterName, value in pairs(outputValues) do
+    if type(parameterName) ~= 'string' then return nil, 'Every output key must be a reflected parameter name string' end
+
+    local property = metadata.parameters and metadata.parameters[parameterName]
+    if not property then return nil, ('Output parameter %s was not found; names are case-sensitive'):format(parameterName) end
+    if not property.isParameter then return nil, parameterName .. ' is not a UFunction parameter' end
+    if property.isReturnParameter then return nil, parameterName .. ' is a return parameter; return-value stubs are not supported yet' end
+    if not property.isOutParameter then return nil, parameterName .. ' is not marked as an output parameter' end
+    if property.isConstParameter then return nil, parameterName .. ' is const and cannot be assigned' end
+
+    assignments[ #assignments + 1 ] =
+    {
+      name = parameterName,
+      property = property,
+      value = value,
+    }
+  end
+
+  table.sort( assignments,
+    function(left, right)
+      local leftOffset = left.property.offset or math.maxinteger
+      local rightOffset = right.property.offset or math.maxinteger
+      if leftOffset ~= rightOffset then return leftOffset < rightOffset end
+      return left.name < right.name
+    end
+  )
+
+  local patchBytes, buildError = Bytecode.Patches.buildOutParameterStub(assignments)
+  if not patchBytes then return nil, buildError end
+
+  local patch, patchError = Dumper.Patching.ue_patchFunction( functionAddress, patchBytes, 0 )
+  if not patch then return nil, patchError end
+
+  patch.kind = 'fixed-output-stub'
+  patch.outputParameters = {}
+  for _, assignment in ipairs(assignments) do patch.outputParameters[ #patch.outputParameters + 1 ] = assignment.name end
+
+  return patch
+end
+
 --- Restore one reversible function patch
 -- @param patch table @ handle returned by ue_patchFunction/ue_nopFunction
 -- @param options table|nil @ { force=true } overwrites externally changed bytes
@@ -4085,6 +4143,7 @@ Dumper.API =
   ue_decompileClass = Dumper.Decompiler.ue_decompileClass,
   ue_patchFunction = Dumper.Patching.ue_patchFunction,
   ue_nopFunction = Dumper.Patching.ue_nopFunction,
+  ue_patchFunctionOutputs = Dumper.Patching.ue_patchFunctionOutputs,
   ue_restoreFunctionPatch = Dumper.Patching.ue_restoreFunctionPatch,
   ue_restoreAllFunctionPatches = Dumper.Patching.ue_restoreAllFunctionPatches,
   ue_getFunctionPatches = Dumper.Patching.ue_getFunctionPatches,
