@@ -1852,6 +1852,23 @@ function Dumper.Structures.alignOffset(value, alignment)
   return ( value + alignment - 1 ) & ~( alignment - 1 )
 end
 
+Dumper.Structures.propertyAlignments =
+{
+  BoolProperty = 1,
+  ByteProperty = 1,
+  Int8Property = 1,
+  UInt8Property = 1,
+  Int16Property = 2,
+  UInt16Property = 2,
+  IntProperty = 4,
+  Int32Property = 4,
+  UInt32Property = 4,
+  FloatProperty = 4,
+  NameProperty = 4,
+  WeakObjectProperty = 4,
+  DelegateProperty = 4,
+}
+
 --- Resolve minimum alignment required by one reflected property value
 -- @param property table @ decoded property metadata
 -- @return number @ alignment used by FScriptSetLayout/FScriptMapLayout
@@ -1872,21 +1889,8 @@ function Dumper.Structures.propertyAlignment(property)
   end
 
   local propertyType = property.propertyType
-
-  if propertyType == 'BoolProperty' or propertyType == 'ByteProperty' or propertyType == 'Int8Property' or propertyType == 'UInt8Property' then return 1 end
-  
-  if propertyType == 'Int16Property' or propertyType == 'UInt16Property' then return 2 end
-  
-  if propertyType == 'IntProperty'
-     or propertyType == 'Int32Property'
-     or propertyType == 'UInt32Property'
-     or propertyType == 'FloatProperty'
-     or propertyType == 'NameProperty'
-     or propertyType == 'WeakObjectProperty'
-     or propertyType == 'DelegateProperty'
-  then
-    return 4
-  end
+  local knownAlignment = Dumper.Structures.propertyAlignments[propertyType]
+  if knownAlignment then return knownAlignment end
 
   local size = property.size or PTR_SIZE
   if size >= 8 then return 8 end
@@ -2197,6 +2201,103 @@ function Dumper.Structures.addSparseContainerProperty(structure, fieldName, prop
   end
 end
 
+--- Render FString using its inline TArray-compatible header
+-- @param structure userdata|table @ destination CE structure
+-- @param fieldName string @ displayed field name
+-- @param property table @ reflected property metadata
+-- @param elementOffset number @ final field offset
+function Dumper.Structures.renderFStringProperty(structure, fieldName, property, elementOffset)
+  Dumper.Structures.addFStringProperty( structure, fieldName, elementOffset )
+end
+
+--- Render inline FText shared-data pointer
+-- @param structure userdata|table @ destination CE structure
+-- @param fieldName string @ displayed field name
+-- @param property table @ reflected property metadata
+-- @param elementOffset number @ final field offset
+-- @param baseAddress number|nil @ live containing-object address
+function Dumper.Structures.renderFTextProperty(structure, fieldName, property, elementOffset, baseAddress)
+  local dataElement = structure.addElement()
+  dataElement.Name = fieldName .. '.TextData.Object'
+  dataElement.Offset = elementOffset
+  dataElement.Vartype = vtPointer
+  dataElement.OnCreateChild = function(_, textDataAddress)
+    local childStructure = Dumper.Structures.createFTextDataStructure(textDataAddress)
+    if childStructure then return childStructure end
+    return nil, true
+  end
+
+  if baseAddress then
+    local textDataAddress = readPointer( baseAddress + elementOffset )
+    dataElement.ChildStruct = Dumper.Structures.createFTextDataStructure(textDataAddress)
+  end
+
+  -- local referenceElement = structure.addElement()
+  -- referenceElement.Name = fieldName .. '.TextData.SharedReferenceCount.ReferenceController'
+  -- referenceElement.Offset = elementOffset + 8
+  -- referenceElement.Vartype = vtPointer
+
+  -- local flagsElement = structure.addElement()
+  -- flagsElement.Name = fieldName .. '.Flags'
+  -- flagsElement.Offset = elementOffset + 0x10
+  -- flagsElement.Vartype = vtDword
+end
+
+--- Render TArray header and its live pointed-to values
+-- @param structure userdata|table @ destination CE structure
+-- @param fieldName string @ displayed field name
+-- @param property table @ reflected ArrayProperty metadata
+-- @param elementOffset number @ final field offset
+-- @param baseAddress number|nil @ live containing-object address
+function Dumper.Structures.renderArrayProperty(structure, fieldName, property, elementOffset, baseAddress)
+  local dataElement = structure.addElement()
+  dataElement.Name = fieldName --  .. ' [AllocatorInstance]'
+  dataElement.Offset = elementOffset
+  dataElement.Vartype = vtPointer
+
+  local countElement = structure.addElement()
+  countElement.Name = fieldName .. ' [ArrayNum]'
+  countElement.Offset = elementOffset + 8
+  countElement.Vartype = vtDword
+
+  -- hide ArrayMax
+  -- local capacityElement = structure.addElement()
+  -- capacityElement.Name = fieldName .. ' [ArrayMax]'
+  -- capacityElement.Offset = elementOffset + 0xC
+  -- capacityElement.Vartype = vtDword
+
+  if not baseAddress then return end
+
+  local childStructure, arrayError = Dumper.Structures.createArrayDataStructure(property, baseAddress + elementOffset)
+
+  if childStructure then
+    dataElement.ChildStruct = childStructure
+  elseif arrayError then
+    dataElement.Name = dataElement.Name .. ' [unresolved: ' .. arrayError .. ']'
+  end
+end
+
+--- Adapt multicast delegate renderer to property-handler signature
+function Dumper.Structures.renderMulticastDelegateProperty(structure, fieldName, property, elementOffset, baseAddress)
+  Dumper.Structures.addMulticastInlineDelegateProperty( structure, fieldName, elementOffset, baseAddress )
+end
+
+--- Adapt sparse-container renderer to property-handler signature
+function Dumper.Structures.renderSparseContainerProperty(structure, fieldName, property, elementOffset, baseAddress)
+  Dumper.Structures.addSparseContainerProperty( structure, fieldName, property, elementOffset, baseAddress )
+end
+
+Dumper.Structures.propertyRenderers =
+{
+  MulticastInlineDelegateProperty = Dumper.Structures.renderMulticastDelegateProperty,
+  MulticastDelegateProperty = Dumper.Structures.renderMulticastDelegateProperty,
+  StrProperty = Dumper.Structures.renderFStringProperty,
+  TextProperty = Dumper.Structures.renderFTextProperty,
+  ArrayProperty = Dumper.Structures.renderArrayProperty,
+  SetProperty = Dumper.Structures.renderSparseContainerProperty,
+  MapProperty = Dumper.Structures.renderSparseContainerProperty,
+}
+
 --- Add reflected field, expanding supported container headers and elements
 -- @param structure userdata|table @ destination CE structure
 -- @param fieldName string @ displayed field name
@@ -2204,81 +2305,10 @@ end
 -- @param additionalOffset number @ containing array-element offset
 -- @param baseAddress number|nil @ live base for container expansion
 function Dumper.Structures.addRenderedProperty(structure, fieldName, property, additionalOffset, baseAddress)
-  local elementOffset = additionalOffset + property.offset  -- TODO: extract to handlers
+  local elementOffset = additionalOffset + property.offset
+  local renderer = Dumper.Structures.propertyRenderers[property.propertyType]
 
-  if property.propertyType == 'MulticastInlineDelegateProperty' or property.propertyType == 'MulticastDelegateProperty'
-  then
-    Dumper.Structures.addMulticastInlineDelegateProperty( structure, fieldName, elementOffset, baseAddress )
-    return
-  end
-
-  if property.propertyType == 'StrProperty' then
-    Dumper.Structures.addFStringProperty( structure, fieldName, elementOffset )
-    return
-  end
-
-  if property.propertyType == 'TextProperty' then
-    local dataElement = structure.addElement()
-    dataElement.Name = fieldName .. '.TextData.Object'
-    dataElement.Offset = elementOffset
-    dataElement.Vartype = vtPointer
-    dataElement.OnCreateChild = function(_, textDataAddress)
-      local childStructure = Dumper.Structures.createFTextDataStructure(textDataAddress)
-      if childStructure then return childStructure end
-      return nil, true
-    end
-
-    if baseAddress then
-      local textDataAddress = readPointer( baseAddress + elementOffset )
-      dataElement.ChildStruct = Dumper.Structures.createFTextDataStructure(textDataAddress)
-    end
-
-    -- local referenceElement = structure.addElement()
-    -- referenceElement.Name = fieldName .. '.TextData.SharedReferenceCount.ReferenceController'
-    -- referenceElement.Offset = elementOffset + 8
-    -- referenceElement.Vartype = vtPointer
-
-    -- local flagsElement = structure.addElement()
-    -- flagsElement.Name = fieldName .. '.Flags'
-    -- flagsElement.Offset = elementOffset + 0x10
-    -- flagsElement.Vartype = vtDword
-    return
-  end
-  
-  if property.propertyType == 'ArrayProperty' then
-    local dataElement = structure.addElement()
-    dataElement.Name = fieldName --  .. ' [AllocatorInstance]'
-    dataElement.Offset = elementOffset
-    dataElement.Vartype = vtPointer
-
-    local countElement = structure.addElement()
-    countElement.Name = fieldName .. ' [ArrayNum]'
-    countElement.Offset = elementOffset + 8
-    countElement.Vartype = vtDword
-
-    -- hide ArrayMax
-    -- local capacityElement = structure.addElement()
-    -- capacityElement.Name = fieldName .. ' [ArrayMax]'
-    -- capacityElement.Offset = elementOffset + 0xC
-    -- capacityElement.Vartype = vtDword
-
-    if baseAddress then
-      local childStructure, arrayError = Dumper.Structures.createArrayDataStructure(property, baseAddress + elementOffset)
-
-      if childStructure then
-        dataElement.ChildStruct = childStructure
-      elseif arrayError then
-        dataElement.Name = dataElement.Name .. ' [unresolved: ' .. arrayError .. ']'
-      end
-    end
-
-    return
-  end
-
-  if property.propertyType == 'SetProperty' or property.propertyType == 'MapProperty' then
-    Dumper.Structures.addSparseContainerProperty( structure, fieldName, property, elementOffset, baseAddress )
-    return
-  end
+  if renderer then return renderer( structure, fieldName, property, elementOffset, baseAddress ) end
 
   local element = structure.addElement()
   element.Name = property.expansionError and fieldName .. ' [unresolved struct]' or fieldName
@@ -2510,6 +2540,44 @@ sharedResources.options.structureDissectEnabled = false
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--/// REFLECTION METADATA VIEWS
 
+Dumper.MetadataViews.elementRoleHandlers =
+{
+  name = function(element)
+    if not Backend.hasCustomType('FName') then return end
+    element.Vartype = vtCustom
+    element.CustomTypeName = 'FName'
+  end,
+
+  class = function(element, context)
+    element.ChildStruct = context.classStructure or Dumper.MetadataViews.getClassMetadataStructure()
+  end,
+
+  property = function(element, context)
+    if context.reflectionMetadataOnly and not Backend.showsReflectionMetadata() then return end
+    element.ChildStruct = context.propertyStructure or Dumper.MetadataViews.getPropertyMetadataStructure()
+  end,
+
+  field = function(element, context)
+    if context.reflectionMetadataOnly and not Backend.showsReflectionMetadata() then return end
+    element.OnCreateChild = function(_, address) return Dumper.MetadataViews.getFieldMetadataStructure(address) end
+  end,
+
+  script = function(element, context)
+    local metadata = context.functionMetadata
+    if not metadata or not metadata.bytecodeSize or metadata.bytecodeSize <= 0 then return end
+    element.OnCreateChild = function() return Dumper.Bytecode.createStructure(metadata) end
+  end,
+}
+
+--- Configure one metadata element according to its declarative field role
+-- @param element userdata @ CE structure element
+-- @param role string|nil @ name/class/property/field/script
+-- @param context table @ view-specific targets and visibility rules
+function Dumper.MetadataViews.configureElementRole(element, role, context)
+  local handler = Dumper.MetadataViews.elementRoleHandlers[role]
+  if handler then handler( element, context or {} ) end
+end
+
 --- Build structural metadata layout shared by UClass objects
 -- Unlike an ordinary UObject instance, a UClass must expose its UStruct
 -- links rather than the reflected gameplay fields described by that class
@@ -2531,8 +2599,14 @@ function Dumper.MetadataViews.getClassMetadataStructure()
     { 'Outer', layout.Outer, vtPointer },
     { 'SuperStruct', layout.SuperStruct, vtPointer, 'class' },
     { 'Children [UField/UFunction]', layout.Children, vtPointer, 'field' },
-    { 'PropertyLink', layout.PropertyLink, vtPointer },
-    { 'PropertyLink (alternate)', layout.PropertyLinkAlt, vtPointer },
+    { 'PropertyLink', layout.PropertyLink, vtPointer, 'property' },
+    { 'PropertyLink (alternate)', layout.PropertyLinkAlt, vtPointer, 'property' },
+  }
+
+  local roleContext =
+  {
+    classStructure = structure,
+    reflectionMetadataOnly = true,
   }
 
   for _, field in ipairs(fields) do
@@ -2540,25 +2614,7 @@ function Dumper.MetadataViews.getClassMetadataStructure()
 
     local element = structure.addElement()
     element.Name, element.Offset, element.Vartype = field[1], field[2], field[3]
-
-    if field[4] == 'class' then
-      element.ChildStruct = structure
-
-    elseif field[4] == 'field' and Backend.showsReflectionMetadata() then
-      element.OnCreateChild = function(_, address)
-        return Dumper.MetadataViews.getFieldMetadataStructure(address)
-      end
-
-    elseif field[4] == 'name' and Backend.hasCustomType('FName') then
-      element.Vartype = vtCustom
-      element.CustomTypeName = 'FName'
-
-    elseif Backend.showsReflectionMetadata()
-
-      and (field[1] == 'PropertyLink' or field[1] == 'PropertyLink (alt)')
-    then
-      element.ChildStruct = Dumper.MetadataViews.getPropertyMetadataStructure()
-    end
+    Dumper.MetadataViews.configureElementRole( element, field[4], roleContext )
 
     ::continue::
   end
@@ -2568,20 +2624,34 @@ end
 
 local FUNCTION_FLAGS =
 {
-  { 0x00000001, 'Final' }, { 0x00000002, 'RequiredAPI' },
-  { 0x00000004, 'BlueprintAuthorityOnly' }, { 0x00000008, 'BlueprintCosmetic' },
-  { 0x00000040, 'Net' }, { 0x00000080, 'NetReliable' },
-  { 0x00000100, 'NetRequest' }, { 0x00000200, 'Exec' },
-  { 0x00000400, 'Native' }, { 0x00000800, 'Event' },
-  { 0x00001000, 'NetResponse' }, { 0x00002000, 'Static' },
-  { 0x00004000, 'NetMulticast' }, { 0x00010000, 'MulticastDelegate' },
-  { 0x00020000, 'Public' }, { 0x00040000, 'Private' },
-  { 0x00080000, 'Protected' }, { 0x00100000, 'Delegate' },
-  { 0x00200000, 'NetServer' }, { 0x00400000, 'HasOutParms' },
-  { 0x00800000, 'HasDefaults' }, { 0x01000000, 'NetClient' },
-  { 0x02000000, 'DLLImport' }, { 0x04000000, 'BlueprintCallable' },
-  { 0x08000000, 'BlueprintEvent' }, { 0x10000000, 'BlueprintPure' },
-  { 0x20000000, 'EditorOnly' }, { 0x40000000, 'Const' },
+  { 0x00000001, 'Final' },
+  { 0x00000002, 'RequiredAPI' },
+  { 0x00000004, 'BlueprintAuthorityOnly' },
+  { 0x00000008, 'BlueprintCosmetic' },
+  { 0x00000040, 'Net' },
+  { 0x00000080, 'NetReliable' },
+  { 0x00000100, 'NetRequest' },
+  { 0x00000200, 'Exec' },
+  { 0x00000400, 'Native' },
+  { 0x00000800, 'Event' },
+  { 0x00001000, 'NetResponse' },
+  { 0x00002000, 'Static' },
+  { 0x00004000, 'NetMulticast' },
+  { 0x00010000, 'MulticastDelegate' },
+  { 0x00020000, 'Public' },
+  { 0x00040000, 'Private' },
+  { 0x00080000, 'Protected' },
+  { 0x00100000, 'Delegate' },
+  { 0x00200000, 'NetServer' },
+  { 0x00400000, 'HasOutParms' },
+  { 0x00800000, 'HasDefaults' },
+  { 0x01000000, 'NetClient' },
+  { 0x02000000, 'DLLImport' },
+  { 0x04000000, 'BlueprintCallable' },
+  { 0x08000000, 'BlueprintEvent' },
+  { 0x10000000, 'BlueprintPure' },
+  { 0x20000000, 'EditorOnly' },
+  { 0x40000000, 'Const' },
   { 0x80000000, 'NetValidate' },
 }
 
@@ -2640,23 +2710,15 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
     { 'Func [' .. implementation .. ']', metadata.functionPointerOffset, vtPointer },
   }
 
+  local roleContext = { functionMetadata = metadata }
+
   for _, field in ipairs(fields) do
 
     if type(field[2]) ~= 'number' then goto continue end
 
     local element = structure.addElement()
     element.Name, element.Offset, element.Vartype = field[1], field[2], field[3]
-
-    if field[4] == 'class' then element.ChildStruct = Dumper.MetadataViews.getClassMetadataStructure()
-    elseif field[4] == 'name' and Backend.hasCustomType('FName') then element.Vartype, element.CustomTypeName = vtCustom, 'FName'
-    elseif field[4] == 'property' then element.ChildStruct = Dumper.MetadataViews.getPropertyMetadataStructure()
-    elseif field[4] == 'field' then element.OnCreateChild = function(_, address) return Dumper.MetadataViews.getFieldMetadataStructure(address) end
-    elseif field[4] == 'script' and metadata.bytecodeSize and metadata.bytecodeSize > 0 then
-      element.OnCreateChild = function()
-        local childStructure = Dumper.Bytecode.createStructure(metadata)
-        return childStructure
-      end
-    end
+    Dumper.MetadataViews.configureElementRole( element, field[4], roleContext )
 
     ::continue::
   end
@@ -2679,8 +2741,8 @@ function Dumper.MetadataViews.getFieldMetadataStructure(fieldAddress)
   local fields =
   {
     { 'vftable', 0, vtPointer }, { 'Class', layout.Class, vtPointer },
-    { 'Name', layout.Name, vtQword }, { 'Outer', layout.Outer, vtPointer },
-    { 'Next', layout.Name and layout.Name + PTR_SIZE * 2, vtPointer },
+    { 'Name', layout.Name, vtQword, 'name' }, { 'Outer', layout.Outer, vtPointer },
+    { 'Next', layout.Name and layout.Name + PTR_SIZE * 2, vtPointer, 'field' },
   }
 
   for _, field in ipairs(fields) do
@@ -2688,14 +2750,7 @@ function Dumper.MetadataViews.getFieldMetadataStructure(fieldAddress)
     if type( field[2] ) == 'number' then
       local element = structure.addElement()
       element.Name, element.Offset, element.Vartype = field[1], field[2], field[3]
-
-      if field[1] == 'Name' and Backend.hasCustomType('FName') then
-
-        element.Vartype, element.CustomTypeName = vtCustom, 'FName'
-      elseif field[1] == 'Next' then
-
-        element.OnCreateChild = function(_, address) return Dumper.MetadataViews.getFieldMetadataStructure(address) end
-      end
+      Dumper.MetadataViews.configureElementRole( element, field[4], {} )
 
     end
 
@@ -2728,19 +2783,14 @@ function Dumper.MetadataViews.getPropertyMetadataStructure()
     { 'Type-specific metadata', layout.BitMaskField or layout.ObjectClassType, vtPointer },
   }
 
+  local roleContext = { propertyStructure = structure }
+
   for _, field in ipairs(fields) do
     if type(field[2]) ~= 'number' then goto continue end
 
     local element = structure.addElement()
     element.Name, element.Offset, element.Vartype = field[1], field[2], field[3]
-
-    if field[4] == 'property' then
-      element.ChildStruct = structure
-      
-    elseif field[4] == 'name' and Backend.hasCustomType('FName') then
-      element.Vartype = vtCustom
-      element.CustomTypeName = 'FName'
-    end
+    Dumper.MetadataViews.configureElementRole( element, field[4], roleContext )
 
     ::continue::
   end
@@ -3319,7 +3369,200 @@ Dumper.Invocation.pointerTypes =
   ClassPtrProperty = true,
 }
 
---- Return reflected function parameters ordered by buffer offset
+Dumper.Invocation.valueWriters = {}
+Dumper.Invocation.valueReaders = {}
+
+--- Register parameter-buffer read/write handlers for reflected property types
+-- @param propertyTypes string[] @ reflected property class names
+-- @param writer function|nil @ buffer writer
+-- @param reader function|nil @ buffer reader
+function Dumper.Invocation.registerValueHandlers(propertyTypes, writer, reader)
+  for _, propertyType in ipairs(propertyTypes) do
+    if writer then Dumper.Invocation.valueWriters[propertyType] = writer end
+    if reader then Dumper.Invocation.valueReaders[propertyType] = reader end
+  end
+end
+
+Dumper.Invocation.registerValueHandlers(
+  { 'BoolProperty' },
+  function(valueAddress, property, value)
+    writeBytes( valueAddress, value and (property.byteMask or 1) or 0 )
+    return true
+  end,
+  function(valueAddress, property)
+    local byteValue = readBytes( valueAddress, 1, false ) or 0
+    return byteValue & (property.byteMask or 1) ~= 0
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'ByteProperty', 'UInt8Property' },
+  function(valueAddress, property, value)
+    if type(value) ~= 'number' then return nil, property.propertyType .. ' requires a number' end
+    writeBytes( valueAddress, value & 0xFF )
+    return true
+  end,
+  function(valueAddress)
+    return readBytes( valueAddress, 1, false )
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'Int8Property' },
+  Dumper.Invocation.valueWriters.ByteProperty,
+  function(valueAddress)
+    local result = readBytes( valueAddress, 1, false )
+    return result and (result >= 0x80 and result - 0x100 or result) or nil
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'Int16Property', 'UInt16Property' },
+  function(valueAddress, property, value)
+    if type(value) ~= 'number' then return nil, property.propertyType .. ' requires a number' end
+    writeSmallInteger(valueAddress, value)
+    return true
+  end,
+  function(valueAddress)
+    return readSmallInteger(valueAddress)
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'IntProperty', 'Int32Property', 'EnumProperty' },
+  function(valueAddress, property, value)
+    if type(value) ~= 'number' then return nil, property.propertyType .. ' requires a number' end
+    writeInteger(valueAddress, value)
+    return true
+  end,
+  function(valueAddress)
+    return readInteger(valueAddress)
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'UInt32Property' },
+  Dumper.Invocation.valueWriters.IntProperty,
+  function(valueAddress)
+    local result = readInteger(valueAddress)
+    return result and (result & 0xFFFFFFFF) or nil
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'Int64Property', 'UInt64Property' },
+  function(valueAddress, property, value)
+    if type(value) ~= 'number' then return nil, property.propertyType .. ' requires a number' end
+    writeQword(valueAddress, value)
+    return true
+  end,
+  function(valueAddress)
+    return readQword(valueAddress)
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'FloatProperty' },
+  function(valueAddress, property, value)
+    if type(value) ~= 'number' then return nil, 'FloatProperty requires a number' end
+    writeFloat(valueAddress, value)
+    return true
+  end,
+  function(valueAddress)
+    return readFloat(valueAddress)
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'DoubleProperty' },
+  function(valueAddress, property, value)
+    if type(value) ~= 'number' then return nil, 'DoubleProperty requires a number' end
+    writeDouble(valueAddress, value)
+    return true
+  end,
+  function(valueAddress)
+    return readDouble(valueAddress)
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'ObjectProperty', 'ClassProperty', 'ClassPtrProperty' },
+  function(valueAddress, property, value)
+    if value ~= nil and type(value) ~= 'number' then return nil, property.propertyType .. ' requires an address or nil' end
+    writePointer(valueAddress, value or 0)
+    return true
+  end,
+  function(valueAddress)
+    return readPointer(valueAddress)
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'NameProperty' },
+  function(valueAddress, property, value)
+    local comparisonIndex
+    local number = 0
+
+    if type(value) == 'string' then
+      comparisonIndex = Backend.nameIndex(value)
+      if comparisonIndex == nil then return nil, 'FName is absent from the cached name pool: ' .. value end
+    elseif type(value) == 'number' then
+      comparisonIndex = value
+    elseif type(value) == 'table' then
+      comparisonIndex = value.comparisonIndex or value.index
+      number = value.number or 0
+    end
+
+    if type(comparisonIndex) ~= 'number' then return nil, 'NameProperty requires a string, index, or FName table' end
+
+    writeInteger(valueAddress, comparisonIndex)
+    writeInteger(valueAddress + 4, number)
+    return true
+  end,
+  function(valueAddress)
+    return
+    {
+      comparisonIndex = readInteger(valueAddress),
+      number = readInteger(valueAddress + 4),
+    }
+  end
+)
+
+Dumper.Invocation.registerValueHandlers(
+  { 'StructProperty' },
+  function(valueAddress, property, value)
+    if type(value) ~= 'table' then return nil, 'StructProperty requires a table' end
+
+    local fields, fieldsError = Backend.properties(property.structAddress)
+    if not fields then return nil, fieldsError end
+
+    for requestedName, fieldValue in pairs(value) do
+      local field, lookupError = Dumper.Helpers.resolveProperty(fields, requestedName)
+      if not field then return nil, lookupError end
+
+      local written, writeError = Dumper.Invocation.writePropertyValue( valueAddress + field.offset, field, fieldValue )
+      if not written then return nil, requestedName .. ': ' .. writeError end
+    end
+
+    return true
+  end,
+  function(valueAddress, property)
+    local fields, fieldsError = Backend.properties(property.structAddress)
+    if not fields then return nil, fieldsError end
+
+    local result = {}
+
+    for fieldName, field in pairs(fields) do
+      local fieldValue, readError = Dumper.Invocation.readPropertyValue( valueAddress + field.offset, field )
+      if readError then return nil, fieldName .. ': ' .. readError end
+      result[fieldName] = fieldValue
+    end
+
+    return result
+  end
+)
+
+--- Return function parameters ordered by buffer offset
 -- @param functionMetadata table @ decoded UFunction metadata
 -- @return table[] @ entries containing name and property
 function Dumper.Invocation.orderedParameters(functionMetadata)
@@ -3332,9 +3575,13 @@ function Dumper.Invocation.orderedParameters(functionMetadata)
     end
 
   end
-  
+
   -- sort by offset order
-  table.sort( ordered, function(left, right) return left.property.offset < right.property.offset end )
+  table.sort( ordered,
+    function(left, right)
+      return left.property.offset < right.property.offset
+    end
+  )
   return ordered
 end
 
@@ -3347,9 +3594,9 @@ function Dumper.Invocation.validatePropertyType(property, visitedStructs)
   local propertyType = property.propertyType
 
   if Dumper.Invocation.scalarSizes[propertyType]
-      or Dumper.Invocation.pointerTypes[propertyType]
-      or propertyType == 'BoolProperty'
-      or propertyType == 'NameProperty'
+     or Dumper.Invocation.pointerTypes[propertyType]
+     or propertyType == 'BoolProperty'
+     or propertyType == 'NameProperty'
   then
     return true
   end
@@ -3392,97 +3639,9 @@ end
 -- @return boolean|nil @ true on success
 -- @return string|nil @ conversion error
 function Dumper.Invocation.writePropertyValue(valueAddress, property, value)
-  local propertyType = property.propertyType
-
-  if propertyType == 'BoolProperty' then
-    local byteMask = property.byteMask or 1
-    writeBytes( valueAddress, value and byteMask or 0 )
-    return true
-  end
-
-  if propertyType == 'ByteProperty' or propertyType == 'Int8Property' or propertyType == 'UInt8Property' then
-    if type(value) ~= 'number' then return nil, propertyType .. ' requires a number' end
-    writeBytes( valueAddress, value & 0xFF )
-    return true
-  end
-
-  if propertyType == 'Int16Property' or propertyType == 'UInt16Property' then
-    if type(value) ~= 'number' then return nil, propertyType .. ' requires a number' end
-    writeSmallInteger(valueAddress, value)
-    return true
-  end
-
-  if propertyType == 'IntProperty' or propertyType == 'Int32Property'
-    or propertyType == 'UInt32Property' or propertyType == 'EnumProperty'
-  then
-    if type(value) ~= 'number' then return nil, propertyType .. ' requires a number' end
-    writeInteger(valueAddress, value)
-    return true
-  end
-
-  if propertyType == 'Int64Property' or propertyType == 'UInt64Property' then
-    if type(value) ~= 'number' then return nil, propertyType .. ' requires a number' end
-    writeQword(valueAddress, value)
-    return true
-  end
-
-  if propertyType == 'FloatProperty' then
-    if type(value) ~= 'number' then return nil, 'FloatProperty requires a number' end
-    writeFloat(valueAddress, value)
-    return true
-  end
-
-  if propertyType == 'DoubleProperty' then
-    if type(value) ~= 'number' then return nil, 'DoubleProperty requires a number' end
-    writeDouble(valueAddress, value)
-    return true
-  end
-
-  if Dumper.Invocation.pointerTypes[ propertyType ] then
-    if value ~= nil and type(value) ~= 'number' then return nil, propertyType .. ' requires an address or nil' end
-    writePointer(valueAddress, value or 0)
-    return true
-  end
-
-  if propertyType == 'NameProperty' then
-    local comparisonIndex
-    local number = 0
-
-    if type(value) == 'string' then
-      comparisonIndex = Backend.nameIndex(value)
-      if comparisonIndex == nil then return nil, 'FName is absent from the cached name pool: ' .. value end
-    elseif type(value) == 'number' then
-      comparisonIndex = value
-    elseif type(value) == 'table' then
-      comparisonIndex = value.comparisonIndex or value.index
-      number = value.number or 0
-    end
-
-    if type(comparisonIndex) ~= 'number' then return nil, 'NameProperty requires a string, index, or FName table' end
-
-    writeInteger(valueAddress, comparisonIndex)
-    writeInteger(valueAddress + 4, number)
-    return true
-  end
-
-  if propertyType == 'StructProperty' then
-    if type(value) ~= 'table' then return nil, 'StructProperty requires a table' end
-
-    local fields, fieldsError = Backend.properties(property.structAddress)
-    if not fields then return nil, fieldsError end
-
-    for requestedName, fieldValue in pairs(value) do
-      local field, lookupError = Dumper.Helpers.resolveProperty(fields, requestedName)
-      if not field then return nil, lookupError end
-
-      local written, writeError = Dumper.Invocation.writePropertyValue( valueAddress + field.offset, field, fieldValue )
-      if not written then return nil, requestedName .. ': ' .. writeError end
-    end
-
-    return true
-  end
-
-  return nil, 'Unsupported parameter type: ' .. tostring(propertyType)
+  local writer = Dumper.Invocation.valueWriters[property.propertyType]
+  if not writer then return nil, 'Unsupported parameter type: ' .. tostring(property.propertyType) end
+  return writer( valueAddress, property, value )
 end
 
 --- Read one supported reflected value from parameter buffer
@@ -3491,57 +3650,9 @@ end
 -- @return any @ decoded Lua value
 -- @return string|nil @ conversion error
 function Dumper.Invocation.readPropertyValue(valueAddress, property)
-  local propertyType = property.propertyType
-
-  if propertyType == 'BoolProperty' then
-    local byteValue = readBytes( valueAddress, 1, false ) or 0
-    return byteValue & (property.byteMask or 1) ~= 0
-  end
-
-  if propertyType == 'ByteProperty' or propertyType == 'UInt8Property' then return readBytes( valueAddress, 1, false ) end
-
-  if propertyType == 'Int8Property' then
-    local result = readBytes( valueAddress, 1, false )
-    return result and (result >= 0x80 and result - 0x100 or result) or nil
-  end
-
-  if propertyType == 'Int16Property' or propertyType == 'UInt16Property' then return readSmallInteger(valueAddress) end
-  if propertyType == 'IntProperty' or propertyType == 'Int32Property' or propertyType == 'EnumProperty' then return readInteger(valueAddress) end
-
-  if propertyType == 'UInt32Property' then
-    local result = readInteger(valueAddress)
-    return result and (result & 0xFFFFFFFF) or nil
-  end
-
-  if propertyType == 'Int64Property' or propertyType == 'UInt64Property' then return readQword(valueAddress) end
-  if propertyType == 'FloatProperty' then return readFloat(valueAddress) end
-  if propertyType == 'DoubleProperty' then return readDouble(valueAddress) end
-  if Dumper.Invocation.pointerTypes[propertyType] then return readPointer(valueAddress) end
-
-  if propertyType == 'NameProperty' then
-    return
-    {
-      comparisonIndex = readInteger(valueAddress),
-      number = readInteger(valueAddress + 4),
-    }
-  end
-
-  if propertyType == 'StructProperty' then
-    local fields, fieldsError = Backend.properties(property.structAddress)
-    if not fields then return nil, fieldsError end
-
-    local result = {}
-
-    for fieldName, field in pairs(fields) do
-      local fieldValue, readError = Dumper.Invocation.readPropertyValue( valueAddress + field.offset, field )
-      if readError then return nil, fieldName .. ': ' .. readError end
-      result[fieldName] = fieldValue
-    end
-
-    return result
-  end
-
-  return nil, 'Unsupported parameter type: ' .. tostring(propertyType)
+  local reader = Dumper.Invocation.valueReaders[property.propertyType]
+  if not reader then return nil, 'Unsupported parameter type: ' .. tostring(property.propertyType) end
+  return reader( valueAddress, property )
 end
 
 --- Invoke a reflected UFunction on UObject through ProcessEvent
@@ -3754,6 +3865,46 @@ function Dumper.Dumps.objectPath(objectAddress)
   return path
 end
 
+Dumper.Dumps.propertyTypeFormatters =
+{
+  StructProperty = function(property, propertyAddress)
+    local structAddress = property.structAddress or propertyAddress and Backend.propertyStruct(propertyAddress)
+    return ('StructProperty<%s>'):format( Backend.objectName(structAddress) or '?' )
+  end,
+
+  EnumProperty = function(property, propertyAddress, active, cppStyle, formatted)
+    local enumAddress = propertyAddress and Backend.propertyEnum( propertyAddress, property.propertyType )
+    return enumAddress and ('%s<%s>'):format( property.propertyType, Backend.objectName(enumAddress) or '?' ) or formatted
+  end,
+
+  ByteProperty = function(property, propertyAddress, active, cppStyle, formatted)
+    local enumAddress = propertyAddress and Backend.propertyEnum( propertyAddress, property.propertyType )
+    return enumAddress and ('%s<%s>'):format( property.propertyType, Backend.objectName(enumAddress) or '?' ) or formatted
+  end,
+
+  ArrayProperty = function(property, propertyAddress, active)
+    local inner = property.innerProperty or propertyAddress and Backend.propertyArrayInner(propertyAddress)
+    return ('TArray<%s>'):format( Dumper.Dumps.propertyType( inner, active, true ) )
+  end,
+
+  SetProperty = function(property, propertyAddress, active)
+    local element = property.elementProperty or propertyAddress and Backend.propertySetElement(propertyAddress)
+    return ('TSet<%s>'):format( Dumper.Dumps.propertyType( element, active, true ) )
+  end,
+
+  MapProperty = function(property, propertyAddress, active)
+    local keyProperty = property.keyProperty
+    local valueProperty = property.valueProperty
+
+    if (not keyProperty or not valueProperty) and propertyAddress then keyProperty, valueProperty = Backend.propertyMapMembers(propertyAddress) end
+
+    return ('TMap<%s, %s>'):format(
+                                    Dumper.Dumps.propertyType( keyProperty, active, true ),
+                                    Dumper.Dumps.propertyType( valueProperty, active, true )
+                                  )
+  end,
+}
+
 --- Format property type (+ referenced and container types)
 -- @param property table|nil @ decoded property metadata
 -- @param active table|nil @ descriptor recursion guard
@@ -3780,33 +3931,10 @@ function Dumper.Dumps.propertyType(property, active, cppStyle)
   local formatted = cppStyle and cppScalarTypes[propertyType] or propertyType
   formatted = formatted or propertyType
 
-  if propertyType == 'StructProperty' then
-    local structAddress = property.structAddress or propertyAddress and Backend.propertyStruct(propertyAddress)
-    formatted = ('StructProperty<%s>'):format( Backend.objectName(structAddress) or '?' )
+  local formatter = Dumper.Dumps.propertyTypeFormatters[propertyType]
 
-  elseif propertyType == 'EnumProperty' or propertyType == 'ByteProperty' then
-    local enumAddress = propertyAddress and Backend.propertyEnum( propertyAddress, propertyType )
-    if enumAddress then formatted = ('%s<%s>'):format( propertyType, Backend.objectName(enumAddress) or '?' ) end
-
-  elseif propertyType == 'ArrayProperty' then
-    local inner = property.innerProperty or propertyAddress and Backend.propertyArrayInner(propertyAddress)
-    formatted = ('TArray<%s>'):format( Dumper.Dumps.propertyType( inner, active, true ) )
-
-  elseif propertyType == 'SetProperty' then
-    local element = property.elementProperty or propertyAddress and Backend.propertySetElement(propertyAddress)
-    formatted = ('TSet<%s>'):format( Dumper.Dumps.propertyType( element, active, true ) )
-
-  elseif propertyType == 'MapProperty' then
-    local keyProperty = property.keyProperty
-    local valueProperty = property.valueProperty
-
-    if (not keyProperty or not valueProperty) and propertyAddress then keyProperty, valueProperty = Backend.propertyMapMembers(propertyAddress) end
-
-    formatted = ('TMap<%s, %s>'):format(
-                                        Dumper.Dumps.propertyType( keyProperty, active, true ),
-                                        Dumper.Dumps.propertyType( valueProperty, active, true )
-                                      )
-
+  if formatter then
+    formatted = formatter( property, propertyAddress, active, cppStyle, formatted )
   elseif propertyAddress then
     local referencedClass = Backend.propertyClassReference( propertyAddress, propertyType )
     if referencedClass then formatted = ('%s<%s>'):format( propertyType, Backend.objectName(referencedClass) or '?' ) end

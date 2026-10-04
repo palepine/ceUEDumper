@@ -1456,6 +1456,25 @@ function Module.Reflection.propertyEnum(propertyAddress, propertyType)
   return nil
 end
 
+Module.Reflection.propertyMetadataEnrichers =
+{
+  StructProperty = function(propertyAddress, property)
+    property.structAddress, property.structError = Module.Reflection.propertyStruct(propertyAddress)
+  end,
+
+  ArrayProperty = function(propertyAddress, property)
+    property.innerProperty, property.innerError = Module.Reflection.propertyArrayInner(propertyAddress)
+  end,
+
+  SetProperty = function(propertyAddress, property)
+    property.elementProperty, property.elementError = Module.Reflection.propertySetElement(propertyAddress)
+  end,
+
+  MapProperty = function(propertyAddress, property)
+    property.keyProperty, property.valueProperty, property.mapError = Module.Reflection.propertyMapMembers(propertyAddress)
+  end,
+}
+
 --- Decode one reflected property descriptor outside property chain
 -- used by object dumping when GUObjectArray contains UProperty/FProperty objects
 -- @param propertyAddress number @ reflected property descriptor
@@ -1467,16 +1486,8 @@ function Module.Reflection.propertyMetadata(propertyAddress)
   if not property then return propertyName, nil, propertyError end
 
   addPropertyFlags(property)
-
-  if property.propertyType == 'StructProperty' then
-    property.structAddress, property.structError = Module.Reflection.propertyStruct(propertyAddress)
-  elseif property.propertyType == 'ArrayProperty' then
-    property.innerProperty, property.innerError = Module.Reflection.propertyArrayInner(propertyAddress)
-  elseif property.propertyType == 'SetProperty' then
-    property.elementProperty, property.elementError = Module.Reflection.propertySetElement(propertyAddress)
-  elseif property.propertyType == 'MapProperty' then
-    property.keyProperty, property.valueProperty, property.mapError = Module.Reflection.propertyMapMembers(propertyAddress)
-  end
+  local enricher = Module.Reflection.propertyMetadataEnrichers[property.propertyType]
+  if enricher then enricher( propertyAddress, property ) end
 
   return propertyName, property
 end
