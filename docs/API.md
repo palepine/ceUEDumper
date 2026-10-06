@@ -580,7 +580,7 @@ Keys in `outputValues` must match the UFunction parameter names.
 ```lua
 local functionAddress = assert( ue_findFunction( 'BP_ThirdPersonCharacter_C', 'CheckStuff' ) )
 
-local patch, patchError = ue_patchFunctionOutputs( functionAddress, { HaveBullets = true } )
+local patch, patchError = ue_patchFunctionOutputs( functionAddress, { HasSomething = true } )
 
 assert( ue_restoreFunctionPatch(patch) ) -- restoring
 ```
