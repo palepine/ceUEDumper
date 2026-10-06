@@ -112,6 +112,22 @@ local function isValidAddress(address)
   return type(address) == 'number' and address ~= 0
 end
 
+--- Test if target address resides in executable memory
+-- @param address number|nil @ candidate native thunk
+-- @return boolean @ true for one of the Windows executable page protections
+local function isExecutableAddress(address)
+  if not isValidAddress(address) then return false end
+
+  local region = getMemoryRegionInfo(address)
+  if not region or type(region.Protect) ~= 'number' then return false end
+
+  local protection = region.Protect & 0xFF
+  return protection == 0x10 -- PAGE_EXECUTE
+         or protection == 0x20 -- PAGE_EXECUTE_READ
+         or protection == 0x40 -- PAGE_EXECUTE_READWRITE
+         or protection == 0x80 -- PAGE_EXECUTE_WRITECOPY
+end
+
 --- Count named fields in one enumeration result
 -- @param properties table|nil @ property map returned by the core
 -- @return number @ number of named properties
@@ -973,7 +989,26 @@ function Module.Functions.functionMetadata(functionAddress)
   local propertyLink = definitions.UClass and definitions.UClass.PropertyLink
   local expectedStart = type(propertyLink) == 'number' and propertyLink + (propertyLink >= 0x68 and 0x40 or 0x30) or nil
 
-  local starts = { expectedStart, 0xB0, 0xB8, 0xA0, 0x98, 0x88, 0xC0, 0xC8 }
+  local parameters, parameterError = Module.Reflection.properties(functionAddress)
+  local reflectedParameterCount = 0
+  local minimumParameterBufferSize = 0
+  local reflectedReturnOffset
+
+  for _, property in pairs(parameters or {}) do
+
+    if property.isParameter then
+      reflectedParameterCount = reflectedParameterCount + 1
+
+      local propertyOffset = type(property.offset) == 'number' and property.offset or 0
+      local propertySize = type(property.size) == 'number' and math.max( property.size, 1 ) or 1
+      minimumParameterBufferSize = math.max( minimumParameterBufferSize, propertyOffset + propertySize )
+
+      if property.isReturnParameter then reflectedReturnOffset = propertyOffset end
+    end
+
+  end
+
+  local starts = { 0xB0, 0xB8, 0xA0, 0x98, 0x88, 0xC0, 0xC8, expectedStart }
   local seen = {}
   local selected
 
@@ -997,9 +1032,29 @@ function Module.Functions.functionMetadata(functionAddress)
         local functionPointer = readPointer( functionAddress + functionFlagsOffset + functionPointerDelta )
         local returnIsValid = returnValueOffset == 0xFFFF or returnValueOffset <= parmsSize
 
-        if functionFlags and functionFlags ~= 0 and numParms and numParms <= 0x80
-          and parmsSize and parmsSize <= 0x8000 and returnValueOffset and returnIsValid
-          and isValidAddress(functionPointer) and readByte(functionPointer) ~= nil
+        local reflectedReturnMatches
+
+        if reflectedReturnOffset then
+          reflectedReturnMatches = returnValueOffset == reflectedReturnOffset
+        else
+          reflectedReturnMatches = returnValueOffset == 0xFFFF
+        end
+
+        local parameterHeaderMatches = not parameters
+                                       or numParms == reflectedParameterCount
+                                       and parmsSize >= minimumParameterBufferSize
+                                       and reflectedReturnMatches
+
+        if functionFlags
+           and functionFlags ~= 0
+           and numParms
+           and numParms <= 0x80
+           and parmsSize
+           and parmsSize <= 0x8000
+           and returnValueOffset
+           and returnIsValid
+           and parameterHeaderMatches
+           and isExecutableAddress(functionPointer)
         then
           selected =
           {
@@ -1040,7 +1095,13 @@ function Module.Functions.functionMetadata(functionAddress)
     if selected then break end
   end
 
-  if not selected then return nil, 'UFunction member layout was not recognized' end
+  if not selected then
+    local parameterSummary = parameters
+                             and ('reflected %d parameter(s), minimum buffer 0x%X'):format( reflectedParameterCount, minimumParameterBufferSize )
+                             or ('parameter reflection unavailable: ' .. tostring(parameterError))
+
+    return nil, 'UFunction member layout was not recognized (' .. parameterSummary .. ')'
+  end
 
   local script = resolveScriptArray( functionAddress, definitions )
 
@@ -1051,7 +1112,7 @@ function Module.Functions.functionMetadata(functionAddress)
     selected.bytecodeCapacity = script.bytecodeCapacity
   end
 
-  selected.parameters = Module.Reflection.properties(functionAddress) or {}
+  selected.parameters = parameters or {}
   return selected
 end
 
@@ -1108,17 +1169,19 @@ function Module.Reflection.classHeaderLayout()
     result.Children = result.SuperStruct + PTR_SIZE
   end
 
-  if type(result.PropertyLink) == 'number' then
-    result.PropertiesSize = result.PropertiesSize or result.Children + PTR_SIZE * 2
-    result.MinAlignment = result.MinAlignment or result.PropertiesSize + 4
-  end
-
   if type(result.Script) ~= 'number' then
     if result.PropertyLinkAlt == 0x38 or result.PropertyLinkAlt == 0x48 or result.PropertyLinkAlt == 0x50 then
       result.Script = result.PropertyLinkAlt + 0x10
     elseif result.PropertyLink == 0x58 or result.PropertyLink == 0x68 or result.PropertyLink == 0x70 then
       result.Script = result.PropertyLink - 0x10
     end
+  end
+
+  -- PropertiesSize and MinAlignment immediately precede Script in supported UStruct layouts
+  -- deriving them from Children is ambiguous on UE4.24, legacy UStruct has no ChildProperties pointer in that slot
+  if type(result.Script) == 'number' then
+    result.PropertiesSize = result.Script - 0x8
+    result.MinAlignment = result.Script - 0x4
   end
 
   return result
