@@ -2738,12 +2738,14 @@ end
 --- Count coherent UObject chains for a possible x64 FUObjectItem size
 -- @param firstItemAddress number @ first item in the first object chunk
 -- @param candidateItemSize number @ candidate FUObjectItem byte size
+-- @param objectPointerOffset number @ candidate FUObjectItem::Object member offset
 -- @return number @ number of coherent object/vtable/function chains
-function Core.Objects.ue_guessObjectItemStrideInternal(firstItemAddress, candidateItemSize)
+function Core.Objects.ue_guessObjectItemStrideInternal(firstItemAddress, candidateItemSize, objectPointerOffset)
   local validObjectCount = 0
 
   for objectIndex = 0, 31 do
-    local objectAddress = readPointer( firstItemAddress + objectIndex * candidateItemSize )
+    local itemAddress = firstItemAddress + objectIndex * candidateItemSize
+    local objectAddress = readPointer( itemAddress + objectPointerOffset )
 
     if not objectAddress or objectAddress == 0 then goto continue end
 
@@ -2770,28 +2772,42 @@ end
 --- Infer FUObjectItem size from several known layout candidates
 -- @param firstItemAddress number @ first item in the first object chunk
 -- @return number|nil @ best validated item stride
+-- @return number|nil @ FUObjectItem::Object member offset
 function Core.Objects.ue_inferObjectItemSizeInternal(firstItemAddress)
   local guessObjectItemStride = Core.Objects.ue_guessObjectItemStrideInternal
   local writeLog = Core.Runtime.log
 
   local candidateItemSizes = { 0x18, 0x20, 0x10, 0x28, 0x30 }
-  local bestItemSize, bestValidObjectCount = nil, 0
+  local candidateObjectPointerOffsets = { 0, 0x8 }
+  local bestItemSize, bestObjectPointerOffset, bestValidObjectCount = nil, nil, 0
 
   for _, candidateItemSize in ipairs( candidateItemSizes ) do
-    local validObjectCount = guessObjectItemStride( firstItemAddress, candidateItemSize )
+    for _, objectPointerOffset in ipairs(candidateObjectPointerOffsets) do
+      if objectPointerOffset >= candidateItemSize then goto continue end
 
-    writeLog( ('Core.Objects.FindObjectArray: FUObjectItem stride 0x%X scored %d/32'):format( candidateItemSize, validObjectCount ) )
+      local validObjectCount = guessObjectItemStride( firstItemAddress, candidateItemSize, objectPointerOffset )
 
-    if validObjectCount > bestValidObjectCount then
-      bestItemSize = candidateItemSize
-      bestValidObjectCount = validObjectCount
+      writeLog(
+        ('Core.Objects.FindObjectArray: FUObjectItem stride 0x%X Object+0x%X scored %d/32')
+        :format( candidateItemSize, objectPointerOffset, validObjectCount )
+      )
+
+      if validObjectCount > bestValidObjectCount then
+        bestItemSize = candidateItemSize
+        bestObjectPointerOffset = objectPointerOffset
+        bestValidObjectCount = validObjectCount
+      end
+
+      ::continue::
     end
-
   end
 
   if bestValidObjectCount >= 2 then
-    writeLog( ( 'Core.Objects.FindObjectArray: selected FUObjectItem stride 0x%X' ):format( bestItemSize ) )
-    return bestItemSize
+    writeLog(
+      ('Core.Objects.FindObjectArray: selected FUObjectItem stride 0x%X Object+0x%X')
+      :format( bestItemSize, bestObjectPointerOffset )
+    )
+    return bestItemSize, bestObjectPointerOffset
   end
 
   return nil
@@ -2800,13 +2816,14 @@ end
 --- Collect UObject addresses from the first 128 FUObjectItem slots
 -- @param firstItemAddress number @ first item address
 -- @param objectItemSize number @ item stride in bytes
+-- @param objectPointerOffset number @ FUObjectItem::Object member offset
 -- @return number[] @ sampled object addresses with pointer flags removed
-function Core.Objects.collectUObjectSamples(firstItemAddress, objectItemSize)
+function Core.Objects.collectUObjectSamples(firstItemAddress, objectItemSize, objectPointerOffset)
   local objectAddresses = {}
 
   for index = 0, 127 do
     local itemAddress = firstItemAddress + index * objectItemSize
-    local objectAddress = readPointer(itemAddress)
+    local objectAddress = readPointer( itemAddress + objectPointerOffset )
 
     if objectAddress and objectAddress ~= 0 then
       objectAddresses[ #objectAddresses + 1 ] = objectAddress & 0xFFFFFFFFFFFFFFF8
@@ -2961,9 +2978,9 @@ end
 -- @param objectItemSize number @ selected FUObjectItem byte size
 -- @return number|nil @ class-pointer offset
 -- @return number|nil @ FName offset
-function Core.Objects.ue_inferUObjectOffsetsInternal(firstItemAddress, objectItemSize)
+function Core.Objects.ue_inferUObjectOffsetsInternal(firstItemAddress, objectItemSize, objectPointerOffset)
 
-  local objectAddresses = Core.Objects.collectUObjectSamples( firstItemAddress, objectItemSize )  -- TODO: any better?
+  local objectAddresses = Core.Objects.collectUObjectSamples( firstItemAddress, objectItemSize, objectPointerOffset )  -- TODO: any better?
 
   local acceptanceThreshold = math.min( 8, #objectAddresses )
 
@@ -3112,21 +3129,31 @@ end
 function Core.Objects.looksLikeSingleObjectChunk(chunkAddress)
   if not chunkAddress or chunkAddress == 0 then return false end
 
-  local objectAddress = readPointer(chunkAddress)
-  if not objectAddress or objectAddress == 0 then return false end
+  for _, objectPointerOffset in ipairs({ 0, 0x8 }) do
+    local objectAddress = readPointer( chunkAddress + objectPointerOffset )
+    if not objectAddress or objectAddress == 0 then goto continue end
 
-  local vtableAddress = readPointer(objectAddress)
-  if not vtableAddress or vtableAddress == 0 then return false end
+    local vtableAddress = readPointer(objectAddress)
+    if not vtableAddress or vtableAddress == 0 then goto continue end
 
-  for functionOffset = 0, 16, 8 do
-    local functionAddress = readPointer( vtableAddress + functionOffset )
+    local valid = true
 
-    --3 valid pointers to executable memory. Guess it's just a small list  (single)
-    if not functionAddress then return false end
-    if not Core.Memory.isInExecutableMainModuleMemory(functionAddress) then return false end
+    for functionOffset = 0, 16, 8 do
+      local functionAddress = readPointer( vtableAddress + functionOffset )
+
+      --3 valid pointers to executable memory. Guess it's just a small list  (single)
+      if not functionAddress or not Core.Memory.isInExecutableMainModuleMemory(functionAddress) then
+        valid = false
+        break
+      end
+    end
+
+    if valid then return true end
+
+    ::continue::
   end
 
-  return true
+  return false
 end
 
 --- Distinguish chunked storage from a contiguous FUObjectItem array
@@ -3209,12 +3236,15 @@ end
 -- @param firstItemAddress number @ first FUObjectItem address
 -- @return number|nil @ inferred item stride
 -- @return number[]|nil @ item offsets available for legacy UObject inference
+-- @return number|nil @ FUObjectItem::Object member offset
 -- @return string|nil @ error
 function Core.Objects.findObjectItemStride(firstItemAddress)
 
-  local inferredSize = Core.Objects.ue_inferObjectItemSizeInternal(firstItemAddress)
+  local inferredSize, objectPointerOffset = Core.Objects.ue_inferObjectItemSizeInternal(firstItemAddress)
 
-  if inferredSize then return inferredSize, { 0, inferredSize } end
+  if inferredSize then
+    return inferredSize, { objectPointerOffset, objectPointerOffset + inferredSize }, objectPointerOffset
+  end
 
   local itemOffsets = Core.Objects.findLegacyObjectItemOffsets(firstItemAddress)
 
@@ -3227,9 +3257,33 @@ function Core.Objects.findObjectItemStride(firstItemAddress)
     itemOffsets = Core.Objects.findLegacyObjectItemOffsets(firstItemAddress)
   end
 
-  if #itemOffsets <= 1 then return nil, nil, 'Unable to infer ObjectArrayEntryStruct size' end
+  if #itemOffsets <= 1 then return nil, nil, nil, 'Unable to infer ObjectArrayEntryStruct size' end
 
-  return itemOffsets[2] - itemOffsets[1], itemOffsets
+  local itemSize = itemOffsets[2] - itemOffsets[1]
+  return itemSize, itemOffsets, itemOffsets[1] % itemSize
+end
+
+--- Check and restore FUObjectItem::Object offset
+-- @return boolean|nil @ true when an object-pointer offset is available
+-- @return string|nil @ inference error
+function Core.Objects.ensureObjectItemPointerOffset()
+  if type(CUEDEFS.ObjectArrayObjectOffset) == 'number' then return true end
+  if not CUEDEFS.ObjectArray or type(CUEDEFS.ObjectArrayEntryStructSize) ~= 'number' then
+    return nil, 'Saved object-array layout is incomplete'
+  end
+
+  local firstItemAddress, storageType, storageError = Core.Objects.resolveObjectItemStorage(CUEDEFS.ObjectArray)
+  if not firstItemAddress then return nil, storageError end
+
+  local inferredSize, objectPointerOffset = Core.Objects.ue_inferObjectItemSizeInternal(firstItemAddress)
+
+  if not inferredSize or inferredSize ~= CUEDEFS.ObjectArrayEntryStructSize then
+    return nil, 'Saved FUObjectItem stride no longer matches runtime storage'
+  end
+
+  CUEDEFS.ObjectArrayListType = storageType
+  CUEDEFS.ObjectArrayObjectOffset = objectPointerOffset
+  return true
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// LEGACY UOBJECT INFERENCE
@@ -3363,11 +3417,12 @@ end
 -- @param firstItemAddress number @ first FUObjectItem address
 -- @param itemSize number @ inferred FUObjectItem stride
 -- @param itemOffsets number[] @ candidate offsets for legacy sampling
+-- @param objectPointerOffset number @ FUObjectItem::Object member offset
 -- @return boolean @ true when both required offsets were found
 -- @return string|nil @ error
-function Core.Objects.findUObjectLayout(firstItemAddress, itemSize, itemOffsets)
+function Core.Objects.findUObjectLayout(firstItemAddress, itemSize, itemOffsets, objectPointerOffset)
   
-  local classOffset, nameOffset = Core.Objects.ue_inferUObjectOffsetsInternal( firstItemAddress, itemSize )
+  local classOffset, nameOffset = Core.Objects.ue_inferUObjectOffsetsInternal( firstItemAddress, itemSize, objectPointerOffset )
 
   if not classOffset or not nameOffset then
     local inferenceError
@@ -3422,9 +3477,9 @@ function Core.Objects.FindObjectArray(cancellationThread)
     ├─ +0x28 MaxChunks
     └─ +0x2C NumChunks
 
-    FUObjectItem entry (size varies)
-    ├─ UObject* Object
-    ├─ object flags / bookkeeping
+    FUObjectItem entry (size/member order varies)
+    ├─ pre-UE5.7: UObject* Object at +0x0
+    ├─ UE5.7:     FlagsAndRefCount at +0x0; UObject* Object at +0x8
     └─ ...
 
     UObject
@@ -3460,7 +3515,7 @@ function Core.Objects.FindObjectArray(cancellationThread)
     
     findObjectItemStride
     ├─ inferObjectItemSize
-    │  ├─ test known FUObjectItem sizes
+    │  ├─ test known FUObjectItem sizes and Object member offsets (+0x0/+0x8)
     │  │  ├─ 0x18
     │  │  ├─ 0x20
     │  │  ├─ 0x10
@@ -3527,13 +3582,14 @@ function Core.Objects.FindObjectArray(cancellationThread)
   
   -- Core.Objects.logFirstObjectVTable(firstItemAddress)
 
-  local itemSize, itemOffsets, strideError = Core.Objects.findObjectItemStride( firstItemAddress )
+  local itemSize, itemOffsets, objectPointerOffset, strideError = Core.Objects.findObjectItemStride( firstItemAddress )
   if not itemSize then return false, strideError end
   CUEDEFS.ObjectArrayEntryStructSize = itemSize -- for iterating objects
+  CUEDEFS.ObjectArrayObjectOffset = objectPointerOffset
   
   -- CUEDEFS.UObject.Class -- offset to UObject::ClassPrivate
   -- CUEDEFS.UObject.Name -- offset to UObject::NamePrivate
-  return Core.Objects.findUObjectLayout( firstItemAddress, itemSize, itemOffsets )
+  return Core.Objects.findUObjectLayout( firstItemAddress, itemSize, itemOffsets, objectPointerOffset )
 end
 
 
@@ -4764,7 +4820,8 @@ function Core.Signatures.ue_objectMatchesArrayIndexInternal(object)
       item = objects + index * CUEDEFS.ObjectArrayEntryStructSize
     end
 
-    local listed = readPointer(item)
+    local objectPointerOffset = CUEDEFS.ObjectArrayObjectOffset or 0
+    local listed = readPointer( item + objectPointerOffset )
 
     if listed and (listed & 0xFFFFFFFFFFFFFFF8) == object then return true end
 
@@ -5380,13 +5437,21 @@ function Core.Signatures.ue_validateObjectArrayInternal(address)
 
   if not firstChunk or firstChunk == 0 then return false end
 
-  local firstObject = readPointer(firstChunk)
+  -- UE5.7 moved FUObjectItem::Object from +0x0 to +0x8, FlagsAndRefCount go first
+  -- layout is selected later
+  for _, objectPointerOffset in ipairs({ 0, 0x8 }) do
+    local firstObject = readPointer( firstChunk + objectPointerOffset )
+    if not firstObject or firstObject == 0 then goto continue end
 
-  if not firstObject or firstObject == 0 then return false end
+    local firstVtable = readPointer(firstObject)
+    local firstFunction = firstVtable and readPointer(firstVtable)
 
-  local firstVtable = readPointer(firstObject)
+    if firstFunction and readByte(firstFunction) ~= nil then return true end
 
-  return firstVtable ~= nil and firstVtable ~= 0
+    ::continue::
+  end
+
+  return false
 end
 
 --- Normalize RIP target referencing GUObjectArray or an embedded field
@@ -6109,6 +6174,8 @@ function Core.Persistence.saveLayout(savedSettings)
 
   savedSettings['CUEDEFS.ObjectArrayEntryStructSize'] = CUEDEFS.ObjectArrayEntryStructSize
 
+  savedSettings['CUEDEFS.ObjectArrayObjectOffset'] = CUEDEFS.ObjectArrayObjectOffset
+
   savedSettings['CUEDEFS.NamePoolData_old'] = CUEDEFS.NamePoolData_old
 
   savedSettings.fullyParsed = true
@@ -6228,6 +6295,9 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
   Core.Menu.createUEMenu( true, cancellationThread )
   local restored, restoreError = Core.Persistence.restoreGlobalAddresses( savedSettings, cancellationThread )
   if not restored then return nil, restoreError end
+
+  local objectLayoutReady, objectLayoutError = Core.Objects.ensureObjectItemPointerOffset()
+  if not objectLayoutReady then return nil, objectLayoutError end
 
   cancellationError = Core.Scanner.getCancellationError(cancellationThread)
   if cancellationError then return nil, cancellationError end
@@ -6358,7 +6428,9 @@ function Core.Scanner.findScannerObjects(savedSettings, cancellationThread)
       CUEDEFS.ObjectArray = getAddressSafe(savedSymbol)
     end
   end
-  if CUEDEFS.ObjectArray ~= nil and CUEDEFS.UObject ~= nil then return true end
+  if CUEDEFS.ObjectArray ~= nil and CUEDEFS.UObject ~= nil then
+    return Core.Objects.ensureObjectItemPointerOffset()
+  end
 
   Core.Runtime.log('Scanning for object table')
   Core.Menu.setScannerStatus( 'Scanning for object table', cancellationThread )

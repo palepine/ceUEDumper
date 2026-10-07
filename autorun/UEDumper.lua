@@ -2709,7 +2709,14 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
 
   local layout = Backend.classHeaderLayout()
   local structure = createStructure( 'ceUE.UFunction metadata ' .. (metadata.name or '') )
-  local implementation = metadata.native and 'native thunk' or 'script VM thunk'
+  local implementation
+
+  if metadata.functionPointerIsExecutable then
+    implementation = metadata.native and 'native thunk' or 'script VM thunk'
+  else
+    implementation = 'callable wrapper'
+  end
+
   local scriptKind = metadata.bytecodeSize and metadata.bytecodeSize > 0 and 'Blueprint bytecode' or 'no bytecode'
   local fields =
   {
@@ -4048,9 +4055,6 @@ end
 function Dumper.Hooks.resolveScriptDispatcher(metadata, options)
   local requested = options.backend or 'auto'
   local explicitAddress = options.scriptDispatcherAddress or options.processLocalScriptFunctionAddress
-  local processInternal = Dumper.Hooks.resolveBranchTarget( metadata.functionPointer, false )
-
-  if not processInternal then return nil, nil, 'ProcessInternal entry point is unreadable' end
 
   if explicitAddress ~= nil then
     if type(explicitAddress) ~= 'number' or explicitAddress == 0 or readByte(explicitAddress) == nil then
@@ -4058,6 +4062,14 @@ function Dumper.Hooks.resolveScriptDispatcher(metadata, options)
     end
     return explicitAddress, 'script-explicit'
   end
+
+  if not metadata.functionPointerIsExecutable then
+    return nil, nil, 'This engine stores UFunction::Func in a callable wrapper; supply scriptDispatcherAddress explicitly'
+  end
+
+  local processInternal = Dumper.Hooks.resolveBranchTarget( metadata.functionPointer, false )
+
+  if not processInternal then return nil, nil, 'ProcessInternal entry point is unreadable' end
 
   if requested == 'processInternal' then
     return processInternal, 'processInternal'
@@ -4153,6 +4165,10 @@ function Dumper.Hooks.ue_hookBlueprintFunction(objectPointerAddress, functionNam
 
   if requestedBackend == 'func' then
     if not metadata.functionPointerOffset then return nil, 'UFunction::Func offset is unavailable' end
+
+    if not metadata.functionPointerIsExecutable then
+      return nil, 'The func backend cannot replace this engine\'s callable-wrapper UFunction::Func'
+    end
 
     nativeHandle, createError = HookBridge.create(
                                                    functionAddress,
@@ -4480,7 +4496,15 @@ function Dumper.Dumps.functionDeclaration(functionAddress, functionName)
   declaration = declaration .. ';'
 
   local annotations = {}
-  if metadata.native then annotations[ #annotations + 1 ] = metadata.functionPointer and ('Native thunk=0x%X'):format(metadata.functionPointer) or 'Native' end
+  if metadata.native then
+    if metadata.functionPointer and metadata.functionPointerIsExecutable then
+      annotations[ #annotations + 1 ] = ('Native thunk=0x%X'):format(metadata.functionPointer)
+    elseif metadata.functionPointer then
+      annotations[ #annotations + 1 ] = ('Native callable wrapper=0x%X'):format(metadata.functionPointer)
+    else
+      annotations[ #annotations + 1 ] = 'Native'
+    end
+  end
   if metadata.bytecodeSize and metadata.bytecodeSize > 0 then annotations[ #annotations + 1 ] = ('Blueprint bytecode=%d bytes'):format(metadata.bytecodeSize) end
   if #annotations > 0 then declaration = declaration .. ' // ' .. table.concat( annotations, ', ' ) end
   return declaration

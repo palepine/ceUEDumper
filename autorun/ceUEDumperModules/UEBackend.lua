@@ -294,6 +294,7 @@ function Module.Objects.createObjectArrayView(refresh)
 
   local objectArrayAddress = definitions.ObjectArray
   local itemSize = definitions.ObjectArrayEntryStructSize
+  local objectPointerOffset = definitions.ObjectArrayObjectOffset or 0
   local chunked = definitions.ObjectArrayListType == 0
 
   if not isValidAddress( objectArrayAddress ) then return nil end
@@ -304,6 +305,7 @@ function Module.Objects.createObjectArrayView(refresh)
                    cachedObjectArrayView.definitions == definitions and
                    cachedObjectArrayView.objectArrayAddress == objectArrayAddress and
                    cachedObjectArrayView.itemSize == itemSize and
+                   cachedObjectArrayView.objectPointerOffset == objectPointerOffset and
                    cachedObjectArrayView.chunked == chunked
 
   if reusable and not refresh then return cachedObjectArrayView end
@@ -325,6 +327,7 @@ function Module.Objects.createObjectArrayView(refresh)
     objectArrayAddress = objectArrayAddress,
     objectsAddress = objectsAddress,
     itemSize = itemSize,
+    objectPointerOffset = objectPointerOffset,
     count = count,
     chunked = chunked,
     cachedChunkIndex = nil,
@@ -362,7 +365,7 @@ function Module.Objects.objectAtFromView(view, index)
     itemAddress = view.objectsAddress + index * view.itemSize
   end
 
-  return readPointer(itemAddress)
+  return readPointer( itemAddress + view.objectPointerOffset )
 end
 
 --- Resolve obj pointer from GUObjectArray index
@@ -440,6 +443,7 @@ local function objectArrayViewIdentity(view)
       view.objectArrayAddress,
       view.objectsAddress,
       view.itemSize,
+      view.objectPointerOffset,
       view.chunked and 1 or 0,
       objectLayout.Class or -1,
       objectLayout.Name or -1,
@@ -1030,6 +1034,7 @@ function Module.Functions.functionMetadata(functionAddress)
         local rpcIdDelta = shiftedTail and 0x12 or numParmsDelta + 6
         local rpcResponseIdDelta = shiftedTail and 0x14 or numParmsDelta + 8
         local functionPointer = readPointer( functionAddress + functionFlagsOffset + functionPointerDelta )
+        local functionPointerIsExecutable = isExecutableAddress(functionPointer)
         local returnIsValid = returnValueOffset == 0xFFFF or returnValueOffset <= parmsSize
 
         local reflectedReturnMatches
@@ -1054,7 +1059,8 @@ function Module.Functions.functionMetadata(functionAddress)
            and returnValueOffset
            and returnIsValid
            and parameterHeaderMatches
-           and isExecutableAddress(functionPointer)
+           and isValidAddress(functionPointer)
+           and readByte(functionPointer) ~= nil
         then
           selected =
           {
@@ -1080,6 +1086,8 @@ function Module.Functions.functionMetadata(functionAddress)
             eventGraphFunction = readPointer( functionAddress + functionFlagsOffset + eventGraphDelta ),
             eventGraphCallOffset = readInteger( functionAddress + functionFlagsOffset + eventGraphCallDelta ),
             functionPointer = functionPointer,
+            functionPointerIsExecutable = functionPointerIsExecutable,
+            functionStorage = functionPointerIsExecutable and 'direct' or 'callable-wrapper',
             native = functionFlags & 0x00000400 ~= 0,
             blueprintCallable = functionFlags & 0x04000000 ~= 0,
             blueprintEvent = functionFlags & 0x08000000 ~= 0,
