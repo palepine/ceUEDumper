@@ -2755,10 +2755,12 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
 
   if metadata.functionStorage == 'unavailable' then
     implementation = 'unavailable'
+  elseif metadata.functionStorage == 'callable-pair' then
+    implementation = 'callable context'
   elseif metadata.functionPointerIsExecutable then
     implementation = metadata.native and 'native thunk' or 'script VM thunk'
   else
-    implementation = 'callable wrapper'
+    implementation = 'unresolved'
   end
 
   local scriptKind = metadata.bytecodeSize and metadata.bytecodeSize > 0 and 'Blueprint bytecode' or 'no bytecode'
@@ -2789,6 +2791,15 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
     { 'EventGraphCallOffset', metadata.eventGraphCallOffsetOffset, vtDword },
     { 'Func [' .. implementation .. ']', metadata.functionPointerOffset, vtPointer },
   }
+
+  if metadata.functionStorage == 'callable-pair' then
+    fields[ #fields + 1 ] =
+    {
+      'Func.Callback [' .. (metadata.native and 'native thunk' or 'script VM thunk') .. ']',
+      metadata.functionCallableOffset,
+      vtPointer,
+    }
+  end
 
   local roleContext = { functionMetadata = metadata }
 
@@ -3739,7 +3750,7 @@ end
 --
 -- It supports scalar values, FName, raw UObject/UClass, ptrs, POD structs
 -- UE-managed values requiring Ctors/Dtors are rejected before invocation
--- via CE calling API, not main thread
+-- options.executionThread='game' queues to execute in the game thread
 --
 -- @param objectAddress number @ live target UObject this pointer
 -- @param functionName string @ reflected UFunction name
@@ -3756,13 +3767,48 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
   arguments = arguments or {}
   options = options or {}
 
+  if options.executionThread ~= nil and options.executionThread ~= 'remote' and options.executionThread ~= 'game' then
+    return nil, "options.executionThread must be 'remote' or 'game'"
+  end
+
+  local useGameThread = options.executionThread == 'game' or options.gameThread == true
+  local requestedRuns = options.runs or 1
+  local intervalDispatches = options.intervalDispatches or 0
+
+  if type(requestedRuns) ~= 'number' or requestedRuns < 1 or requestedRuns % 1 ~= 0 then
+    return nil, 'options.runs must be a positive integer'
+  end
+
+  if type(intervalDispatches) ~= 'number' or intervalDispatches < 0 or intervalDispatches % 1 ~= 0 then
+    return nil, 'options.intervalDispatches must be a non-negative integer'
+  end
+
+  if not useGameThread and (requestedRuns ~= 1 or intervalDispatches ~= 0) then
+    return nil, 'options.runs and options.intervalDispatches require game-thread execution'
+  end
+
   local functionAddress, functionError = Backend.functionForObject( objectAddress, functionName )
   if not functionAddress then return nil, functionError end
 
   local metadata, metadataError = Backend.functionMetadata(functionAddress)
   if not metadata then return nil, metadataError end
 
-  local processEventAddress, processEventError = Backend.processEvent()
+  local processEventAddress
+  local processEventError
+  local processEventSource
+  local processEventVtableOffset
+
+  if options.processEventAddress ~= nil then
+    if type(options.processEventAddress) ~= 'number' or options.processEventAddress == 0 or readByte(options.processEventAddress) == nil then
+      return nil, 'options.processEventAddress must be a readable non-zero address'
+    end
+
+    processEventAddress = options.processEventAddress
+    processEventSource = 'explicit'
+  else
+    processEventAddress, processEventError, processEventSource, processEventVtableOffset = Backend.processEvent( objectAddress, options.processEventVtableOffset, options.processEventMode )
+  end
+
   if not processEventAddress then return nil, processEventError end
 
   local orderedParameters = Dumper.Invocation.orderedParameters(metadata)
@@ -3793,11 +3839,15 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
   if not parameterBuffer or parameterBuffer == 0 then return nil, 'Failed allocating the UFunction parameter buffer' end
 
   local callResult
+  local invocationHandle
   local succeeded, invocationError = xpcall(
     function()
+      -- should be zero, but let's keep it
       -- local zeroBytes = {}
       -- for index = 1, allocationSize do zeroBytes[index] = 0 end
-      -- writeBytes(parameterBuffer, zeroBytes)
+      -- if writeBytes( parameterBuffer, zeroBytes ) == false then
+      --   error('Failed zero-initializing the UFunction parameter buffer', 0)
+      -- end
 
       for _, parameter in ipairs(orderedParameters) do
         local argumentValue = resolvedArguments[ parameter.property.propertyAddress ]
@@ -3810,22 +3860,91 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
 
       end
 
-      local integerArgumentType = 0
       local timeout = options.timeout or INIT_WAIT_TIME
+      local executionResult
 
-      executeCodeEx(
-        0, -- stdcall
-        timeout,
-        processEventAddress,
-        { type = integerArgumentType, value = objectAddress },
-        { type = integerArgumentType, value = functionAddress },
-        { type = integerArgumentType, value = parameterBuffer }
-      )
+      if useGameThread then
+        local loaded, loadError = Dumper.Runtime.onMainThread( HookBridge.load, options.bridgePath )
+        if not loaded then error( loadError, 0 ) end
+
+        local configured, configureError = HookBridge.configureProcessEventDispatcher(processEventAddress)
+        if not configured then error( configureError, 0 ) end
+
+        invocationHandle, configureError = HookBridge.queueProcessEvent(
+                                                                          objectAddress,
+                                                                          functionAddress,
+                                                                          parameterBuffer,
+                                                                          allocationSize,
+                                                                          requestedRuns,
+                                                                          intervalDispatches
+                                                                        )
+        if not invocationHandle then error( configureError, 0 ) end
+
+        local startedAt = getTickCount()
+        local completedStatus = HookBridge.InvocationStatus.completed
+        local cancelledStatus = HookBridge.InvocationStatus.cancelled
+        local failedStatus = HookBridge.InvocationStatus.failed
+
+        while true do
+          local status, statusError = HookBridge.invocationStatus( invocationHandle )
+          if not status then error(statusError, 0) end
+
+          if status == completedStatus then break end
+          if status == cancelledStatus then error( 'Game-thread ProcessEvent invocation was cancelled', 0 ) end
+          if status == failedStatus then error( HookBridge.lastError(), 0 ) end
+
+          if timeout and timeout >= 0 and getTickCount() - startedAt >= timeout then
+            local cancelled = HookBridge.cancelInvocation(invocationHandle)
+            
+            if cancelled then
+              HookBridge.releaseInvocation(invocationHandle)
+              invocationHandle = nil
+            elseif HookBridge.abandonInvocation(invocationHandle) then
+              invocationHandle = nil
+            end
+
+            error(
+                    cancelled
+                    and ('Game-thread ProcessEvent invocation at 0x%X timed out before execution'):format(processEventAddress)
+                    or ('Game-thread ProcessEvent invocation at 0x%X timed out while running'):format(processEventAddress),
+                    0
+                  )
+          end
+
+          sleep(1)
+        end
+
+        local copied, copyError = HookBridge.copyInvocationParameters( invocationHandle, parameterBuffer, allocationSize )
+        if not copied then error( copyError, 0 ) end
+
+        executionResult = HookBridge.invocationCompletedRuns( invocationHandle )
+        local released, releaseError = HookBridge.releaseInvocation( invocationHandle )
+        invocationHandle = nil
+        if not released then error( releaseError, 0 ) end
+      else
+        local integerArgumentType = 0
+        executionResult = executeCodeEx(
+                                          0, -- stdcall
+                                          timeout,
+                                          processEventAddress,
+                                          { type = integerArgumentType, value = objectAddress },
+                                          { type = integerArgumentType, value = functionAddress },
+                                          { type = integerArgumentType, value = parameterBuffer }
+                                        )
+
+        if executionResult == nil then
+          error( ('ProcessEvent invocation at 0x%X failed or timed out'):format(processEventAddress), 0 )
+        end
+      end
 
       callResult =
       {
-        -- functionAddress = functionAddress,
-        -- processEventAddress = processEventAddress,
+        functionAddress = functionAddress,
+        processEventAddress = processEventAddress,
+        processEventSource = processEventSource,
+        processEventVtableOffset = processEventVtableOffset,
+        executionResult = executionResult,
+        executionThread = useGameThread and 'game' or 'remote',
         outParameters = {},
       }
 
@@ -3845,6 +3964,16 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
     end,
     debug.traceback
   )
+
+  if invocationHandle then
+
+    if HookBridge.cancelInvocation(invocationHandle) then
+      HookBridge.releaseInvocation(invocationHandle)
+    else
+      HookBridge.abandonInvocation(invocationHandle)
+    end
+    
+  end
 
   deAlloc( parameterBuffer )
 
@@ -4108,7 +4237,7 @@ function Dumper.Hooks.resolveScriptDispatcher(metadata, options)
   end
 
   if not metadata.functionPointerIsExecutable then
-    return nil, nil, 'This engine stores UFunction::Func in a callable wrapper; supply scriptDispatcherAddress explicitly'
+    return nil, nil, 'An executable UFunction::Func callback was not resolved; supply scriptDispatcherAddress explicitly'
   end
 
   local processInternal = Dumper.Hooks.resolveBranchTarget( metadata.functionPointer, false )
@@ -4210,8 +4339,8 @@ function Dumper.Hooks.ue_hookBlueprintFunction(objectPointerAddress, functionNam
   if requestedBackend == 'func' then
     if not metadata.functionPointerOffset then return nil, 'UFunction::Func offset is unavailable' end
 
-    if not metadata.functionPointerIsExecutable then
-      return nil, 'The func backend cannot replace this engine\'s callable-wrapper UFunction::Func'
+    if metadata.functionStorage ~= 'direct' then
+      return nil, 'The func backend currently supports only a direct-pointer UFunction::Func layout'
     end
 
     nativeHandle, createError = HookBridge.create(
@@ -4541,10 +4670,10 @@ function Dumper.Dumps.functionDeclaration(functionAddress, functionName)
 
   local annotations = {}
   if metadata.native then
-    if metadata.functionPointer and metadata.functionPointerIsExecutable then
+    if metadata.functionPointer and metadata.functionStorage == 'callable-pair' then
+      annotations[ #annotations + 1 ] = ('Native Func callback=0x%X'):format(metadata.functionPointer)
+    elseif metadata.functionPointer and metadata.functionPointerIsExecutable then
       annotations[ #annotations + 1 ] = ('Native thunk=0x%X'):format(metadata.functionPointer)
-    elseif metadata.functionPointer then
-      annotations[ #annotations + 1 ] = ('Native callable wrapper=0x%X'):format(metadata.functionPointer)
     else
       annotations[ #annotations + 1 ] = 'Native'
     end
