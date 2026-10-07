@@ -7,9 +7,9 @@ A standalone, portable Unreal Engine reflection dumper for Cheat Engine with Lua
 
 Currently supports
 - Resolving offsets using UClass/runtime UObjects
-- Registering the said offsets as symbols accordingly
-- UFunction invocation & enumeration  (both experimental)
-- Uniform Struct dissector
+- Registering said offsets as symbols accordingly
+- UFunction invocation & enumeration (experimental)
+- Struct dissector
 - Portability
 
 ## Installation
@@ -22,7 +22,7 @@ Copy and merge the `autorun` folder into the root Cheat Engine directory.
 - Attach to an UE process
 - `ceUEDumper` menu item should appear at the top
 - Choose `Initialize UE reflection` to launch the scanner
-- (optional) choose `Attach to table` to embed the script to the Cheat Table as files
+- (optional) choose `Attach to table` to embed the script into the table
 
 An embedded copy can be loaded using this Lua script (lua script table or via a memrec AutoAssemble script)
 ```lua
@@ -95,7 +95,7 @@ Any feedback and contribution is welcomed!
 
 ## Support
 
-If you find the script useful, [consider supporting me here so I keep improving the tool](https://ko-fi.com/vesperpallens)
+If you find the script useful, consider supporting me here so I keep improving the tool
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/R6R813UKCL)
 
