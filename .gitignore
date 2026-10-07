@@ -1,2 +1,3 @@
 tests/
 /bridge/build*/
+.vscode/
