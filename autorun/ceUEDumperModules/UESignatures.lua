@@ -1,5 +1,5 @@
 --[[
-  ceUEDumperModules — a Cheat Engine Unreal Engine Dumper — Copyright (C) 2026 palepine
+  ceUEDumper — a Cheat Engine Unreal Engine Dumper — Copyright (C) 2026 palepine
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -44,6 +44,9 @@ local Module = {}
 --- FNamePool/GNames
 Module.GNames =
 {
+  --"48 8D 1D * * * * EB * 48 8D 0D * * * * E8 * * * * 48 8B D8 C6 05",
+  "4C 8D 3D * * * * EB * 48 8D 0D * * * * E8 * * * * 4C 8B F8 C6 05 * * * * * 48 8B 05 * * * * 48 85 C0 75 * E8 * * * * 48 8B C8 E8", -- 5.7
+  "48 8D 1D * * * * EB * 48 8D 0D * * * * E8 * * * * 48 8B D8 C6 05 * * * * * 48 8B 05 * * * * 48 85 C0 75 * E8 * * * * 48 8B C8 E8", -- 5.7
   "48 8D * * * * * E8 * * * * 4C 8B * C6 * * * * * * 48 8B * * * 48 8B * 48 C1 * * 8D * * 49 03 * * * E8 * * * * 83 * * * 74 * 8B * * 48 89",
   "48 8B 05 * * * * 48 85 * 75 * B9 * * * * 48 89 * * * E8 * * * * 48 8B * 48 85 * 74",
   "48 83 * * 48 8B 05 * * * * 48 85 * 75 * B9 * * * * 48 89 * * * E8 * * * * 48 89",
