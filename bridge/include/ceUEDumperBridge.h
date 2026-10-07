@@ -127,6 +127,15 @@ enum class CeueHookBackend : std::uint32_t
   ScriptDispatcher = 1,
 };
 
+enum class CeueInvocationStatus : std::uint32_t
+{
+  Queued = 1,
+  Running = 2,
+  Completed = 3,
+  Cancelled = 4,
+  Failed = 5,
+};
+
 CEUE_API std::uint32_t ceue_bridge_version();
 CEUE_API std::uint32_t ceue_bridge_abi();
 
@@ -187,6 +196,38 @@ CEUE_API std::uint32_t ceue_remove_all_bp_hooks();
 CEUE_API std::uint32_t ceue_get_hook_count();
 
 CEUE_API std::uint64_t ceue_get_hook_hit_count(void *handle);
+
+// Install UObject::ProcessEvent detour for queued calls on the process's oldest (packaged-game main/game) thread
+// ProcessEvent calls made by other target threads never drain the queue
+CEUE_API std::uint32_t ceue_configure_process_event_dispatcher( void *process_event );
+
+// Copy parameter buffer into bridge-owned storage and enqueue ProcessEvent
+// runs at least once
+// interval_dispatches counts ProcessEvent dispatcher visits between repeated executions (zero executes every visit)
+CEUE_API void *ceue_queue_process_event(
+                                        void *object,
+                                        void *ufunction,
+                                        const void *parameters,
+                                        std::uint32_t parameter_size,
+                                        std::uint32_t runs,
+                                        std::uint32_t interval_dispatches
+                                      );
+
+CEUE_API std::uint32_t ceue_get_invocation_status( void *handle );
+
+CEUE_API std::uint32_t ceue_get_invocation_completed_runs( void *handle );
+
+CEUE_API std::uint32_t ceue_copy_invocation_parameters( void *handle, void *destination, std::uint32_t capacity );
+
+CEUE_API std::uint32_t ceue_cancel_invocation( void *handle );
+
+CEUE_API std::uint32_t ceue_abandon_invocation( void *handle );
+
+CEUE_API std::uint32_t ceue_release_invocation( void *handle );
+
+CEUE_API std::uint32_t ceue_get_pending_invocation_count();
+
+CEUE_API std::uint32_t ceue_get_scheduler_thread_id();
 
 // returns required byte count including trailing NUL
 // passing a buffer copies as much as fits and always NUL-terminates it

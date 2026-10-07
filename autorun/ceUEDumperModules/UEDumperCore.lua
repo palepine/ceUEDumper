@@ -5335,6 +5335,21 @@ function Core.Signatures.resolveProcessEvent()
   return processEventAddress
 end
 
+--- Resolve & cache AActor::ProcessEvent-compatible fallback
+-- @return number|nil @ executable actor ProcessEvent entry point
+-- @return string|nil @ error
+function Core.Signatures.resolveActorProcessEvent()
+  if CUEDEFS and CUEDEFS.ActorProcessEvent and readByte(CUEDEFS.ActorProcessEvent) ~= nil then
+    return CUEDEFS.ActorProcessEvent
+  end
+
+  local processEventAddress = Core.Signatures.findFunctionEntryBySignatures('ActorProcessEvent')
+  if not processEventAddress then return nil, 'AActor::ProcessEvent signature was not found' end
+
+  CUEDEFS.ActorProcessEvent = processEventAddress
+  return processEventAddress
+end
+
 --- Convert an unsigned DWORD to a signed x64 displacement
 -- @param value number @ unsigned 32-bit value
 -- @return number @ signed value
@@ -7863,6 +7878,7 @@ Core.API.propertyMetadata = Core.Reflection.readPropertyMetadata
 Core.API.findContainingObject = Core.Objects.findContainingObject
 Core.API.status = Core.API.ue_getScannerStatusInternal
 Core.API.processEvent = Core.Signatures.resolveProcessEvent
+Core.API.actorProcessEvent = Core.Signatures.resolveActorProcessEvent
 Core.API.setMenuVisible = Core.Menu.setMenuVisible
 Core.API.isMenuVisible = Core.Menu.isMenuVisible
 Core.API.clearSavedLayout = Core.Persistence.clearCurrentLayout

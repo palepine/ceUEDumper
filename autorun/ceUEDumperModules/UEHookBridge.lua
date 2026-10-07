@@ -100,7 +100,26 @@ local EXPORT_NAMES =
   'ceue_remove_all_bp_hooks',
   'ceue_get_hook_count',
   'ceue_get_hook_hit_count',
+  'ceue_configure_process_event_dispatcher',
+  'ceue_queue_process_event',
+  'ceue_get_invocation_status',
+  'ceue_get_invocation_completed_runs',
+  'ceue_copy_invocation_parameters',
+  'ceue_cancel_invocation',
+  'ceue_abandon_invocation',
+  'ceue_release_invocation',
+  'ceue_get_pending_invocation_count',
+  'ceue_get_scheduler_thread_id',
   'ceue_get_last_error',
+}
+
+Module.InvocationStatus =
+{
+  queued = 1,
+  running = 2,
+  completed = 3,
+  cancelled = 4,
+  failed = 5,
 }
 
 local function integerArgument(value)
@@ -387,6 +406,70 @@ end
 
 function Module.hitCount(handle)
   return Module.callExport( 'ceue_get_hook_hit_count', handle )
+end
+
+function Module.configureProcessEventDispatcher(processEventAddress)
+  local result, callError = Module.callExport( 'ceue_configure_process_event_dispatcher', processEventAddress )
+  if result ~= 1 then return nil, callError or Module.lastError() end
+  return true
+end
+
+function Module.queueProcessEvent( objectAddress, functionAddress, parameterBuffer, parameterSize, runs, intervalDispatches )
+  local handle, callError = Module.callExport(
+                                                'ceue_queue_process_event',
+                                                objectAddress,
+                                                functionAddress,
+                                                parameterBuffer or 0,
+                                                parameterSize or 0,
+                                                runs or 1,
+                                                intervalDispatches or 0
+                                              )
+
+  if not handle or handle == 0 then return nil, callError or Module.lastError() end
+  return handle
+end
+
+function Module.invocationStatus(handle)
+  local status, callError = Module.callExport( 'ceue_get_invocation_status', handle )
+  if not status or status == 0 then return nil, callError or Module.lastError() end
+  return status
+end
+
+function Module.invocationCompletedRuns(handle)
+  return Module.callExport( 'ceue_get_invocation_completed_runs', handle )
+end
+
+function Module.copyInvocationParameters(handle, destination, capacity)
+  if capacity == 0 then return true end
+  local copied, callError = Module.callExport( 'ceue_copy_invocation_parameters', handle, destination, capacity )
+  if copied ~= capacity then return nil, callError or Module.lastError() end
+  return true
+end
+
+function Module.cancelInvocation(handle)
+  local result, callError = Module.callExport( 'ceue_cancel_invocation', handle )
+  if result ~= 1 then return nil, callError or Module.lastError() end
+  return true
+end
+
+function Module.abandonInvocation(handle)
+  local result, callError = Module.callExport( 'ceue_abandon_invocation', handle )
+  if result ~= 1 then return nil, callError or Module.lastError() end
+  return true
+end
+
+function Module.releaseInvocation(handle)
+  local result, callError = Module.callExport( 'ceue_release_invocation', handle )
+  if result ~= 1 then return nil, callError or Module.lastError() end
+  return true
+end
+
+function Module.pendingInvocationCount()
+  return Module.callExport('ceue_get_pending_invocation_count')
+end
+
+function Module.schedulerThreadId()
+  return Module.callExport('ceue_get_scheduler_thread_id')
 end
 
 return Module

@@ -70,6 +70,7 @@
 #include <MinHook.h>
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -77,6 +78,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -93,6 +95,7 @@ namespace
   constexpr std::uint32_t LocalsOffsetUnavailable = 0xFFFFFFFFu;
 
   using UnrealFunction = void(__fastcall *)(void *context, void *frame, void *result);
+  using ProcessEventFunction = void(__fastcall *)(void *object, void *ufunction, void *parameters);
 
   enum class HookBackend
   {
@@ -139,6 +142,19 @@ namespace
     Write writes[ MaximumWrites ]{};
   };
 
+  struct InvocationRecord
+  {
+    void *object{};
+    void *ufunction{};
+    std::vector<std::byte> parameters;
+    std::atomic<CeueInvocationStatus> status{ CeueInvocationStatus::Queued };
+    std::atomic<std::uint32_t> completed_runs{};
+    std::atomic<bool> release_when_terminal{};
+    std::uint32_t remaining_runs{ 1 };
+    std::uint32_t interval_dispatches{};
+    std::uint32_t dispatches_until_run{};
+  };
+
   std::mutex g_hook_mutex;
   std::unordered_set<HookRecord *> g_hooks;
   std::unordered_multimap<void *, HookRecord *> g_script_hooks;
@@ -151,6 +167,16 @@ namespace
   bool g_minhook_initialized{};
   bool g_script_dispatcher_created{};
   bool g_script_dispatcher_enabled{};
+  std::mutex g_invocation_mutex;
+  std::unordered_set<InvocationRecord *> g_invocations;
+  std::deque<InvocationRecord *> g_invocation_queue;
+  std::atomic<std::uint32_t> g_pending_invocation_count{};
+  std::atomic<std::uint32_t> g_active_process_event_dispatches{};
+  std::atomic<DWORD> g_scheduler_thread_id{};
+  ProcessEventFunction g_process_event_original{};
+  void *g_process_event_target{};
+  bool g_process_event_dispatcher_created{};
+  bool g_process_event_dispatcher_enabled{};
   thread_local std::string g_last_error;
 
   void set_error(std::string message)
@@ -188,6 +214,28 @@ namespace
     __try
     {
       *static_cast< volatile T * >(address) = value;
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
+
+  bool safe_copy( void *destination, const void *source, std::size_t size )
+  {
+    if (size == 0)
+    {
+      return true;
+    }
+    if ( !destination || !source )
+    {
+      return false;
+    }
+
+    __try
+    {
+      std::memcpy( destination, source, size );
       return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -234,6 +282,13 @@ namespace
     auto *record = static_cast< HookRecord * >(handle);
     std::scoped_lock lock(g_hook_mutex);
     return record && g_hooks.contains(record) && record->magic == HookMagic ? record : nullptr;
+  }
+
+  InvocationRecord *checked_invocation(void *handle)
+  {
+    auto *record = static_cast< InvocationRecord* >(handle);
+    std::scoped_lock lock( g_invocation_mutex );
+    return record && g_invocations.contains(record) ? record : nullptr;
   }
 
   void *resolve_source( HookRecord &record, CeueHookSource source, void *context, void *frame, void *result )
@@ -545,6 +600,128 @@ namespace
     g_active_script_dispatches.fetch_sub( 1, std::memory_order_release );
   }
 
+  DWORD find_primary_thread_id()
+  {
+    const DWORD process_id = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot( TH32CS_SNAPTHREAD, 0 );
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+      return 0;
+    }
+
+    DWORD selected_id{};
+    ULONGLONG earliest_creation = std::numeric_limits<ULONGLONG>::max();
+    THREADENTRY32 entry{ sizeof(entry) };
+
+    if ( Thread32First( snapshot, &entry ) )
+    {
+      do
+      {
+        if (entry.th32OwnerProcessID != process_id)
+        {
+          continue;
+        }
+
+        HANDLE thread = OpenThread( THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID );
+        if (!thread)
+        {
+          continue;
+        }
+
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        if ( GetThreadTimes( thread, &creation, &exit, &kernel, &user ) )
+        {
+          ULARGE_INTEGER value{};
+          value.LowPart = creation.dwLowDateTime;
+          value.HighPart = creation.dwHighDateTime;
+          if ( value.QuadPart < earliest_creation )
+          {
+            earliest_creation = value.QuadPart;
+            selected_id = entry.th32ThreadID;
+          }
+        }
+        CloseHandle(thread);
+      }
+      while ( Thread32Next( snapshot, &entry ) );
+    }
+
+    CloseHandle(snapshot);
+    return selected_id;
+  }
+
+  void drain_invocation_queue()
+  {
+    std::vector< InvocationRecord* > ready;
+
+    {
+      std::scoped_lock lock( g_invocation_mutex );
+      const std::size_t queued_count = g_invocation_queue.size();
+
+      for (std::size_t index = 0; index < queued_count; ++index)
+      {
+        auto *record = g_invocation_queue.front();
+        g_invocation_queue.pop_front();
+
+        if (record->status.load( std::memory_order_acquire ) == CeueInvocationStatus::Cancelled)
+        {
+          g_pending_invocation_count.fetch_sub( 1, std::memory_order_release );
+          continue;
+        }
+
+        if ( record->dispatches_until_run != 0 )
+        {
+          --record->dispatches_until_run;
+          g_invocation_queue.push_back(record);
+          continue;
+        }
+
+        record->status.store( CeueInvocationStatus::Running, std::memory_order_release );
+        g_pending_invocation_count.fetch_sub( 1, std::memory_order_release );
+        ready.push_back(record);
+      }
+    }
+
+    for (auto *record : ready)
+    {
+      g_process_event_original( record->object, record->ufunction, record->parameters.empty() ? nullptr : record->parameters.data() );
+
+      record->completed_runs.fetch_add( 1, std::memory_order_release );
+
+      std::scoped_lock lock( g_invocation_mutex );
+      if ( record->release_when_terminal.load( std::memory_order_acquire ) )
+      {
+        g_invocations.erase(record);
+        delete record;
+      }
+      else if ( record->remaining_runs > 1 )
+      {
+        --record->remaining_runs;
+        record->dispatches_until_run = record->interval_dispatches;
+        record->status.store( CeueInvocationStatus::Queued, std::memory_order_release );
+        g_invocation_queue.push_back(record);
+        g_pending_invocation_count.fetch_add( 1, std::memory_order_release );
+      }
+      else
+      {
+        record->remaining_runs = 0;
+        record->status.store( CeueInvocationStatus::Completed, std::memory_order_release );
+      }
+    }
+  }
+
+  void __fastcall dispatch_process_event( void *object, void *ufunction, void *parameters )
+  {
+    g_active_process_event_dispatches.fetch_add( 1, std::memory_order_acquire );
+    g_process_event_original( object, ufunction, parameters );
+
+    if ( g_pending_invocation_count.load( std::memory_order_acquire ) != 0 && GetCurrentThreadId() == g_scheduler_thread_id.load( std::memory_order_acquire ) )
+    {
+      drain_invocation_queue();
+    }
+
+    g_active_process_event_dispatches.fetch_sub( 1, std::memory_order_release );
+  }
+
   bool initialize_minhook()
   {
     if (g_minhook_initialized)
@@ -564,17 +741,17 @@ namespace
 
   bool enable_script_dispatcher()
   {
-    if (!g_script_dispatcher_created)
+    if ( !g_script_dispatcher_created )
     {
       set_error("ProcessLocalScriptFunction dispatcher is not configured");
       return false;
     }
-    if (g_script_dispatcher_enabled)
+    if ( g_script_dispatcher_enabled )
     {
       return true;
     }
 
-    const auto status = MH_EnableHook(g_script_dispatcher_target);
+    const auto status = MH_EnableHook( g_script_dispatcher_target );
     if ( status != MH_OK && status != MH_ERROR_ENABLED )
     {
       set_error( std::string("Could not enable ProcessLocalScriptFunction detour: ") + MH_StatusToString(status) );
@@ -591,7 +768,7 @@ namespace
       return true;
     }
 
-    const auto status = MH_DisableHook(g_script_dispatcher_target);
+    const auto status = MH_DisableHook( g_script_dispatcher_target );
     if ( status != MH_OK && status != MH_ERROR_DISABLED )
     {
       set_error( std::string("Could not disable ProcessLocalScriptFunction detour: ") + MH_StatusToString(status) );
@@ -722,10 +899,287 @@ std::uint32_t ceue_bridge_abi()
   return 1;
 }
 
+std::uint32_t ceue_configure_process_event_dispatcher(void *process_event)
+{
+  g_last_error.clear();
+  if ( !process_event )
+  {
+    set_error("Invalid UObject::ProcessEvent address");
+    return 0;
+  }
+
+  std::scoped_lock lock(g_invocation_mutex);
+  if ( g_process_event_dispatcher_created && g_process_event_target == process_event )
+  {
+    return 1;
+  }
+  if ( !g_invocation_queue.empty() )
+  {
+    set_error("ProcessEvent dispatcher cannot change while invocations are queued");
+    return 0;
+  }
+  if ( g_active_process_event_dispatches.load( std::memory_order_acquire ) != 0 )
+  {
+    set_error("ProcessEvent dispatcher cannot change while it is active");
+    return 0;
+  }
+
+  if ( g_process_event_dispatcher_created )
+  {
+    const auto disable_status = MH_DisableHook( g_process_event_target );
+    if (disable_status != MH_OK && disable_status != MH_ERROR_DISABLED)
+    {
+      set_error( std::string("Could not disable ProcessEvent detour: ") + MH_StatusToString(disable_status) );
+      return 0;
+    }
+
+    while ( g_active_process_event_dispatches.load( std::memory_order_acquire ) != 0 )
+    {
+      SwitchToThread();
+    }
+
+    const auto remove_status = MH_RemoveHook(g_process_event_target);
+    if ( remove_status != MH_OK && remove_status != MH_ERROR_NOT_CREATED )
+    {
+      set_error( std::string("Could not replace ProcessEvent detour: ") + MH_StatusToString(remove_status) );
+      return 0;
+    }
+    g_process_event_dispatcher_created = false;
+    g_process_event_dispatcher_enabled = false;
+    g_process_event_target = nullptr;
+    g_process_event_original = nullptr;
+  }
+
+  if ( !initialize_minhook() )
+  {
+    return 0;
+  }
+
+  const auto create_status = MH_CreateHook( process_event, reinterpret_cast<void *>(&dispatch_process_event), reinterpret_cast<void **>(&g_process_event_original) );
+  if ( create_status != MH_OK )
+  {
+    set_error( std::string("Could not create ProcessEvent detour: ") + MH_StatusToString(create_status) );
+    return 0;
+  }
+
+  const auto enable_status = MH_EnableHook(process_event);
+  if ( enable_status != MH_OK && enable_status != MH_ERROR_ENABLED )
+  {
+    MH_RemoveHook(process_event);
+    g_process_event_original = nullptr;
+    set_error( std::string("Could not enable ProcessEvent detour: ") + MH_StatusToString(enable_status) );
+    return 0;
+  }
+
+  const DWORD scheduler_thread = find_primary_thread_id();
+  if (scheduler_thread == 0)
+  {
+    MH_DisableHook(process_event);
+    MH_RemoveHook(process_event);
+    g_process_event_original = nullptr;
+    set_error("Could not identify the target process primary/game thread");
+    return 0;
+  }
+
+  g_scheduler_thread_id.store( scheduler_thread, std::memory_order_release );
+  g_process_event_target = process_event;
+  g_process_event_dispatcher_created = true;
+  g_process_event_dispatcher_enabled = true;
+  return 1;
+}
+
+void *ceue_queue_process_event(
+                                void *object,
+                                void *ufunction,
+                                const void *parameters,
+                                std::uint32_t parameter_size,
+                                std::uint32_t runs,
+                                std::uint32_t interval_dispatches
+                              )
+{
+  g_last_error.clear();
+  if ( !object || !ufunction || runs == 0 || (parameter_size != 0 && !parameters) )
+  {
+    set_error("Invalid queued ProcessEvent object, function, parameters, or run count");
+    return nullptr;
+  }
+
+  auto record = std::make_unique<InvocationRecord>();
+  record->object = object;
+  record->ufunction = ufunction;
+  record->remaining_runs = runs;
+  record->interval_dispatches = interval_dispatches;
+
+  if (parameter_size != 0)
+  {
+    record->parameters.resize(parameter_size);
+    if ( !safe_copy( record->parameters.data(), parameters, parameter_size ) )
+    {
+      set_error("Queued ProcessEvent parameter buffer is unreadable");
+      return nullptr;
+    }
+  }
+
+  auto *handle = record.release();
+  {
+    std::scoped_lock lock(g_invocation_mutex);
+    if ( !g_process_event_dispatcher_enabled || !g_process_event_original )
+    {
+      delete handle;
+      set_error("ProcessEvent game-thread dispatcher is not configured");
+      return nullptr;
+    }
+    g_invocations.insert(handle);
+    g_invocation_queue.push_back(handle);
+    g_pending_invocation_count.fetch_add( 1, std::memory_order_release );
+  }
+  return handle;
+}
+
+std::uint32_t ceue_get_invocation_status(void *handle)
+{
+  auto *record = checked_invocation(handle);
+  if (!record)
+  {
+    set_error("Invalid queued invocation handle");
+    return 0;
+  }
+  return static_cast<std::uint32_t>( record->status.load(std::memory_order_acquire) );
+}
+
+std::uint32_t ceue_get_invocation_completed_runs(void *handle)
+{
+  auto *record = checked_invocation(handle);
+  if (!record)
+  {
+    set_error("Invalid queued invocation handle");
+    return 0;
+  }
+  return record->completed_runs.load( std::memory_order_acquire );
+}
+
+std::uint32_t ceue_copy_invocation_parameters( void *handle, void *destination, std::uint32_t capacity )
+{
+  auto *record = checked_invocation(handle);
+  if ( !record || (!destination && !record->parameters.empty()) || capacity < record->parameters.size() )
+  {
+    set_error("Invalid invocation handle or output parameter capacity");
+    return 0;
+  }
+
+  const auto status = record->status.load( std::memory_order_acquire );
+  if ( status != CeueInvocationStatus::Completed && status != CeueInvocationStatus::Cancelled )
+  {
+    set_error("Queued invocation has not reached a terminal state");
+    return 0;
+  }
+
+  if ( !record->parameters.empty() )
+  {
+    if ( !safe_copy( destination, record->parameters.data(), record->parameters.size() ) )
+    {
+      set_error("Invocation output destination is unreadable");
+      return 0;
+    }
+  }
+  return static_cast<std::uint32_t>( record->parameters.size() );
+}
+
+std::uint32_t ceue_cancel_invocation(void *handle)
+{
+  auto *record = static_cast< InvocationRecord* >(handle);
+  std::scoped_lock lock( g_invocation_mutex );
+  if ( !record || !g_invocations.contains(record) )
+  {
+    set_error("Invalid queued invocation handle");
+    return 0;
+  }
+
+  const auto status = record->status.load( std::memory_order_acquire );
+  if (status == CeueInvocationStatus::Running)
+  {
+    set_error("Invocation is already running on the game thread");
+    return 0;
+  }
+  if ( status == CeueInvocationStatus::Completed || status == CeueInvocationStatus::Cancelled )
+  {
+    return 1;
+  }
+
+  const auto iterator = std::find( g_invocation_queue.begin(), g_invocation_queue.end(), record );
+  if ( iterator != g_invocation_queue.end() )
+  {
+    g_invocation_queue.erase(iterator);
+    g_pending_invocation_count.fetch_sub( 1, std::memory_order_release );
+  }
+  record->status.store( CeueInvocationStatus::Cancelled, std::memory_order_release );
+  return 1;
+}
+
+std::uint32_t ceue_abandon_invocation(void *handle)
+{
+  auto *record = static_cast< InvocationRecord* >(handle);
+  std::scoped_lock lock( g_invocation_mutex );
+  if ( !record || !g_invocations.contains(record) )
+  {
+    set_error("Invalid queued invocation handle");
+    return 0;
+  }
+
+  if ( record->status.load( std::memory_order_acquire ) == CeueInvocationStatus::Running )
+  {
+    record->release_when_terminal.store( true, std::memory_order_release );
+    return 1;
+  }
+
+  const auto iterator = std::find( g_invocation_queue.begin(), g_invocation_queue.end(), record );
+  if ( iterator != g_invocation_queue.end() )
+  {
+    g_invocation_queue.erase(iterator);
+    g_pending_invocation_count.fetch_sub( 1, std::memory_order_release );
+  }
+  g_invocations.erase(record);
+  delete record;
+  return 1;
+}
+
+std::uint32_t ceue_release_invocation(void *handle)
+{
+  auto *record = static_cast< InvocationRecord* >(handle);
+  {
+    std::scoped_lock lock( g_invocation_mutex );
+    if ( !record || !g_invocations.contains(record) )
+    {
+      set_error("Invalid queued invocation handle");
+      return 0;
+    }
+
+    const auto status = record->status.load( std::memory_order_acquire );
+    if ( status != CeueInvocationStatus::Completed && status != CeueInvocationStatus::Cancelled && status != CeueInvocationStatus::Failed )
+    {
+      set_error("Queued invocation must complete or be cancelled before release");
+      return 0;
+    }
+    g_invocations.erase(record);
+  }
+  delete record;
+  return 1;
+}
+
+std::uint32_t ceue_get_pending_invocation_count()
+{
+  return g_pending_invocation_count.load( std::memory_order_acquire );
+}
+
+std::uint32_t ceue_get_scheduler_thread_id()
+{
+  return g_scheduler_thread_id.load( std::memory_order_acquire );
+}
+
 void *ceue_create_bp_hook( void *ufunction, std::uint32_t function_pointer_offset, void *expected_original, void **object_pointer, std::uint32_t flags )
 {
   g_last_error.clear();
-  if (!ufunction || function_pointer_offset == 0 || function_pointer_offset > 0x1000)
+  if ( !ufunction || function_pointer_offset == 0 || function_pointer_offset > 0x1000 )
   {
     set_error("Invalid UFunction address or Func offset");
     return nullptr;

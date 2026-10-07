@@ -905,11 +905,66 @@ function Module.Functions.functionForObject(objectAddress, functionName)
   return nil, 'UFunction was not found: ' .. functionName
 end
 
---- Resolve the standalone UObject::ProcessEvent entry point
--- @return number|nil @ executable function address
--- @return string|nil @ signature error
-function Module.Functions.processEvent()
-  return Core.processEvent()
+-- UObject vtable byte offsets from UE's versioned UObject layouts
+local PROCESS_EVENT_VTABLE_OFFSETS =
+{
+  [5] =
+  {
+    [7] = 0x260,
+  },
+}
+
+--- Resolve UObject::ProcessEvent for UObject
+-- @param objectAddress number|nil @ target UObject used for virtual dispatch
+-- @param requestedVtableOffset number|nil @ explicit UObject::ProcessEvent slot
+-- @param mode string|nil @ auto, vtable, signature, or actor-signature
+-- @return number|nil @ executable ProcessEvent address
+-- @return string|nil @ resolution error
+-- @return string|nil @ vtable or signature
+-- @return number|nil @ selected vtable byte offset
+function Module.Functions.processEvent(objectAddress, requestedVtableOffset, mode)
+  mode = mode or 'auto'
+
+  if mode ~= 'auto' and mode ~= 'vtable' and mode ~= 'signature' and mode ~= 'actor-signature' then
+    return nil, 'Unsupported ProcessEvent mode: ' .. tostring(mode)
+  end
+
+  if mode == 'actor-signature' then
+    local objectClass = Module.Objects.objectClass(objectAddress)
+    local actorClass = Module.Objects.findType( 'Actor', 'Class' )
+
+    if not actorClass or not Module.Objects.classDerivesFrom( objectClass, actorClass ) then
+      return nil, 'actor-signature requires an AActor instance'
+    end
+
+    local actorAddress, actorError = Core.actorProcessEvent()
+    if actorAddress then return actorAddress, nil, 'actor-signature' end
+    return nil, actorError
+  end
+
+  local definitions = Core.definitions()
+  local configuredOffset = definitions and definitions.UObject and definitions.UObject.ProcessEventVTableOffset
+  local version = Core.getEngineVersion()
+  local versionOffsets = version and PROCESS_EVENT_VTABLE_OFFSETS[version.major]
+  local versionOffset = versionOffsets and versionOffsets[version.minor]
+  local vtableOffset = type(requestedVtableOffset) == 'number' and requestedVtableOffset or type(configuredOffset) == 'number' and configuredOffset or versionOffset
+
+  if mode ~= 'signature' and isValidAddress(objectAddress) and type(vtableOffset) == 'number' then
+    local vtableAddress = readPointer(objectAddress)
+    local virtualFunction = isValidAddress(vtableAddress) and readPointer( vtableAddress + vtableOffset ) or nil
+
+    if isExecutableAddress(virtualFunction) then
+      return virtualFunction, nil, 'vtable', vtableOffset
+    end
+  end
+
+  if mode == 'vtable' then
+    return nil, 'UObject::ProcessEvent was not resolved from the requested vtable slot'
+  end
+
+  local signatureAddress, signatureError = Core.processEvent()
+  if signatureAddress then return signatureAddress, nil, 'signature' end
+  return nil, signatureError or 'UObject::ProcessEvent was not resolved'
 end
 
 --- Read and validate one possible UStruct::Script TArray<uint8>
@@ -1120,10 +1175,25 @@ function Module.Functions.functionMetadata(functionAddress)
     local numParms = readBytes( functionAddress + layout.NumParms, 1, false )
     local parmsSize = readUnsignedWord( functionAddress + layout.ParmsSize )
     local returnValueOffset = readUnsignedWord( functionAddress + layout.ReturnValueOffset )
+    
+    -- Func + 0x00 -> executable FNativeFuncPtr
+    -- Func + 0x00 -> callable context
+    -- Func + 0x08 -> executable callback
     local rawFunctionPointer = readPointer( functionAddress + layout.Func )
-    local functionPointerIsReadable = isValidAddress(rawFunctionPointer) and readByte(rawFunctionPointer) ~= nil
-    local functionPointer = functionPointerIsReadable and rawFunctionPointer or nil
-    local functionPointerIsExecutable = functionPointerIsReadable and isExecutableAddress(functionPointer)
+    local directFunctionIsReadable = isValidAddress(rawFunctionPointer) and readByte(rawFunctionPointer) ~= nil
+    local directFunctionIsExecutable = directFunctionIsReadable and isExecutableAddress(rawFunctionPointer)
+    local pairedFunctionPointer = readPointer( functionAddress + layout.Func + PTR_SIZE )
+    local pairedFunctionIsExecutable = directFunctionIsReadable and isValidAddress(pairedFunctionPointer) and isExecutableAddress(pairedFunctionPointer)
+
+    local functionStorage = directFunctionIsExecutable and 'direct'
+                            or pairedFunctionIsExecutable and 'callable-pair'
+                            or directFunctionIsReadable and 'unresolved'
+                            or 'unavailable'
+
+    local functionPointer = directFunctionIsExecutable and rawFunctionPointer or pairedFunctionIsExecutable and pairedFunctionPointer or nil
+    local functionCallableOffset = pairedFunctionIsExecutable and layout.Func + PTR_SIZE or layout.Func
+    local functionPointerIsReadable = functionPointer ~= nil
+    local functionPointerIsExecutable = functionPointer ~= nil
     local headerValuesReadable = type(numParms) == 'number' and type(parmsSize) == 'number' and type(returnValueOffset) == 'number'
     local returnIsValid = headerValuesReadable and ( returnValueOffset == 0xFFFF or returnValueOffset <= parmsSize )
     local reflectedReturnMatches = reflectedReturnOffset and returnValueOffset == reflectedReturnOffset or not reflectedReturnOffset and returnValueOffset == 0xFFFF
@@ -1154,6 +1224,7 @@ function Module.Functions.functionMetadata(functionAddress)
         eventGraphFunctionOffset = layout.EventGraphFunction,
         eventGraphCallOffsetOffset = layout.EventGraphCallOffset,
         functionPointerOffset = layout.Func,
+        functionCallableOffset = functionCallableOffset,
         numParms = numParms,
         parmsSize = parmsSize,
         returnValueOffset = returnValueOffset,
@@ -1164,9 +1235,11 @@ function Module.Functions.functionMetadata(functionAddress)
         eventGraphCallOffset = layout.EventGraphCallOffset and readInteger( functionAddress + layout.EventGraphCallOffset ) or nil,
         functionPointer = functionPointer,
         rawFunctionPointer = rawFunctionPointer,
+        functionContextPointer = functionStorage == 'callable-pair' and rawFunctionPointer or nil,
+        pairedFunctionPointer = pairedFunctionPointer,
         functionPointerIsReadable = functionPointerIsReadable,
         functionPointerIsExecutable = functionPointerIsExecutable,
-        functionStorage = functionPointerIsExecutable and 'direct' or functionPointerIsReadable and 'callable-wrapper' or 'unavailable',
+        functionStorage = functionStorage,
         native = functionFlags & 0x00000400 ~= 0,
         blueprintCallable = functionFlags & 0x04000000 ~= 0,
         blueprintEvent = functionFlags & 0x08000000 ~= 0,
