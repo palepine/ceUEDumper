@@ -30,6 +30,7 @@
 | `ue_restoreAllFunctionPatches(options)`            | Restore all active bytecode patches                     |
 | `ue_getFunctionPatches(function)`                  | List active reversible patches                          |
 | `ue_callFunction(this, name, arguments, options)`  | Invoke `UFunction` for an object                       |
+| `ue_hookBlueprintFunction(objectPointer, name, options)` | Install a retargetable native Blueprint hook |
 | `ue_enumProperties(class)`                         | Enumerate properties for class name UClass addr        |
 | `ue_getPropertyOffset(class, property)`            | Resolve one property offset                            |
 | `ue_enumObjectProperties(this)`                    | Enumerate class properties via object                  |
@@ -580,7 +581,7 @@ Keys in `outputValues` must match the UFunction parameter names.
 ```lua
 local functionAddress = assert( ue_findFunction( 'BP_ThirdPersonCharacter_C', 'CheckStuff' ) )
 
-local patch, patchError = ue_patchFunctionOutputs( functionAddress, { HasSomething = true } )
+local patch, patchError = ue_patchFunctionOutputs( functionAddress, { HaveBullets = true } )
 
 assert( ue_restoreFunctionPatch(patch) ) -- restoring
 ```
@@ -691,6 +692,90 @@ for name, value in pairs(result.outParameters) do
   print('out:', name, value)
 end
 ```
+
+### BP function hooks
+
+#### `ue_hookBlueprintFunction(objectPointerAddress, functionName, options)`
+
+Hook a non-native BP function.
+The first param is a pointer containing the UObject,
+it must be of the same type or nullptr if overwritten
+
+```lua
+local options =
+{
+  -- allInstances = true, -- to affect all instances
+
+  -- every condition must match
+  conditions =
+  {
+    {
+      source = 'self', -- this
+      property = 'bIsDead',
+      value = true  -- this->bIsDead == true
+    },
+    {
+      parameter = 'ActionIndex',
+      operation = 'eq',
+      value = 3 -- ActionIndex == 3
+    },
+  },
+
+  writes =
+  {
+    {
+      result = true,
+      phase = 'after', -- or 'before' to write before
+      value = false
+    },
+
+    {
+      parameter = 'WasHandled',
+      phase = 'after',
+      value = true
+    },
+  },
+  skipOriginal = true,
+}
+
+local enemyPointer = allocateMemory(8)
+writePointer( enemyPointer, enemyComponent )
+
+local hook, err = ue_hookBlueprintFunction( enemyPointer, 'CanPerformSharedAction', options )
+assert(hook, err)
+
+-- writePointer( enemyPointer, 0 ) -- every call now falls through to original
+-- update the enemy object
+writePointer( enemyPointer, newEnemyComponent )
+
+-- temp switch without destroying hook record
+assert( ue_setBlueprintHookEnabled(hook, false) )
+assert( ue_setBlueprintHookEnabled(hook, true) )
+
+-- unhook and restore
+assert( ue_removeBlueprintHook(hook) )
+-- assert( ue_removeAllBlueprintHooks() )
+
+-- only after removing the hook, UB otherwise
+deAlloc(enemyPointer)
+
+-- return ue_getBlueprintHooks()
+```
+
+Notes:
+
+| Form | Meaning |
+|---|---|
+| `{ parameter='Name', value=... }` | `FFrame::Locals + parameter offset` |
+| `{ result=true, value=... }` | `RESULT_DECL` |
+| `{ source='self', property='Name', value=... }` | `this->Name` |
+| `{ source='self', offset=0x120, type='i32', value=... }` | Raw location |
+
+Scalar types: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `pointer`
+
+Conditionals: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `anyBits`, `allBits`
+
+`frameLocalsOffset` defaults to `0x20`
 
 
 ## Cleanup
