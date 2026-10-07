@@ -18,6 +18,7 @@
 local Module =
 {
   ABI = 1,
+  DEFAULT_FRAME_NODE_OFFSET = 0x08,
   DEFAULT_FRAME_LOCALS_OFFSET = 0x20,
   BRIDGE_ATTACHMENT_NAME = 'ceUEDumper.ceUEDumperBridge.dll',
   State =
@@ -89,6 +90,8 @@ local EXPORT_NAMES =
   'ceue_bridge_version',
   'ceue_bridge_abi',
   'ceue_create_bp_hook',
+  'ceue_configure_script_dispatcher',
+  'ceue_create_script_hook',
   'ceue_set_frame_locals_offset',
   'ceue_add_condition',
   'ceue_add_write',
@@ -96,6 +99,7 @@ local EXPORT_NAMES =
   'ceue_remove_bp_hook',
   'ceue_remove_all_bp_hooks',
   'ceue_get_hook_count',
+  'ceue_get_hook_hit_count',
   'ceue_get_last_error',
 }
 
@@ -311,6 +315,20 @@ function Module.create( functionAddress, functionPointerOffset, functionPointer,
   return handle
 end
 
+function Module.configureScriptDispatcher( dispatcherAddress, frameNodeOffset )
+  local result, callError = Module.callExport( 'ceue_configure_script_dispatcher', dispatcherAddress, frameNodeOffset or Module.DEFAULT_FRAME_NODE_OFFSET )
+
+  if result ~= 1 then return nil, callError or Module.lastError() end
+  return true
+end
+
+function Module.createScript( functionAddress, objectPointerAddress, skipOriginal )
+  local handle, callError = Module.callExport( 'ceue_create_script_hook', functionAddress, objectPointerAddress or 0, skipOriginal and 1 or 0 )
+  
+  if not handle or handle == 0 then return nil, callError or Module.lastError() end
+  return handle
+end
+
 function Module.setFrameLocalsOffset( handle, offset )
   local result, callError = Module.callExport( 'ceue_set_frame_locals_offset', handle, offset )
   if result ~= 1 then return nil, callError or Module.lastError() end
@@ -365,6 +383,10 @@ end
 
 function Module.count()
   return Module.callExport('ceue_get_hook_count')
+end
+
+function Module.hitCount(handle)
+  return Module.callExport( 'ceue_get_hook_hit_count', handle )
 end
 
 return Module

@@ -3936,6 +3936,143 @@ function Dumper.Hooks.normalizeDescriptor(objectAddress, metadata, descriptor)
   }
 end
 
+--- Resolve direct relative branch and follow simple linker jump stubs
+-- @param instructionAddress number @ CALL/JMP instruction or already-resolved entry
+-- @param isCall boolean @ decode CALL when true, JMP when false
+-- @return number|nil @ executable destination
+function Dumper.Hooks.resolveBranchTarget(instructionAddress, isCall)
+  local opcodeOffset = 0
+  local firstByte = readByte(instructionAddress)
+
+  if firstByte and firstByte >= 0x40 and firstByte <= 0x4F then
+    opcodeOffset = 1
+    firstByte = readByte( instructionAddress + opcodeOffset )
+  end
+
+  local destination
+  local expectedRelativeOpcode = isCall and 0xE8 or 0xE9
+
+  if firstByte == expectedRelativeOpcode then
+    local displacement = readInteger( instructionAddress + opcodeOffset + 1 )
+    if displacement == nil then return nil end
+    if displacement >= 0x80000000 then displacement = displacement - 0x100000000 end
+    destination = instructionAddress + opcodeOffset + 5 + displacement
+
+  elseif firstByte == 0xFF and readByte( instructionAddress + opcodeOffset + 1 ) == (isCall and 0x15 or 0x25) then
+    local displacement = readInteger( instructionAddress + opcodeOffset + 2 )
+    if displacement == nil then return nil end
+    if displacement >= 0x80000000 then displacement = displacement - 0x100000000 end
+    destination = readPointer( instructionAddress + opcodeOffset + 6 + displacement )
+  elseif not isCall then
+    destination = instructionAddress
+  end
+
+  if not destination or destination == 0 then return nil end
+
+  -- follow short/near import and linker thunks, humble implementation
+  for _ = 1, 4 do
+    local opcode = readByte(destination)
+
+    if opcode == 0xE9 then
+      local displacement = readInteger(destination + 1)
+      if displacement == nil then break end
+      if displacement >= 0x80000000 then displacement = displacement - 0x100000000 end
+      destination = destination + 5 + displacement
+    elseif opcode == 0xEB then
+      local displacement = readBytes(destination + 1, 1, false)
+      if displacement == nil then break end
+      if displacement >= 0x80 then displacement = displacement - 0x100 end
+      destination = destination + 2 + displacement
+    elseif opcode == 0xFF and readByte(destination + 1) == 0x25 then
+      local displacement = readInteger(destination + 2)
+      if displacement == nil then break end
+      if displacement >= 0x80000000 then displacement = displacement - 0x100000000 end
+      destination = readPointer(destination + 6 + displacement)
+      if not destination then break end
+    else
+      break
+    end
+  end
+
+  return destination and readByte(destination) ~= nil and destination or nil
+end
+
+--- Derive ProcessLocalScriptFunction from a non-native UFunction Func target
+-- @param processInternalAddress number @ non-native UFunction::Func
+-- @return number|nil @ ProcessLocalScriptFunction entry
+-- @return string|nil @ diagnostic
+function Dumper.Hooks.resolveProcessLocalScriptFunction(processInternalAddress)
+  -- UE4SS/UEPseudo (MIT, Copyright 2022 Narknon)
+  -- UEPseudo obtains ProcessInternal from Object:ExecuteUbergraph on UE 4.22+,
+  -- resolves the third CALL in its first 164 bytes.
+  -- here the target UFunction already supplies that same ProcessInternal pointer
+
+  local processInternal = Dumper.Hooks.resolveBranchTarget( processInternalAddress, false )
+  if not processInternal then return nil, 'ProcessInternal entry point is unreadable' end
+
+  local instructionAddress = processInternal
+  local endAddress = processInternal + 164
+  local callCount = 0
+
+  while instructionAddress < endAddress do
+    local instructionSize = getInstructionSize(instructionAddress)
+    if type(instructionSize) ~= 'number' or instructionSize <= 0 then
+      return nil, ('Could not decode ProcessInternal at +0x%X'):format( instructionAddress - processInternal )
+    end
+
+    local _, _, opcodeText = splitDisassembledString( disassemble(instructionAddress) )
+    local mnemonic = type(opcodeText) == 'string' and opcodeText:match('^%s*([%a]+)')
+
+    if mnemonic and mnemonic:lower() == 'call' then
+      callCount = callCount + 1
+
+      if callCount == 3 then
+        local target = Dumper.Hooks.resolveBranchTarget( instructionAddress, true )
+        if target then return target end
+        return nil, 'The third ProcessInternal call target could not be resolved'
+      end
+    end
+
+    instructionAddress = instructionAddress + instructionSize
+  end
+
+  return nil, ('ProcessInternal exposed only %d call(s) in the inspected prologue'):format(callCount)
+end
+
+--- Select global BP VM dispatcher for a script hook
+-- @param metadata table @ target non-native UFunction metadata
+-- @param options table @ hook options
+-- @return number|nil @ dispatcher address
+-- @return string|nil @ selected backend label
+-- @return string|nil @ error
+function Dumper.Hooks.resolveScriptDispatcher(metadata, options)
+  local requested = options.backend or 'auto'
+  local explicitAddress = options.scriptDispatcherAddress or options.processLocalScriptFunctionAddress
+  local processInternal = Dumper.Hooks.resolveBranchTarget( metadata.functionPointer, false )
+
+  if not processInternal then return nil, nil, 'ProcessInternal entry point is unreadable' end
+
+  if explicitAddress ~= nil then
+    if type(explicitAddress) ~= 'number' or explicitAddress == 0 or readByte(explicitAddress) == nil then
+      return nil, nil, 'scriptDispatcherAddress must be a readable executable address'
+    end
+    return explicitAddress, 'script-explicit'
+  end
+
+  if requested == 'processInternal' then
+    return processInternal, 'processInternal'
+  end
+
+  local dispatcher, resolveError = Dumper.Hooks.resolveProcessLocalScriptFunction(metadata.functionPointer)
+  if dispatcher then return dispatcher, 'processLocalScriptFunction' end
+
+  if requested == 'auto' then
+    return processInternal, 'processInternal-fallback'
+  end
+
+  return nil, nil, resolveError
+end
+
 --- Install BP hook using an updateable UObject pointer cell
 -- @param objectPointerAddress number @ address containing UObject
 -- @param functionName string @ reflected Blueprint function name
@@ -3957,7 +4094,17 @@ function Dumper.Hooks.ue_hookBlueprintFunction(objectPointerAddress, functionNam
   local metadata, metadataError = Backend.functionMetadata(functionAddress)
   if not metadata then return nil, metadataError end
   if metadata.native then return nil, 'Native UFunctions are outside the Blueprint-hook bridge scope' end
-  if not metadata.functionPointer or not metadata.functionPointerOffset then return nil, 'UFunction::Func metadata is unavailable' end
+  if not metadata.functionPointer then return nil, 'UFunction::Func metadata is unavailable' end
+
+  local requestedBackend = options.backend or 'auto'
+  if requestedBackend == 'functionPointer' then requestedBackend = 'func' end
+  if requestedBackend ~= 'auto'
+     and requestedBackend ~= 'script'
+     and requestedBackend ~= 'processInternal'
+     and requestedBackend ~= 'func'
+  then
+    return nil, 'backend must be auto, script, processInternal, or func'
+  end
 
   local loaded, loadError = Dumper.Runtime.onMainThread( HookBridge.load, options.bridgePath )
   if not loaded then return nil, loadError end
@@ -3999,13 +4146,34 @@ function Dumper.Hooks.ue_hookBlueprintFunction(objectPointerAddress, functionNam
     return nil, 'frameLocalsOffset is required for parameter conditions/writes'
   end
 
-  local nativeHandle, createError = HookBridge.create(
-                                                        functionAddress,
-                                                        metadata.functionPointerOffset,
-                                                        metadata.functionPointer,
-                                                        nativeObjectPointer,
-                                                        options.skipOriginal == true
-                                                      )
+  local selectedBackend = requestedBackend
+  local scriptDispatcherAddress
+  local nativeHandle
+  local createError
+
+  if requestedBackend == 'func' then
+    if not metadata.functionPointerOffset then return nil, 'UFunction::Func offset is unavailable' end
+
+    nativeHandle, createError = HookBridge.create(
+                                                   functionAddress,
+                                                   metadata.functionPointerOffset,
+                                                   metadata.functionPointer,
+                                                   nativeObjectPointer,
+                                                   options.skipOriginal == true
+                                                 )
+  else
+    scriptDispatcherAddress, selectedBackend, createError = Dumper.Hooks.resolveScriptDispatcher( metadata, options )
+    if not scriptDispatcherAddress then return nil, createError end
+
+    local frameNodeOffset = options.frameNodeOffset or HookBridge.DEFAULT_FRAME_NODE_OFFSET
+    if type(frameNodeOffset) ~= 'number' or frameNodeOffset < 0 then return nil, 'frameNodeOffset must be non-negative' end
+
+    local dispatcherReady, dispatcherError = HookBridge.configureScriptDispatcher( scriptDispatcherAddress, frameNodeOffset )
+    if not dispatcherReady then return nil, dispatcherError end
+
+    nativeHandle, createError = HookBridge.createScript( functionAddress, nativeObjectPointer, options.skipOriginal == true )
+  end
+
   if not nativeHandle then return nil, createError end
 
   local configured, configurationError = xpcall(
@@ -4031,25 +4199,28 @@ function Dumper.Hooks.ue_hookBlueprintFunction(objectPointerAddress, functionNam
     allInstances = options.allInstances == true,
     functionAddress = functionAddress,
     functionName = functionName,
+    backend = selectedBackend,
+    scriptDispatcherAddress = scriptDispatcherAddress,
     metadata = metadata,
     conditions = normalizedConditions,
     writes = normalizedWrites,
     skipOriginal = options.skipOriginal == true,
     frameLocalsOffset = requiresLocals and frameLocalsOffset or nil,
+    frameNodeOffset = scriptDispatcherAddress and (options.frameNodeOffset or HookBridge.DEFAULT_FRAME_NODE_OFFSET) or nil,
   }
 
   sharedResources.blueprintHooks.active[nativeHandle] = hook
   return hook
 end
 
---- Temp enable/disable BP hook (no dtoring)
+--- Temporarily enable or disable a BP hook without destroying its record
 function Dumper.Hooks.ue_setBlueprintHookEnabled(hookOrHandle, enabled)
   local handle = type(hookOrHandle) == 'table' and hookOrHandle.nativeHandle or hookOrHandle
   if type(handle) ~= 'number' or handle == 0 then return nil, 'Invalid Blueprint hook handle' end
   return HookBridge.enable( handle, enabled ~= false )
 end
 
---- Restore UFunction::Func and retire BP hook record
+--- Disable the selected backend and retire its BP hook record
 function Dumper.Hooks.ue_removeBlueprintHook(hookOrHandle)
   local handle = type(hookOrHandle) == 'table' and hookOrHandle.nativeHandle or hookOrHandle
   if type(handle) ~= 'number' or handle == 0 then return nil, 'Invalid Blueprint hook handle' end
@@ -4074,6 +4245,13 @@ function Dumper.Hooks.ue_getBlueprintHooks()
   local result = {}
   for handle, hook in pairs(sharedResources.blueprintHooks.active) do result[handle] = hook end
   return result
+end
+
+--- Return number of matching invocations observed by one hook
+function Dumper.Hooks.ue_getBlueprintHookHitCount(hookOrHandle)
+  local handle = type(hookOrHandle) == 'table' and hookOrHandle.nativeHandle or hookOrHandle
+  if type(handle) ~= 'number' or handle == 0 then return nil, 'Invalid Blueprint hook handle' end
+  return HookBridge.hitCount(handle)
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// TEXT DUMPS
@@ -4585,6 +4763,7 @@ Dumper.API =
   ue_removeBlueprintHook = Dumper.Hooks.ue_removeBlueprintHook,
   ue_removeAllBlueprintHooks = Dumper.Hooks.ue_removeAllBlueprintHooks,
   ue_getBlueprintHooks = Dumper.Hooks.ue_getBlueprintHooks,
+  ue_getBlueprintHookHitCount = Dumper.Hooks.ue_getBlueprintHookHitCount,
   ue_dumpFNames = Dumper.Dumps.ue_dumpFNames,
   ue_dumpTypes = Dumper.Dumps.ue_dumpTypes,
   ue_dumpObjects = Dumper.Dumps.ue_dumpObjects,
@@ -4606,5 +4785,3 @@ for functionName, implementation in pairs(Dumper.API) do
   end
 
 end
-
--- ceUEDumper = Dumper.API

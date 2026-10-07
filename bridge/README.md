@@ -16,9 +16,11 @@ Place in `\autorun\ceUEDumperModules`
 
 ## Functionality
 
-- `UFunction::Func` swap-based (not `ProcessLocalScriptFunction`)
+- `ProcessLocalScriptFunction`/`ProcessInternal` detouring
+- `UFunction::Func` swapping
+- dispatch selection by `FFrame::Node`
 - filtering via object
 - ANDed scalar conditions on `object`, `FFrame::Locals` or `RESULT_DECL`
 - scalar writes before/after call
 - conditional early return
-- graceful toggling/removal of `UFunction::Func`
+- graceful hook toggling/removal

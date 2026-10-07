@@ -13,9 +13,61 @@
 
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+  MinHook - The Minimalistic API Hooking Library for x64/x86
+  Copyright (C) 2009-2017 Tsuda Kageyu.
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+
+  1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+  HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  MIT License
+
+  Copyright (c) 2022 Narknon
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
 */
 
 #include "ceUEDumperBridge.h"
+
+#include <MinHook.h>
 
 #include <Windows.h>
 
@@ -30,6 +82,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -40,6 +93,12 @@ namespace
   constexpr std::uint32_t LocalsOffsetUnavailable = 0xFFFFFFFFu;
 
   using UnrealFunction = void(__fastcall *)(void *context, void *frame, void *result);
+
+  enum class HookBackend
+  {
+    FunctionPointer,
+    ScriptDispatcher,
+  };
 
   struct ValueDescriptor
   {
@@ -64,15 +123,15 @@ namespace
   {
     std::uint64_t magic{ HookMagic };
     void *ufunction{};
+    HookBackend backend{ HookBackend::FunctionPointer };
     void **function_slot{};
     UnrealFunction original{};
     void *thunk{};
-    // Address of a caller-owned UObject* cell. Its current value is read for
-    // every invocation, so replacing the cell's value retargets the hook.
     void **object_pointer{};
     std::uint32_t flags{};
     std::uint32_t frame_locals_offset{ LocalsOffsetUnavailable };
     std::atomic<std::uint32_t> active_calls{};
+    std::atomic<std::uint64_t> hit_count{};
     std::atomic<bool> enabled{};
     std::size_t condition_count{};
     std::size_t write_count{};
@@ -82,7 +141,16 @@ namespace
 
   std::mutex g_hook_mutex;
   std::unordered_set<HookRecord *> g_hooks;
+  std::unordered_multimap<void *, HookRecord *> g_script_hooks;
   std::vector<HookRecord *> g_retired_hooks;
+  std::atomic<std::uint32_t> g_enabled_script_hook_count{};
+  std::atomic<std::uint32_t> g_active_script_dispatches{};
+  UnrealFunction g_script_dispatcher_original{};
+  void *g_script_dispatcher_target{};
+  std::uint32_t g_frame_node_offset{ 0x08 };
+  bool g_minhook_initialized{};
+  bool g_script_dispatcher_created{};
+  bool g_script_dispatcher_enabled{};
   thread_local std::string g_last_error;
 
   void set_error(std::string message)
@@ -361,6 +429,37 @@ namespace
     return false;
   }
 
+  bool record_matches( HookRecord &record, void *context, void *frame, void *result )
+  {
+    bool matched = record.enabled.load( std::memory_order_acquire );
+
+    if ( matched && record.object_pointer )
+    {
+      void *selected_object{};
+      matched = safe_read( record.object_pointer, selected_object )
+                && selected_object
+                && selected_object == context;
+    }
+
+    for (std::size_t index = 0; matched && index < record.condition_count; ++index)
+    {
+      matched = condition_matches( record, record.conditions[index], context, frame, result );
+    }
+    return matched;
+  }
+
+  void apply_writes( HookRecord &record, CeueWritePhase phase, void *context, void *frame, void *result )
+  {
+    for (std::size_t index = 0; index < record.write_count; ++index)
+    {
+      const auto &write = record.writes[index];
+      if ( write.phase == phase )
+      {
+        apply_write( record, write, context, frame, result );
+      }
+    }
+  }
+
   void __fastcall dispatch( void *context, void *frame, void *result, HookRecord *record )
   {
     if (!record || record->magic != HookMagic)
@@ -369,33 +468,12 @@ namespace
     }
 
     record->active_calls.fetch_add( 1, std::memory_order_acquire );
-
-    const bool enabled = record->enabled.load( std::memory_order_acquire );
-    bool matched = enabled;
-
-    if (matched && record->object_pointer)
-    {
-      void *selected_object{};
-      matched = safe_read( record->object_pointer, selected_object )
-                && selected_object
-                && selected_object == context;
-    }
-
-    for (std::size_t index = 0; matched && index < record->condition_count; ++index)
-    {
-      matched = condition_matches( *record, record->conditions[index], context, frame, result );
-    }
+    const bool matched = record_matches( *record, context, frame, result );
 
     if (matched)
     {
-      for ( std::size_t index = 0; index < record->write_count; ++index )
-      {
-        const auto &write = record->writes[index];
-        if (write.phase == CeueWritePhase::Before)
-        {
-          apply_write( *record, write, context, frame, result );
-        }
-      }
+      record->hit_count.fetch_add( 1, std::memory_order_relaxed );
+      apply_writes( *record, CeueWritePhase::Before, context, frame, result );
     }
 
     if (!matched || (record->flags & CeueHookSkipOriginal) == 0)
@@ -405,17 +483,122 @@ namespace
 
     if (matched)
     {
-      for (std::size_t index = 0; index < record->write_count; ++index)
-      {
-        const auto &write = record->writes[index];
-        if (write.phase == CeueWritePhase::After)
-        {
-          apply_write( *record, write, context, frame, result );
-        }
-      }
+      apply_writes( *record, CeueWritePhase::After, context, frame, result );
     }
 
     record->active_calls.fetch_sub( 1, std::memory_order_release );
+  }
+
+  // creadit to UE4SS/UEPseudo: ProcessLocalScriptFunction is detoured once and callbacks are selected through FFrame::Node
+  void __fastcall dispatch_script( void *context, void *frame, void *result )
+  {
+    g_active_script_dispatches.fetch_add( 1, std::memory_order_acquire );
+
+    void *function{};
+    if (frame)
+    {
+      const auto node_address = static_cast< const std::byte * >(frame) + g_frame_node_offset;
+      safe_read( node_address, function );
+    }
+
+    std::vector<HookRecord *> records;
+    if ( function && g_enabled_script_hook_count.load( std::memory_order_acquire ) != 0 )
+    {
+      std::scoped_lock lock(g_hook_mutex);
+      const auto [first, last] = g_script_hooks.equal_range(function);
+      for (auto iterator = first; iterator != last; ++iterator)
+      {
+        auto *record = iterator->second;
+        record->active_calls.fetch_add( 1, std::memory_order_acquire );
+        records.push_back(record);
+      }
+    }
+
+    std::vector<HookRecord *> matched_records;
+    bool skip_original{};
+
+    for (auto *record : records)
+    {
+      if ( record_matches( *record, context, frame, result ) )
+      {
+        record->hit_count.fetch_add( 1, std::memory_order_relaxed );
+        apply_writes( *record, CeueWritePhase::Before, context, frame, result );
+        matched_records.push_back(record);
+        skip_original = skip_original || (record->flags & CeueHookSkipOriginal) != 0;
+      }
+    }
+
+    if ( !skip_original && g_script_dispatcher_original )
+    {
+      g_script_dispatcher_original( context, frame, result );
+    }
+
+    for (auto *record : matched_records)
+    {
+      apply_writes( *record, CeueWritePhase::After, context, frame, result );
+    }
+
+    for (auto *record : records)
+    {
+      record->active_calls.fetch_sub( 1, std::memory_order_release );
+    }
+    g_active_script_dispatches.fetch_sub( 1, std::memory_order_release );
+  }
+
+  bool initialize_minhook()
+  {
+    if (g_minhook_initialized)
+    {
+      return true;
+    }
+
+    const auto status = MH_Initialize();
+    if ( status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED )
+    {
+      set_error( std::string("MinHook initialization failed: ") + MH_StatusToString(status) );
+      return false;
+    }
+    g_minhook_initialized = true;
+    return true;
+  }
+
+  bool enable_script_dispatcher()
+  {
+    if (!g_script_dispatcher_created)
+    {
+      set_error("ProcessLocalScriptFunction dispatcher is not configured");
+      return false;
+    }
+    if (g_script_dispatcher_enabled)
+    {
+      return true;
+    }
+
+    const auto status = MH_EnableHook(g_script_dispatcher_target);
+    if ( status != MH_OK && status != MH_ERROR_ENABLED )
+    {
+      set_error( std::string("Could not enable ProcessLocalScriptFunction detour: ") + MH_StatusToString(status) );
+      return false;
+    }
+    g_script_dispatcher_enabled = true;
+    return true;
+  }
+
+  bool disable_script_dispatcher()
+  {
+    if ( !g_script_dispatcher_enabled )
+    {
+      return true;
+    }
+
+    const auto status = MH_DisableHook(g_script_dispatcher_target);
+    if ( status != MH_OK && status != MH_ERROR_DISABLED )
+    {
+      set_error( std::string("Could not disable ProcessLocalScriptFunction detour: ") + MH_StatusToString(status) );
+      return false;
+    }
+    g_script_dispatcher_enabled = false;
+    return true;
   }
 
   void *create_thunk(HookRecord *record)
@@ -458,6 +641,40 @@ namespace
 
   bool set_enabled( HookRecord &record, bool enabled )
   {
+    if ( record.backend == HookBackend::ScriptDispatcher )
+    {
+      std::scoped_lock lock(g_hook_mutex);
+
+      if (enabled)
+      {
+        if ( record.enabled.load( std::memory_order_acquire ) )
+        {
+          return true;
+        }
+        if ( !enable_script_dispatcher() )
+        {
+          return false;
+        }
+        record.enabled.store( true, std::memory_order_release );
+        g_enabled_script_hook_count.fetch_add( 1, std::memory_order_release );
+        return true;
+      }
+
+      if ( !record.enabled.exchange( false, std::memory_order_acq_rel ) )
+      {
+        return true;
+      }
+
+      const auto remaining = g_enabled_script_hook_count.fetch_sub( 1, std::memory_order_acq_rel ) - 1;
+      if ( remaining == 0 && !disable_script_dispatcher() )
+      {
+        g_enabled_script_hook_count.fetch_add( 1, std::memory_order_release );
+        record.enabled.store( true, std::memory_order_release );
+        return false;
+      }
+      return true;
+    }
+
     if (enabled)
     {
       if ( record.enabled.load( std::memory_order_acquire ) )
@@ -529,6 +746,7 @@ void *ceue_create_bp_hook( void *ufunction, std::uint32_t function_pointer_offse
 
   auto record = std::make_unique<HookRecord>();
   record->ufunction = ufunction;
+  record->backend = HookBackend::FunctionPointer;
   record->function_slot = slot;
   record->original = reinterpret_cast<UnrealFunction>(original);
   record->object_pointer = object_pointer;
@@ -544,6 +762,98 @@ void *ceue_create_bp_hook( void *ufunction, std::uint32_t function_pointer_offse
   {
     std::scoped_lock lock(g_hook_mutex);
     g_hooks.insert(handle);
+  }
+  return handle;
+}
+
+std::uint32_t ceue_configure_script_dispatcher( void *dispatcher, std::uint32_t frame_node_offset )
+{
+  g_last_error.clear();
+  if ( !dispatcher || frame_node_offset > 0x100 )
+  {
+    set_error("Invalid ProcessLocalScriptFunction address or FFrame::Node offset");
+    return 0;
+  }
+
+  std::scoped_lock lock(g_hook_mutex);
+  if ( g_script_dispatcher_created && g_script_dispatcher_target == dispatcher && g_frame_node_offset == frame_node_offset )
+  {
+    return 1;
+  }
+
+  if ( g_enabled_script_hook_count.load( std::memory_order_acquire ) != 0 )
+  {
+    set_error("Script dispatcher cannot change while Blueprint script hooks are enabled");
+    return 0;
+  }
+
+  if ( g_script_dispatcher_created && g_script_dispatcher_target == dispatcher )
+  {
+    g_frame_node_offset = frame_node_offset;
+    return 1;
+  }
+
+  if ( g_script_dispatcher_created )
+  {
+    if ( !disable_script_dispatcher() )
+    {
+      return 0;
+    }
+    const auto remove_status = MH_RemoveHook( g_script_dispatcher_target );
+    if ( remove_status != MH_OK && remove_status != MH_ERROR_NOT_CREATED )
+    {
+      set_error( std::string("Could not replace ProcessLocalScriptFunction detour: ") + MH_StatusToString(remove_status) );
+      return 0;
+    }
+    g_script_dispatcher_created = false;
+    g_script_dispatcher_target = nullptr;
+    g_script_dispatcher_original = nullptr;
+  }
+
+  if ( !initialize_minhook() )
+  {
+    return 0;
+  }
+
+  const auto create_status = MH_CreateHook( dispatcher, reinterpret_cast<void *>( &dispatch_script ), reinterpret_cast<void **>( &g_script_dispatcher_original ) );
+  if (create_status != MH_OK)
+  {
+    set_error( std::string("Could not create ProcessLocalScriptFunction detour: ") + MH_StatusToString(create_status) );
+    return 0;
+  }
+
+  g_script_dispatcher_target = dispatcher;
+  g_frame_node_offset = frame_node_offset;
+  g_script_dispatcher_created = true;
+  return 1;
+}
+
+void *ceue_create_script_hook( void *ufunction, void **object_pointer, std::uint32_t flags )
+{
+  g_last_error.clear();
+  if (!ufunction)
+  {
+    set_error("Invalid UFunction address");
+    return nullptr;
+  }
+
+  auto record = std::make_unique<HookRecord>();
+  record->ufunction = ufunction;
+  record->backend = HookBackend::ScriptDispatcher;
+  record->object_pointer = object_pointer;
+  record->flags = flags;
+
+  auto *handle = record.release();
+  {
+    std::scoped_lock lock(g_hook_mutex);
+    if ( !g_script_dispatcher_created )
+    {
+      delete handle;
+      set_error("ProcessLocalScriptFunction dispatcher is not configured");
+      return nullptr;
+    }
+    g_hooks.insert(handle);
+    g_script_hooks.emplace( ufunction, handle );
   }
   return handle;
 }
@@ -656,6 +966,21 @@ std::uint32_t ceue_remove_bp_hook(void *handle)
   {
     std::scoped_lock lock(g_hook_mutex);
     g_hooks.erase(record);
+    if ( record->backend == HookBackend::ScriptDispatcher )
+    {
+      const auto [first, last] = g_script_hooks.equal_range( record->ufunction );
+      for (auto iterator = first; iterator != last;)
+      {
+        if (iterator->second == record)
+        {
+          iterator = g_script_hooks.erase(iterator);
+        }
+        else
+        {
+          ++iterator;
+        }
+      }
+    }
   }
   return remove_record(record) ? 1u : 0u;
 }
@@ -683,6 +1008,17 @@ std::uint32_t ceue_get_hook_count()
 {
   std::scoped_lock lock( g_hook_mutex );
   return static_cast<std::uint32_t>( g_hooks.size() );
+}
+
+std::uint64_t ceue_get_hook_hit_count(void *handle)
+{
+  auto *record = checked_handle(handle);
+  if ( !record )
+  {
+    set_error("Invalid Blueprint hook handle");
+    return 0;
+  }
+  return record->hit_count.load( std::memory_order_relaxed );
 }
 
 std::uint32_t ceue_get_last_error( char *buffer, std::uint32_t capacity )
