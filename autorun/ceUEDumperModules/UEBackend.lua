@@ -1,5 +1,5 @@
 --[[
-  ceUEDumperModules — a Cheat Engine Unreal Engine Dumper — Copyright (C) 2026 palepine
+  ceUEDumper — a Cheat Engine Unreal Engine Dumper — Copyright (C) 2026 palepine
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

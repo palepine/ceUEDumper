@@ -1,5 +1,5 @@
 --[[
-  ceUEDumperModules — a Cheat Engine Unreal Engine Dumper — Copyright (C) 2026 palepine
+  ceUEDumper — a Cheat Engine Unreal Engine Dumper — Copyright (C) 2026 palepine
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -40,6 +40,7 @@ local Dumper =
   Offsets = {},
   Functions = {},
   Invocation = {},
+  Hooks = {},
   Dumps = {},
   StructureDissect = {},
   API = {},
@@ -85,8 +86,15 @@ local PORTABLE_FILES =
   { name = 'ceUEDumper',              path = [[autorun\UEDumper.lua]] },
   { name = 'ceUEDumper.UEBackend',    path = [[autorun\ceUEDumperModules\UEBackend.lua]] },
   { name = 'ceUEDumper.UEBytecode',   path = [[autorun\ceUEDumperModules\UEBytecode.lua]] },
+  { name = 'ceUEDumper.UEHookBridge', path = [[autorun\ceUEDumperModules\UEHookBridge.lua]] },
   { name = 'ceUEDumper.UEDumperCore', path = [[autorun\ceUEDumperModules\UEDumperCore.lua]] },
   { name = 'ceUEDumper.UESignatures', path = [[autorun\ceUEDumperModules\UESignatures.lua]] },
+  {
+    name = 'ceUEDumper.ceUEDumperBridge.dll',
+    path = [[autorun\ceUEDumperModules\ceUEDumperBridge.dll]],
+    optional = true,
+    binary = true,
+  },
 }
 
 --- Execute operation on CE main thread
@@ -263,10 +271,8 @@ function Dumper.Portable.registerModuleResolver(moduleName, fileName, attachment
 end
 
 
---- Read every portable runtime file before modifying the current table
--- Preloading makes a missing or unreadable installation fail without
--- deleting an older usable attachment from the cheat table
--- @return table[]|nil @ attachment descriptors containing source text
+--- Read every available portable runtime file before modifying the current table
+-- @return table[]|nil @ attachment descriptors containing binary-safe data
 -- @return string|nil @ error
 function Dumper.Portable.readPortableFiles()
   local files = {}
@@ -275,35 +281,51 @@ function Dumper.Portable.readPortableFiles()
     local sourcePath = ceDirectory .. descriptor.path
     local sourceFile, openError = io.open(sourcePath, 'rb')
 
-    if not sourceFile then return nil, 'Could not read portable dependency ' .. sourcePath .. ': ' .. tostring(openError) end
+    if not sourceFile then
+      if descriptor.optional then goto continue end
+      return nil, 'Could not read portable dependency ' .. sourcePath .. ': ' .. tostring(openError)
+    end
 
-    local sourceText = sourceFile:read('*a')
-    sourceFile:close()
+    do
+      local fileData = sourceFile:read('*a')
+      sourceFile:close()
 
-    if not sourceText or sourceText == '' then return nil, 'Portable dependency is empty: ' .. sourcePath end
+      if not fileData or fileData == '' then return nil, 'Portable dependency is empty: ' .. sourcePath end
+      if descriptor.binary and fileData:sub(1, 2) ~= 'MZ' then return nil, 'Portable DLL is not a valid PE image: ' .. sourcePath end
 
-    files[#files + 1] =
-    {
-      name = descriptor.name,
-      source = sourceText,
-    }
+      files[ #files + 1 ] =
+      {
+        name = descriptor.name,
+        data = fileData,
+        binary = descriptor.binary == true,
+        sourcePath = sourcePath,
+      }
+    end
+
+    ::continue::
   end
 
   return files
 end
 
---- Replace one attached table file with validated source text
+--- Replace one attached table file with binary-safe data
 -- @param attachmentName string @ flat name stored in the cheat table
--- @param sourceText string @ complete Lua source
+-- @param fileData string @ complete Lua source or DLL bytes
+-- @param binaryPath string|nil @ source path passed directly to CE for binaries
 -- @return nil
-function Dumper.Portable.replaceTableFile(attachmentName, sourceText)
-  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Portable.replaceTableFile, attachmentName, sourceText ) end
+function Dumper.Portable.replaceTableFile(attachmentName, fileData, binaryPath)
+  if not inMainThread() then return Dumper.Runtime.onMainThread( Dumper.Portable.replaceTableFile, attachmentName, fileData, binaryPath ) end
 
   local existingFile = findTableFile(attachmentName)
   if existingFile then existingFile.delete() end
 
+  if binaryPath then
+    assert( createTableFile(attachmentName, binaryPath), 'Could not attach binary file ' .. attachmentName )
+    return
+  end
+
   local tableFile = assert( createTableFile(attachmentName), 'Could not create table file ' .. attachmentName )
-  local sourceStream = createStringStream(sourceText)
+  local sourceStream = createStringStream(fileData)
   tableFile.Stream.Position = 0
   tableFile.Stream.CopyFrom(sourceStream, 0)
   sourceStream.destroy()
@@ -322,7 +344,7 @@ function Dumper.Portable.ue_attachToTable()
     function()
       Dumper.Runtime.onMainThread(function()
         for _, file in ipairs(files) do
-          Dumper.Portable.replaceTableFile( file.name, file.source )
+          Dumper.Portable.replaceTableFile( file.name, file.data, file.binary and file.sourcePath or nil )
         end
       end)
     end
@@ -336,10 +358,12 @@ end
 
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEBackend', 'UEBackend.lua', 'ceUEDumper.UEBackend' )
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEBytecode', 'UEBytecode.lua', 'ceUEDumper.UEBytecode' )
+Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEHookBridge', 'UEHookBridge.lua', 'ceUEDumper.UEHookBridge' )
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UESignatures', 'UESignatures.lua', 'ceUEDumper.UESignatures' )
 
 local Backend = require('ceUEDumperModules.UEBackend')
 local Bytecode = require('ceUEDumperModules.UEBytecode')
+local HookBridge = require('ceUEDumperModules.UEHookBridge')
 local sharedResources = package.loaded['ceUEDumper.resources']
 
 sharedResources.structureDissectCallbacks = sharedResources.structureDissectCallbacks or {}
@@ -347,6 +371,11 @@ sharedResources.functionPatches = sharedResources.functionPatches or
 {
   processId = getOpenedProcessID(),
   nextId = 1,
+  active = {},
+}
+sharedResources.blueprintHooks = sharedResources.blueprintHooks or
+{
+  processId = getOpenedProcessID(),
   active = {},
 }
 
@@ -3772,6 +3801,281 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
   return callResult
 end
 
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--/// BLUEPRINT FUNCTION HOOKS
+
+Dumper.Hooks.propertyValueTypes =
+{
+  BoolProperty = 'u8',
+  ByteProperty = 'u8',
+  UInt8Property = 'u8',
+  Int8Property = 'i8',
+  Int16Property = 'i16',
+  UInt16Property = 'u16',
+  IntProperty = 'i32',
+  Int32Property = 'i32',
+  UInt32Property = 'u32',
+  Int64Property = 'i64',
+  UInt64Property = 'u64',
+  FloatProperty = 'f32',
+  DoubleProperty = 'f64',
+  EnumProperty = 'i32',
+  NameProperty = 'u64',
+  ObjectProperty = 'pointer',
+  ClassProperty = 'pointer',
+  ClassPtrProperty = 'pointer',
+}
+
+--- Encode Lua scalar as raw bits
+-- @param valueTypeName string @ UEHookBridge.ValueType key
+-- @param value number|boolean|nil @ scalar value
+-- @return integer|nil @ raw 64-bit argument bits
+-- @return string|nil @ conversion error
+function Dumper.Hooks.encodeValue(valueTypeName, value)
+  if valueTypeName == 'bool' then valueTypeName = 'u8' end
+  if valueTypeName == 'object' then valueTypeName = 'pointer' end
+
+  if valueTypeName == 'f32' or valueTypeName == 'float' then
+    if type(value) ~= 'number' then return nil, valueTypeName .. ' requires a number' end
+    return string.unpack( '<i4', string.pack('<f', value) )
+  end
+
+  if valueTypeName == 'f64' or valueTypeName == 'double' then
+    if type(value) ~= 'number' then return nil, valueTypeName .. ' requires a number' end
+    return string.unpack( '<i8', string.pack('<d', value) )
+  end
+
+  if type(value) == 'boolean' then value = value and 1 or 0 end
+  if value == nil and valueTypeName == 'pointer' then value = 0 end
+
+  local integer = math.tointeger(value)
+  if integer == nil then return nil, valueTypeName .. ' requires an integer, boolean, or pointer address' end
+  return integer
+end
+
+--- Resolve a condition/write location from reflected property metadata or raw offsets
+-- @param objectAddress number @ hook context used for self-property lookup
+-- @param metadata table @ UFunction metadata
+-- @param descriptor table @ caller condition/write descriptor
+-- @return table|nil @ normalized native descriptor
+-- @return string|nil @ error
+function Dumper.Hooks.normalizeDescriptor(objectAddress, metadata, descriptor)
+  if type(descriptor) ~= 'table' then return nil, 'Hook condition/write must be a table' end
+
+  -- { parameter='Weapon', value=address }
+  -- { result=true, value=true }
+  -- { source='self', property='Health', value=0 }
+  -- { source='self', offset=0x120, type='i32', value=0 }
+
+  local property
+  local sourceName = descriptor.source
+  local offset = descriptor.offset
+
+  if descriptor.parameter then
+    property = Dumper.Helpers.resolveProperty( metadata.parameters, descriptor.parameter )
+    if not property or not property.isParameter then return nil, 'UFunction parameter was not found: ' .. tostring(descriptor.parameter) end
+    sourceName = 'locals'
+    offset = property.offset
+
+  elseif descriptor.result then
+
+    for _, candidate in pairs(metadata.parameters or {}) do
+      if candidate.isReturnParameter then property = candidate break end
+    end
+    if not property then return nil, 'UFunction has no return parameter' end
+    sourceName = 'result'
+    offset = 0
+
+  elseif descriptor.property then
+    sourceName = sourceName or 'self'
+    if sourceName ~= 'self' then return nil, 'Named object properties require source="self"' end
+
+    local classAddress = Backend.objectClass(objectAddress)
+    local properties, propertiesError = classAddress and Backend.properties(classAddress)
+    if not properties then return nil, propertiesError or 'Runtime object class properties were not found' end
+    property = Dumper.Helpers.resolveProperty( properties, descriptor.property )
+    if not property then return nil, 'Object property was not found: ' .. tostring(descriptor.property) end
+    offset = property.offset
+  end
+
+  sourceName = sourceName or 'self'
+  local source = HookBridge.Source[sourceName]
+  if source == nil then return nil, 'Unknown hook value source: ' .. tostring(sourceName) end
+  if type(offset) ~= 'number' or offset < 0 or offset % 1 ~= 0 then return nil, 'Hook value offset must be a non-negative integer' end
+
+  if descriptor.memberOffset then
+    if type(descriptor.memberOffset) ~= 'number' or descriptor.memberOffset < 0 then return nil, 'memberOffset must be non-negative' end
+    offset = offset + descriptor.memberOffset
+  end
+
+  local valueTypeName = descriptor.type or (property and Dumper.Hooks.propertyValueTypes[property.propertyType])
+  if property and property.propertyType == 'BoolProperty' then valueTypeName = descriptor.type or 'u8' end
+  if not valueTypeName then return nil, 'Hook value type must be supplied for ' .. tostring(property and property.propertyType or 'a raw offset') end
+
+  local valueType = HookBridge.ValueType[valueTypeName]
+  if not valueType then return nil, 'Unsupported hook value type: ' .. tostring(valueTypeName) end
+
+  local valueBits, valueError = Dumper.Hooks.encodeValue( valueTypeName, descriptor.value )
+  if valueBits == nil then return nil, valueError end
+
+  local maskBits = descriptor.mask or 0
+  if property and property.propertyType == 'BoolProperty' then
+    maskBits = descriptor.mask or property.byteMask or 1
+    valueBits = descriptor.value and maskBits or 0
+  end
+
+  return
+  {
+    source = source,
+    sourceName = sourceName,
+    valueType = valueType,
+    valueTypeName = valueTypeName,
+    offset = offset,
+    valueBits = valueBits,
+    maskBits = maskBits,
+    property = property,
+  }
+end
+
+--- Install BP hook using an updateable UObject pointer cell
+-- @param objectPointerAddress number @ address containing UObject
+-- @param functionName string @ reflected Blueprint function name
+-- @param options table|nil
+-- @return table|nil @ removable hook handle and resolved metadata
+-- @return string|nil @ validation/injection error
+function Dumper.Hooks.ue_hookBlueprintFunction(objectPointerAddress, functionName, options)
+  assert( type(objectPointerAddress) == 'number' and objectPointerAddress ~= 0, 'object pointer address must be non-zero' )
+  assert( type(functionName) == 'string' and functionName ~= '', 'function name must be non-empty' )
+  assert( options == nil or type(options) == 'table', 'options must be a table or nil' )
+  options = options or {}
+
+  local objectAddress = readPointer(objectPointerAddress)
+  if not objectAddress or objectAddress == 0 then return nil, 'Object pointer is unreadable or null' end
+
+  local functionAddress, functionError = Backend.functionForObject( objectAddress, functionName )
+  if not functionAddress then return nil, functionError end
+
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+  if not metadata then return nil, metadataError end
+  if metadata.native then return nil, 'Native UFunctions are outside the Blueprint-hook bridge scope' end
+  if not metadata.functionPointer or not metadata.functionPointerOffset then return nil, 'UFunction::Func metadata is unavailable' end
+
+  local loaded, loadError = Dumper.Runtime.onMainThread( HookBridge.load, options.bridgePath )
+  if not loaded then return nil, loadError end
+
+  local processId = getOpenedProcessID()
+  if sharedResources.blueprintHooks.processId ~= processId then
+    sharedResources.blueprintHooks.processId = processId
+    sharedResources.blueprintHooks.active = {}
+  end
+
+  local nativeObjectPointer = options.allInstances and 0 or objectPointerAddress
+
+  local normalizedConditions = {}
+  local normalizedWrites = {}
+  local requiresLocals = false
+
+  for index, descriptor in ipairs(options.conditions or {}) do
+    local condition, conditionError = Dumper.Hooks.normalizeDescriptor( objectAddress, metadata, descriptor )
+    if not condition then return nil, ('Condition %d: %s'):format( index, conditionError ) end
+
+    condition.operation = HookBridge.Operation[ descriptor.operation or descriptor.op or 'eq' ]
+    if condition.operation == nil then return nil, 'Condition ' .. index .. ': unsupported comparison operation' end
+    requiresLocals = requiresLocals or condition.source == HookBridge.Source.locals
+    normalizedConditions[#normalizedConditions + 1] = condition
+  end
+
+  for index, descriptor in ipairs(options.writes or {}) do
+    local write, writeError = Dumper.Hooks.normalizeDescriptor( objectAddress, metadata, descriptor )
+    if not write then return nil, ('Write %d: %s'):format( index, writeError ) end
+
+    write.phase = HookBridge.Phase[ descriptor.phase or 'before' ]
+    if write.phase == nil then return nil, 'Write ' .. index .. ': phase must be before or after' end
+    requiresLocals = requiresLocals or write.source == HookBridge.Source.locals
+    normalizedWrites[#normalizedWrites + 1] = write
+  end
+
+  local frameLocalsOffset = options.frameLocalsOffset or HookBridge.DEFAULT_FRAME_LOCALS_OFFSET
+  if requiresLocals and (type(frameLocalsOffset) ~= 'number' or frameLocalsOffset < 0) then
+    return nil, 'frameLocalsOffset is required for parameter conditions/writes'
+  end
+
+  local nativeHandle, createError = HookBridge.create(
+                                                        functionAddress,
+                                                        metadata.functionPointerOffset,
+                                                        metadata.functionPointer,
+                                                        nativeObjectPointer,
+                                                        options.skipOriginal == true
+                                                      )
+  if not nativeHandle then return nil, createError end
+
+  local configured, configurationError = xpcall(
+    function()
+      if requiresLocals then assert( HookBridge.setFrameLocalsOffset(nativeHandle, frameLocalsOffset) ) end
+      for _, condition in ipairs(normalizedConditions) do assert( HookBridge.addCondition(nativeHandle, condition) ) end
+      for _, write in ipairs(normalizedWrites) do assert( HookBridge.addWrite(nativeHandle, write) ) end
+      assert( HookBridge.enable(nativeHandle, true) )
+    end,
+    function(message) return tostring(message) end
+  )
+
+  if not configured then
+    HookBridge.remove(nativeHandle)
+    return nil, configurationError
+  end
+
+  local hook =
+  {
+    nativeHandle = nativeHandle,
+    objectPointerAddress = objectPointerAddress,
+    initialObjectAddress = objectAddress,
+    allInstances = options.allInstances == true,
+    functionAddress = functionAddress,
+    functionName = functionName,
+    metadata = metadata,
+    conditions = normalizedConditions,
+    writes = normalizedWrites,
+    skipOriginal = options.skipOriginal == true,
+    frameLocalsOffset = requiresLocals and frameLocalsOffset or nil,
+  }
+
+  sharedResources.blueprintHooks.active[nativeHandle] = hook
+  return hook
+end
+
+--- Temp enable/disable BP hook (no dtoring)
+function Dumper.Hooks.ue_setBlueprintHookEnabled(hookOrHandle, enabled)
+  local handle = type(hookOrHandle) == 'table' and hookOrHandle.nativeHandle or hookOrHandle
+  if type(handle) ~= 'number' or handle == 0 then return nil, 'Invalid Blueprint hook handle' end
+  return HookBridge.enable( handle, enabled ~= false )
+end
+
+--- Restore UFunction::Func and retire BP hook record
+function Dumper.Hooks.ue_removeBlueprintHook(hookOrHandle)
+  local handle = type(hookOrHandle) == 'table' and hookOrHandle.nativeHandle or hookOrHandle
+  if type(handle) ~= 'number' or handle == 0 then return nil, 'Invalid Blueprint hook handle' end
+
+  local removed, removeError = HookBridge.remove(handle)
+  if not removed then return nil, removeError end
+  sharedResources.blueprintHooks.active[handle] = nil
+  if type(hookOrHandle) == 'table' then hookOrHandle.nativeHandle = nil end
+  return true
+end
+
+--- Restore and destroy BP hooks
+function Dumper.Hooks.ue_removeAllBlueprintHooks()
+  local removed, removeError = HookBridge.removeAll()
+  if removed == nil then return nil, removeError end
+  sharedResources.blueprintHooks.active = {}
+  return removed
+end
+
+--- Get hook descriptions
+function Dumper.Hooks.ue_getBlueprintHooks()
+  local result = {}
+  for handle, hook in pairs(sharedResources.blueprintHooks.active) do result[handle] = hook end
+  return result
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// TEXT DUMPS
 
 --- Get executable path
@@ -4276,6 +4580,11 @@ Dumper.API =
   ue_restoreAllFunctionPatches = Dumper.Patching.ue_restoreAllFunctionPatches,
   ue_getFunctionPatches = Dumper.Patching.ue_getFunctionPatches,
   ue_callFunction = Dumper.Invocation.ue_callFunction,
+  ue_hookBlueprintFunction = Dumper.Hooks.ue_hookBlueprintFunction,
+  ue_setBlueprintHookEnabled = Dumper.Hooks.ue_setBlueprintHookEnabled,
+  ue_removeBlueprintHook = Dumper.Hooks.ue_removeBlueprintHook,
+  ue_removeAllBlueprintHooks = Dumper.Hooks.ue_removeAllBlueprintHooks,
+  ue_getBlueprintHooks = Dumper.Hooks.ue_getBlueprintHooks,
   ue_dumpFNames = Dumper.Dumps.ue_dumpFNames,
   ue_dumpTypes = Dumper.Dumps.ue_dumpTypes,
   ue_dumpObjects = Dumper.Dumps.ue_dumpObjects,
