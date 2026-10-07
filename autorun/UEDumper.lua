@@ -998,6 +998,48 @@ function Dumper.Lifecycle.ue_clearSavedLayout()
   return Backend.clearSavedLayout()
 end
 
+--- Infer UE version
+-- Embedded UE release branches are preferred, PE meta is fallback
+-- @return table|nil @ { major, minor, patch, source, confidence, raw, module }
+-- @return string|nil @ detection error
+function Dumper.Lifecycle.ue_detectEngineVersion()
+  return Backend.detectEngineVersion()
+end
+
+--- Return engine-version selection/most recent detection
+-- Does not scan when no detection has been requested yet
+-- @return table|nil @ engine-version descriptor
+function Dumper.Lifecycle.ue_getEngineVersion()
+  return Backend.getEngineVersion()
+end
+
+--- Select/clear engine version
+-- @param versionOrMajor table|string|number|nil @ nil clears; accepts "5.7.1", table, or major
+-- @param minor number|nil
+-- @param patch number|nil
+-- @return table|boolean|nil @ selected descriptor, or true when cleared
+-- @return string|nil @ validation error
+function Dumper.Lifecycle.ue_setEngineVersion(versionOrMajor, minor, patch)
+  return Backend.setEngineVersion( versionOrMajor, minor, patch )
+end
+
+--- Return configured layout offsets
+-- @return table|nil @ independent CUEDEFS-shaped override table
+function Dumper.Lifecycle.ue_getLayoutOverrides()
+  return Backend.getLayoutOverrides()
+end
+
+--- Configure/clear layout offsets
+-- Offsets survive scanner resets and take precedence over restored/inferred values
+-- @param overrides table|nil @ nil clears all overrides
+-- @return table|boolean|nil @ normalized offsets, or true when cleared
+-- @return string|nil @ validation error
+function Dumper.Lifecycle.ue_setLayoutOverrides(overrides)
+  local result, layoutError = Backend.setLayoutOverrides(overrides)
+  if result then Dumper.Lifecycle.ue_clearCache() end
+  return result, layoutError
+end
+
 --- Enable or disable UClass/UProperty metadata expansion in new structures
 -- Existing CE structures retain the layout with which they were created
 -- @param enabled boolean @ true to expose reflection descriptor chains
@@ -2711,7 +2753,9 @@ function Dumper.MetadataViews.getFunctionMetadataStructure(functionAddress)
   local structure = createStructure( 'ceUE.UFunction metadata ' .. (metadata.name or '') )
   local implementation
 
-  if metadata.functionPointerIsExecutable then
+  if metadata.functionStorage == 'unavailable' then
+    implementation = 'unavailable'
+  elseif metadata.functionPointerIsExecutable then
     implementation = metadata.native and 'native thunk' or 'script VM thunk'
   else
     implementation = 'callable wrapper'
@@ -4750,6 +4794,11 @@ Dumper.API =
   ue_isReady = Dumper.Lifecycle.ue_isReady,
   ue_isNameReady = Dumper.Lifecycle.ue_isNameReady,
   ue_getStatus = Dumper.Lifecycle.ue_getStatus,
+  ue_detectEngineVersion = Dumper.Lifecycle.ue_detectEngineVersion,
+  ue_getEngineVersion = Dumper.Lifecycle.ue_getEngineVersion,
+  ue_setEngineVersion = Dumper.Lifecycle.ue_setEngineVersion,
+  ue_getLayoutOverrides = Dumper.Lifecycle.ue_getLayoutOverrides,
+  ue_setLayoutOverrides = Dumper.Lifecycle.ue_setLayoutOverrides,
   ue_attachToTable = Dumper.Portable.ue_attachToTable,
   ue_setReflectionMetadataVisible = Dumper.Lifecycle.ue_setReflectionMetadataVisible,
   ue_isReflectionMetadataVisible = Dumper.Lifecycle.ue_isReflectionMetadataVisible,

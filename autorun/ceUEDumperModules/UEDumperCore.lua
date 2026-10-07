@@ -53,6 +53,8 @@ local Core =
 {
   Runtime = {}, -- logging, thread/debug execution helpers
   Modules = {}, -- module bounds, address ownership, classification
+  EngineVersion = {}, -- executable version detection and explicit selection
+  Layout = {}, -- caller-supplied reflection-layout overrides
   Reflection = {}, -- names, properties, inheritance
   PropertyLayout = {}, -- reflection member-layout inference
   Engine = {}, -- GEngine/GWorld scan
@@ -79,6 +81,9 @@ Core.State.signatureSelection = 'first'
 Core.State.scannerGeneration = 0
 Core.State.activeScanner = nil
 Core.State.scannerRuns = setmetatable( {}, { __mode = 'k' } )
+Core.State.detectedEngineVersion = nil
+Core.State.engineVersionOverride = nil
+Core.State.layoutOverrides = nil
 
 local CUEDEFS -- UEDEFS
 
@@ -303,6 +308,517 @@ function Core.Modules.ue_classifyModuleInternal(module)
   end
 
   return 'unknown'
+end
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CORE.ENGINEVERSION
+
+local ENGINE_VERSION_MAJOR_MIN = 4
+local ENGINE_VERSION_MAJOR_MAX = 5
+local ENGINE_VERSION_MINOR_MAX = 99
+
+--- Copy version descriptor
+-- @param version table|nil @ internal version descriptor
+-- @return table|nil @ independent descriptor
+function Core.EngineVersion.copy(version)
+  if type(version) ~= 'table' then return nil end
+
+  local result = {}
+  for key, value in pairs(version) do result[key] = value end
+  return result
+end
+
+--- Validate & normalize UE version
+-- Accepts "5.7.1", { major=5, minor=7, patch=1 }, or major, minor, patch
+-- @return table|nil @ normalized version components
+-- @return string|nil @ validation error
+function Core.EngineVersion.normalize(versionOrMajor, minor, patch)
+  local major
+
+  if type(versionOrMajor) == 'table' then
+    major = versionOrMajor.major or versionOrMajor.Major
+    minor = versionOrMajor.minor or versionOrMajor.Minor
+    patch = versionOrMajor.patch or versionOrMajor.Patch or versionOrMajor.release or versionOrMajor.Release
+  elseif type(versionOrMajor) == 'string' then
+    local majorText, minorText, patchText = versionOrMajor:match('^%s*(%d+)%.(%d+)%.?(%d*)%s*$')
+    major = tonumber(majorText)
+    minor = tonumber(minorText)
+    patch = patchText ~= '' and tonumber(patchText) or nil
+  else
+    major = versionOrMajor
+  end
+
+  major = tonumber(major)
+  minor = tonumber(minor)
+  patch = patch ~= nil and tonumber(patch) or nil
+
+  if not major or major % 1 ~= 0 or major < ENGINE_VERSION_MAJOR_MIN or major > ENGINE_VERSION_MAJOR_MAX then
+    return nil, 'Engine major version must be' .. ENGINE_VERSION_MAJOR_MIN .. ' to ' .. ENGINE_VERSION_MAJOR_MAX
+  end
+
+  if not minor or minor % 1 ~= 0 or minor < 0 or minor > ENGINE_VERSION_MINOR_MAX then
+    return nil, 'Engine minor version must be an integer between 0 and ' .. ENGINE_VERSION_MINOR_MAX
+  end
+
+  if patch ~= nil and (patch % 1 ~= 0 or patch < 0 or patch > 0xFFFF) then
+    return nil, 'Engine patch version must be an integer between 0 and 65535'
+  end
+
+  return { major = major, minor = minor, patch = patch }
+end
+
+--- Parse version from UE branch/build string
+-- Supported examples include ++UE5+Release-5.7 and ++depot+UE4-Releases+4.27
+-- @param text string|nil @ candidate branch/product version
+-- @return table|nil @ normalized components
+function Core.EngineVersion.parseUnrealVersionText(text)
+  if type(text) ~= 'string' or text == '' then return nil end
+
+  local engineMajor, major, minor = text:match('%+%+UE([45])%+Release%-(%d+)%.(%d+)')
+
+  if not engineMajor then
+    engineMajor, major, minor = text:match('%+%+depot%+UE([45])%-Releases?%+(%d+)%.(%d+)')
+  end
+
+  if not engineMajor then
+    major, minor, engineMajor = text:match('^(%d+)%.(%d+)%.%d+.-%d+%+%+UE([45])')
+  end
+
+  if tonumber(engineMajor) ~= tonumber(major) then return nil end
+
+  local patch = text:match('^%d+%.%d+%.(%d+)')
+  local normalized = Core.EngineVersion.normalize( tonumber(major), tonumber(minor), tonumber(patch) )
+  return normalized
+end
+
+--- Encode ASCII text as UTF-16LE AOB pattern
+-- @param text string @ literal prefix
+-- @return string @ CE byte pattern
+function Core.EngineVersion.utf16Pattern(text)
+  local bytes = {}
+  for index = 1, #text do
+    bytes[ #bytes + 1 ] = ('%02X 00'):format( text:byte(index) )
+  end
+  return table.concat( bytes, ' ' )
+end
+
+--- Get process main module descriptor
+-- @return table|nil @ enumModules descriptor
+function Core.EngineVersion.getMainModule()
+  local modules = enumModules() or {}
+  local processFileName = extractFileName(process or '')
+
+  if processFileName then
+    processFileName = processFileName:lower()
+
+    for _, module in ipairs(modules) do
+      local moduleName = extractFileName( module.PathToFile or '' )
+      if moduleName and moduleName:lower() == processFileName then return module end
+    end
+  end
+
+  return modules[1]
+end
+
+--- Collect byte-pattern matches inside one module
+-- @param module table @ enumModules descriptor
+-- @param pattern string @ CE byte-array pattern
+-- @return number[] @ module-contained addresses
+function Core.EngineVersion.scanModulePattern(module, pattern)
+  local moduleName = extractFileName( module.PathToFile or '' )
+  local addresses = {}
+  -- unique scan, then a bounded MemScan
+  if moduleName and moduleName ~= '' and type(AOBScanModuleUnique) == 'function' then
+    local address = AOBScanModuleUnique( moduleName, pattern, '-W-X-C' )
+    if address and type(address) ~= 'number' then address = getAddressSafe(address) end
+    if address then addresses[1] = address end
+  end
+
+  if #addresses > 0 then return addresses end
+
+  local scan = createMemScan()
+  scan.VarType = vtByteArray
+  scan.Hexadecimal = true
+  scan.Scanvalue = pattern
+  scan.Fastscanmethod = fsmAligned
+  scan.Fastscanparameter = '1'
+  scan.Startaddress = module.Address
+  scan.Stopaddress = module.Address + module.Size
+  scan.scan()
+  scan.waitTillDone()
+
+  local results = scan.Results
+
+  if results then
+    for index = 1, #results do
+      local address = getAddressSafe(results[index])
+      if address then addresses[#addresses + 1] = address end
+    end
+  end
+
+  scan.destroy()
+  return addresses
+end
+
+--- Search main module for embedded UE release-branch string
+-- @param module table @ main-module descriptor
+-- @return table|nil @ detected version descriptor
+function Core.EngineVersion.detectEmbeddedBranch(module)
+  local moduleName = extractFileName( module.PathToFile or '' )
+  if not moduleName or moduleName == '' then return nil end
+
+  local prefixes =
+  {
+    '++UE5+Release-',
+    '++UE4+Release-',
+    '++depot+UE4-Releases+',
+  }
+
+  local candidates = {}
+
+  for _, prefix in ipairs(prefixes) do
+    local pattern = Core.EngineVersion.utf16Pattern(prefix)
+    local addresses = Core.EngineVersion.scanModulePattern( module, pattern )
+
+    for _, address in ipairs(addresses) do
+      local branch = readWideString( address, 160 )
+      local version = Core.EngineVersion.parseUnrealVersionText(branch)
+
+      if version then
+        local key = ('%d.%d'):format( version.major, version.minor )
+        candidates[key] = candidates[key] or { version = version, raw = branch }
+      end
+    end
+  end
+
+  local selected
+  for _, candidate in pairs(candidates) do
+    if selected then return nil end -- conflicting embedded engine branches are ambiguous
+    selected = candidate
+  end
+
+  if selected then
+    local version = selected.version
+    version.source = 'embedded-unreal-branch'
+    version.confidence = 'high'
+    version.raw = selected.raw
+    version.module = moduleName
+    return version
+  end
+
+  return nil
+end
+
+--- Read plausible engine version from executable metadata
+-- @param module table @ main-module descriptor
+-- @return table|nil @ detected version descriptor
+function Core.EngineVersion.detectFileMetadata(module)
+  if type(getFileVersion) ~= 'function' or not module.PathToFile then return nil end
+
+  local versionText, info = getFileVersion(module.PathToFile)
+  local productVersion = type(info) == 'table' and info.ProductVersion or nil
+  local productVersionResult = Core.EngineVersion.parseUnrealVersionText(productVersion)
+  local version = productVersionResult or Core.EngineVersion.parseUnrealVersionText(versionText)
+
+  if version then
+    version.source = productVersionResult and 'file-product-version' or 'file-version-text'
+    version.confidence = 'medium'
+    version.raw = productVersion or versionText
+  else
+    if type(info) ~= 'table' then return nil end
+
+    version = Core.EngineVersion.normalize( info.major, info.minor, info.release )
+
+    if not version then return nil end
+
+    version.source = 'file-version-components'
+    version.confidence = 'low'
+    version.raw = versionText
+  end
+
+  version.module = extractFileName( module.PathToFile or '' )
+  return version
+end
+
+--- Infer UE version
+-- @return table|nil @ detected descriptor with source/confidence
+-- @return string|nil @ detection error
+function Core.EngineVersion.detect()
+  local module = Core.EngineVersion.getMainModule()
+  if not module then return nil, 'Main executable module is unavailable' end
+
+  local version = Core.EngineVersion.detectEmbeddedBranch(module) or Core.EngineVersion.detectFileMetadata(module)
+
+  if not version then
+    return nil, 'Unreal Engine version was not found in embedded branch strings or executable metadata'
+  end
+
+  version.overridden = false
+  version.processId = getOpenedProcessID()
+  Core.State.detectedEngineVersion = version
+
+  if CUEDEFS then CUEDEFS.EngineVersion = Core.EngineVersion.get() end
+  return Core.EngineVersion.copy(version)
+end
+
+--- Select/clear configured engine version
+-- @param versionOrMajor table|string|number|nil @ nil clears the override
+-- @param minor number|nil
+-- @param patch number|nil
+-- @return table|boolean|nil @ selected descriptor, or true when cleared
+-- @return string|nil @ validation error
+function Core.EngineVersion.set(versionOrMajor, minor, patch)
+  if Core.State.scannerRunning then return nil, 'Cannot change engine version while reflection scan is running' end
+
+  if versionOrMajor == nil then
+    Core.State.engineVersionOverride = nil
+
+    if CUEDEFS then CUEDEFS.EngineVersion = Core.EngineVersion.get() end
+    return true
+  end
+
+  local version, versionError = Core.EngineVersion.normalize( versionOrMajor, minor, patch )
+  if not version then return nil, versionError end
+
+  version.source = 'explicit-override'
+  version.confidence = 'explicit'
+  version.overridden = true
+  version.processId = getOpenedProcessID()
+  Core.State.engineVersionOverride = version
+
+  if CUEDEFS then CUEDEFS.EngineVersion = Core.EngineVersion.copy(version) end
+  return Core.EngineVersion.copy(version)
+end
+
+--- Return version override or recent detection
+-- @return table|nil @ independent version descriptor
+function Core.EngineVersion.get()
+  local processId = getOpenedProcessID()
+  local selected = Core.State.engineVersionOverride
+
+  if not selected or selected.processId ~= processId then selected = Core.State.detectedEngineVersion end
+  if not selected or selected.processId ~= processId then return nil end
+
+  return Core.EngineVersion.copy(selected)
+end
+
+
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CORE.LAYOUT
+
+local OVERRIDABLE_LAYOUT_TABLES =
+{
+  FNameEntry = true,
+  UObject = true,
+  UStruct = true,
+  UClass = true,
+  UField = true,
+  FFieldClass = true,
+  FField = true,
+  FProperty = true,
+  UFunction = true,
+  FUObjectItem = true,
+  FUObjectArray = true,
+  TUObjectArray = true,
+  FObjectPropertyBase = true,
+  FStructProperty = true,
+  FArrayProperty = true,
+  FMapProperty = true,
+  FSetProperty = true,
+  FBoolProperty = true,
+  FByteProperty = true,
+  FEnumProperty = true,
+  FClassProperty = true,
+  FSoftClassProperty = true,
+  FDelegateProperty = true,
+  FMulticastDelegateProperty = true,
+  FInterfaceProperty = true,
+  FFieldPathProperty = true,
+}
+
+local OVERRIDABLE_LAYOUT_VALUES =
+{
+  ObjectArrayEntryStructSize = true,
+  ObjectArrayObjectOffset = true,
+  FNameHeaderShift = true,
+  VFTableInExecutableMemoryMethod = true,
+}
+
+--- Recursively copy a table
+function Core.Layout.copy(value)
+  if type(value) ~= 'table' then return value end
+
+  local result = {}
+  for key, child in pairs(value) do
+    result[key] = Core.Layout.copy(child)
+  end
+  return result
+end
+
+--- Validate configured layout offsets
+-- @param overrides table @ CUEDEFS-shaped offset tables
+-- @return table|nil @ normalized independent override table
+-- @return string|nil @ validation error
+function Core.Layout.normalize(overrides)
+  if type(overrides) ~= 'table' then return nil, 'Layout overrides must be a table' end
+
+  local normalized = {}
+
+  for layoutName, members in pairs(overrides) do
+
+    if OVERRIDABLE_LAYOUT_VALUES[layoutName] then
+      if type(members) ~= 'number' or members % 1 ~= 0 or members < 0 or members > 0x10000 then
+        return nil, layoutName .. ' must be a non-negative integer no larger than 0x10000'
+      end
+
+      normalized[layoutName] = members
+    else
+
+      if not OVERRIDABLE_LAYOUT_TABLES[layoutName] then
+        return nil, 'Unsupported layout override section: ' .. tostring(layoutName)
+      end
+
+      if type(members) ~= 'table' then return nil, layoutName .. ' must be a table of member offsets' end
+
+      local memberOffsets = {}
+
+      for memberName, offset in pairs(members) do
+        if type(memberName) ~= 'string' or memberName == '' then return nil, layoutName .. ' contains an invalid member name' end
+        if type(offset) ~= 'number' or offset % 1 ~= 0 or offset < 0 or offset > 0x10000 then
+          return nil, layoutName .. '.' .. memberName .. ' must be a non-negative integer no larger than 0x10000'
+        end
+
+        memberOffsets[memberName] = offset
+      end
+
+      normalized[layoutName] = memberOffsets
+    end
+  end
+
+  return normalized
+end
+
+--- Merge configured overrides into dumper object
+-- @return boolean @ false only when scanner state does not exist yet
+function Core.Layout.applyConfiguredOverrides()
+  local overrides = Core.State.layoutOverrides
+  if type(CUEDEFS) ~= 'table' or type(overrides) ~= 'table' then return false end
+
+  for layoutName, members in pairs(overrides) do
+
+    if type(members) == 'table' then
+      CUEDEFS[layoutName] = CUEDEFS[layoutName] or {}
+      for memberName, offset in pairs(members) do CUEDEFS[layoutName][memberName] = offset end
+    else
+      CUEDEFS[layoutName] = members
+    end
+
+  end
+
+  CUEDEFS.LayoutOverridesApplied = true
+  return true
+end
+
+--- Configure/clear explicit reflection-layout offsets
+-- @param overrides table|nil @ nil clears all overrides
+-- @return table|boolean|nil @ normalized overrides, or true when cleared
+-- @return string|nil @ validation error
+function Core.Layout.set(overrides)
+  if Core.State.scannerRunning then return nil, 'Cannot change layout overrides while reflection scan is running' end
+
+  if overrides == nil then
+    Core.State.layoutOverrides = nil
+    if CUEDEFS then CUEDEFS.LayoutOverridesApplied = nil end
+    return true
+  end
+
+  local normalized, validationError = Core.Layout.normalize(overrides)
+  if not normalized then return nil, validationError end
+
+  Core.State.layoutOverrides = normalized
+  Core.Layout.applyConfiguredOverrides()
+  return Core.Layout.copy(normalized)
+end
+
+--- Return configured layout overrides
+-- @return table|nil @ independent CUEDEFS-shaped table
+function Core.Layout.get()
+  return Core.Layout.copy(Core.State.layoutOverrides)
+end
+
+--- Return configured layout section
+-- @param sectionName string @ top-level CUEDEFS layout name
+-- @return table|number|nil @ configured section
+function Core.Layout.getConfiguredSection(sectionName)
+  local overrides = Core.State.layoutOverrides
+  if type(overrides) ~= 'table' then return nil end
+  return overrides[sectionName]
+end
+
+--- Validate configured field layout against known UClass
+-- @param classAddress number @ known UClass used as the validation anchor
+-- @return boolean|nil @ true when a complete supplied layout enumerates fields
+-- @return string|nil @ validation error; nil when no complete override exists
+function Core.Layout.validateConfiguredPropertyLayout(classAddress)
+  local overrides = Core.State.layoutOverrides
+  if type(overrides) ~= 'table' then return nil end
+
+  local classLayout = {}
+  for memberName, offset in pairs(overrides.UStruct or {}) do classLayout[memberName] = offset end
+  for memberName, offset in pairs(overrides.UClass or {}) do classLayout[memberName] = offset end
+  local propertyLayout = overrides.FProperty
+  local fieldClassLayout = overrides.FFieldClass
+  local fieldLayout = overrides.FField
+
+  if type(classLayout) ~= 'table' or type(propertyLayout) ~= 'table' or type(fieldClassLayout) ~= 'table' then
+    return nil
+  end
+
+  local superStructOffset = classLayout.SuperStruct
+  local primaryRootOffset = classLayout.PropertyLink
+  local alternateRootOffset = classLayout.PropertyLinkAlt
+  local primaryNextOffset = propertyLayout.PropertyLinkNext
+  local alternateNextOffset = fieldLayout and fieldLayout.PropertyLinkNext
+
+  local hasCommonMembers = type(superStructOffset) == 'number'
+        and type(propertyLayout.Class) == 'number'
+        and type(propertyLayout.Name) == 'number'
+        and type(propertyLayout.Offset) == 'number'
+        and type(fieldClassLayout.Name) == 'number'
+
+  local hasPrimaryChain = type(primaryRootOffset) == 'number' and type(primaryNextOffset) == 'number'
+  local hasAlternateChain = type(alternateRootOffset) == 'number' and type( alternateNextOffset or primaryNextOffset ) == 'number'
+
+  if not hasCommonMembers or (not hasPrimaryChain and not hasAlternateChain) then return nil end
+  if not classAddress or classAddress == 0 then return nil, 'A known UClass is required to validate layout overrides' end
+
+  Core.Layout.applyConfiguredOverrides()
+  CUEDEFS.UClass = CUEDEFS.UClass or {}
+  CUEDEFS.UClass.SuperStruct = superStructOffset
+  if primaryRootOffset ~= nil then CUEDEFS.UClass.PropertyLink = primaryRootOffset end
+  if alternateRootOffset ~= nil then CUEDEFS.UClass.PropertyLinkAlt = alternateRootOffset end
+
+  local enumProperties = Core.Reflection and Core.Reflection.UClass_enumProperties
+  if type(enumProperties) ~= 'function' then return nil, 'Property enumerator is unavailable' end
+
+  local validationErrors = {}
+
+  for _, useAlternateChain in ipairs( { false, true } ) do
+
+    if ( not useAlternateChain and hasPrimaryChain ) or ( useAlternateChain and hasAlternateChain ) then
+      local properties, enumerationError = enumProperties( classAddress, useAlternateChain )
+
+      if properties and next(properties) ~= nil then
+        local chainName = useAlternateChain and 'alternate' or 'primary'
+        Core.Runtime.log( 'Layout overrides: validated supplied reflection layout through the ' .. chainName .. ' property chain' )
+        CUEDEFS.ProbedPropertyLayout = 'caller-supplied'
+        return true
+      end
+
+      validationErrors[#validationErrors + 1] = enumerationError or 'property chain yielded no named fields'
+    end
+  end
+
+  return nil, 'Supplied reflection layout did not enumerate fields: ' .. table.concat(validationErrors, '; ')
 end
 
 
@@ -3240,6 +3756,40 @@ end
 -- @return string|nil @ error
 function Core.Objects.findObjectItemStride(firstItemAddress)
 
+  local configuredItemSize = Core.Layout.getConfiguredSection('ObjectArrayEntryStructSize')
+  local configuredObjectOffset = Core.Layout.getConfiguredSection('ObjectArrayObjectOffset')
+
+  if configuredItemSize ~= nil or configuredObjectOffset ~= nil then
+
+    local candidateSizes = configuredItemSize and { configuredItemSize } or { 0x18, 0x20, 0x10, 0x28, 0x30 }
+    local candidateOffsets = configuredObjectOffset and { configuredObjectOffset } or { 0, 0x8 }
+    local selectedSize, selectedOffset, highestValidCount = nil, nil, 0
+
+    for _, candidateSize in ipairs(candidateSizes) do
+
+      for _, candidateOffset in ipairs(candidateOffsets) do
+
+        if candidateOffset < candidateSize then
+          local validCount = Core.Objects.ue_guessObjectItemStrideInternal( firstItemAddress, candidateSize, candidateOffset )
+
+          Core.Runtime.log(
+            ('Layout overrides: FUObjectItem stride 0x%X Object+0x%X validated %d/32 object slot(s)'):format( candidateSize, candidateOffset, validCount )
+          )
+
+          if validCount > highestValidCount then
+            selectedSize, selectedOffset, highestValidCount = candidateSize, candidateOffset, validCount
+          end
+        end
+      end
+    end
+
+    if highestValidCount < 2 then
+      return nil, nil, nil, 'Supplied FUObjectItem layout did not validate against runtime object slots'
+    end
+
+    return selectedSize, { selectedOffset, selectedOffset + selectedSize }, selectedOffset
+  end
+
   local inferredSize, objectPointerOffset = Core.Objects.ue_inferObjectItemSizeInternal(firstItemAddress)
 
   if inferredSize then
@@ -3267,6 +3817,24 @@ end
 -- @return boolean|nil @ true when an object-pointer offset is available
 -- @return string|nil @ inference error
 function Core.Objects.ensureObjectItemPointerOffset()
+  local configuredItemSize = Core.Layout.getConfiguredSection('ObjectArrayEntryStructSize')
+  local configuredObjectOffset = Core.Layout.getConfiguredSection('ObjectArrayObjectOffset')
+
+  if configuredItemSize ~= nil or configuredObjectOffset ~= nil then
+    if not CUEDEFS.ObjectArray then return nil, 'Saved object array is unavailable for override validation' end
+
+    local firstItemAddress, storageType, storageError = Core.Objects.resolveObjectItemStorage(CUEDEFS.ObjectArray)
+    if not firstItemAddress then return nil, storageError end
+
+    local itemSize, _, objectPointerOffset, strideError = Core.Objects.findObjectItemStride(firstItemAddress)
+    if not itemSize then return nil, strideError end
+
+    CUEDEFS.ObjectArrayListType = storageType
+    CUEDEFS.ObjectArrayEntryStructSize = itemSize
+    CUEDEFS.ObjectArrayObjectOffset = objectPointerOffset
+    return true
+  end
+
   if type(CUEDEFS.ObjectArrayObjectOffset) == 'number' then return true end
   if not CUEDEFS.ObjectArray or type(CUEDEFS.ObjectArrayEntryStructSize) ~= 'number' then
     return nil, 'Saved object-array layout is incomplete'
@@ -3421,6 +3989,38 @@ end
 -- @return boolean @ true when both required offsets were found
 -- @return string|nil @ error
 function Core.Objects.findUObjectLayout(firstItemAddress, itemSize, itemOffsets, objectPointerOffset)
+  local configuredLayout = Core.Layout.getConfiguredSection('UObject')
+
+  if type(configuredLayout) == 'table' and type(configuredLayout.Class) == 'number' and type(configuredLayout.Name) == 'number' then
+    
+    local objectAddresses = Core.Objects.collectUObjectSamples( firstItemAddress, itemSize, objectPointerOffset )
+    local minimumMatches = math.min( 8, #objectAddresses )
+
+    if minimumMatches == 0 then return false, 'No UObject samples were available to validate supplied offsets' end
+
+    local classConfidence = Core.Objects.scoreUObjectClassOffset( objectAddresses, configuredLayout.Class )
+    local nameMatchCount = 0
+
+    for _, objectAddress in ipairs(objectAddresses) do
+      local nameIndex = readInteger( objectAddress + configuredLayout.Name )
+      if nameIndex and CUEDEFS.IndexToName[nameIndex] then nameMatchCount = nameMatchCount + 1 end
+    end
+
+    -- readable pointer contributes 1 point
+    -- reaching self-referential UClass metaclass contributes 4 more
+    local minimumClassConfidence = minimumMatches * 4
+
+    if classConfidence < minimumClassConfidence or nameMatchCount < minimumMatches then
+      return false, ('Supplied UObject layout failed validation (Class confidence %d/%d, Name matches %d/%d)')
+                    :format( classConfidence, minimumClassConfidence, nameMatchCount, #objectAddresses )
+    end
+
+    CUEDEFS.UObject = CUEDEFS.UObject or {}
+    CUEDEFS.UObject.Class = configuredLayout.Class
+    CUEDEFS.UObject.Name = configuredLayout.Name
+    Core.Runtime.log( ('Layout overrides: validated UObject Class=0x%X Name=0x%X'):format( configuredLayout.Class, configuredLayout.Name ) )
+    return true
+  end
   
   local classOffset, nameOffset = Core.Objects.ue_inferUObjectOffsetsInternal( firstItemAddress, itemSize, objectPointerOffset )
 
@@ -3432,11 +4032,9 @@ function Core.Objects.findUObjectLayout(firstItemAddress, itemSize, itemOffsets,
     if not classOffset or not nameOffset then return false, inferenceError end
   end
 
-  CUEDEFS.UObject =
-  {
-    Class = classOffset, -- UClass
-    Name = nameOffset, -- Fname
-  }
+  CUEDEFS.UObject = CUEDEFS.UObject or {}
+  CUEDEFS.UObject.Class = classOffset -- UClass
+  CUEDEFS.UObject.Name = nameOffset -- FName
 
   return true
 end
@@ -6158,6 +6756,7 @@ function Core.Persistence.saveLayout(savedSettings)
     'UObject',
     'UStruct',
     'UClass',
+    'UFunction',
     'FProperty',
     'FFieldClass',
     'FField',
@@ -6218,6 +6817,8 @@ function Core.Scanner.initializeScannerState(cancellationThread)
 
   CUEDEFS = {}
   CUEDEFS.processid = processId
+  CUEDEFS.EngineVersion = Core.EngineVersion.get()
+  Core.Layout.applyConfiguredOverrides()
   Core.Menu.createUEMenu( true, cancellationThread )
   return true
 end
@@ -6287,6 +6888,7 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
   Core.Runtime.log('The state was fully parsed. Using it')
 
   Core.Persistence.restoreDefinitions(savedSettings)
+  Core.Layout.applyConfiguredOverrides()
 
   cancellationError = Core.Scanner.getCancellationError(cancellationThread)
   if cancellationError then return nil, cancellationError end
@@ -6315,6 +6917,29 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
 
   local ready, cacheError = Core.Scanner.cacheScannerNames(cancellationThread)
   if not ready then return nil, cacheError end
+
+  local configuredUObject = Core.Layout.getConfiguredSection('UObject')
+
+  if type(configuredUObject) == 'table' and type(configuredUObject.Class) == 'number' and type(configuredUObject.Name) == 'number' then
+
+    local firstItemAddress, _, storageError = Core.Objects.resolveObjectItemStorage(CUEDEFS.ObjectArray)
+    if not firstItemAddress then return nil, storageError end
+
+    local itemSize = CUEDEFS.ObjectArrayEntryStructSize
+    local objectPointerOffset = CUEDEFS.ObjectArrayObjectOffset
+    local itemOffsets = { objectPointerOffset, objectPointerOffset + itemSize }
+    local layoutReady, layoutError = Core.Objects.findUObjectLayout( firstItemAddress, itemSize, itemOffsets, objectPointerOffset )
+
+    if not layoutReady then return nil, layoutError end
+  end
+
+  if CUEDEFS.GEngine and CUEDEFS.UObject and type(CUEDEFS.UObject.Class) == 'number' then
+    local engineObjectAddress = readPointer(CUEDEFS.GEngine)
+    local engineClassAddress = engineObjectAddress and readPointer( engineObjectAddress + CUEDEFS.UObject.Class )
+    local overrideReady, overrideError = Core.Layout.validateConfiguredPropertyLayout(engineClassAddress)
+
+    if overrideError then return nil, overrideError end
+  end
 
   cancellationError = Core.Scanner.getCancellationError(cancellationThread)
   if cancellationError then return nil, cancellationError end
@@ -6712,6 +7337,10 @@ function Core.Scanner.findScannerPropertyLayout(cancellationThread)
   Core.Runtime.log( 'Figuring out the other offsets (Core.PropertyLayout.findGameInstanceFPropertyAndFields) ' )
   Core.Menu.setScannerStatus( 'Figuring out offsets', cancellationThread )
 
+  local overrideReady, overrideError = Core.Layout.validateConfiguredPropertyLayout( CUEDEFS.GameEngineClass )
+  if overrideReady then return true end
+  if overrideError then return nil, overrideError end
+
   local ready, layoutError = Core.PropertyLayout.findGameInstanceFPropertyAndFields(cancellationThread)
 
   if not ready then
@@ -6741,6 +7370,9 @@ function Core.Scanner.findIncompleteScannerRuntime(savedSettings, cancellationTh
 
     local ready, stageError = stage(...)
     if not ready then return ready, stageError end
+
+    -- configured offsets take precedence over restored/inferred ones
+    Core.Layout.applyConfiguredOverrides()
 
     cancellationError = Core.Scanner.getCancellationError(cancellationThread)
     if cancellationError then return nil, cancellationError end
@@ -7203,6 +7835,8 @@ function Core.API.ue_getScannerStatusInternal()
     namePoolScanMethod = type(CUEDEFS) == 'table' and CUEDEFS.NamePoolScanMethod or nil,
     cachedNameCount = type(CUEDEFS) == 'table' and CUEDEFS.CachedNameCount or 0,
     fnameToString = type(CUEDEFS) == 'table' and CUEDEFS.FNameToString or nil,
+    engineVersion = Core.EngineVersion.get(),
+    layoutOverrides = Core.Layout.get(),
   }
 
 end
@@ -7232,6 +7866,11 @@ Core.API.processEvent = Core.Signatures.resolveProcessEvent
 Core.API.setMenuVisible = Core.Menu.setMenuVisible
 Core.API.isMenuVisible = Core.Menu.isMenuVisible
 Core.API.clearSavedLayout = Core.Persistence.clearCurrentLayout
+Core.API.detectEngineVersion = Core.EngineVersion.detect
+Core.API.getEngineVersion = Core.EngineVersion.get
+Core.API.setEngineVersion = Core.EngineVersion.set
+Core.API.getLayoutOverrides = Core.Layout.get
+Core.API.setLayoutOverrides = Core.Layout.set
 Core.API.subsystems = Core
 
 return Core.API

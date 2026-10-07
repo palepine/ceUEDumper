@@ -234,6 +234,33 @@ function Module.Lifecycle.clearSavedLayout()
   return Core.clearSavedLayout()
 end
 
+--- Infer UE version from embedded branch data/PE metadata
+function Module.Lifecycle.detectEngineVersion()
+  return Core.detectEngineVersion()
+end
+
+--- Return explicit engine-version selection/recent detection
+function Module.Lifecycle.getEngineVersion()
+  return Core.getEngineVersion()
+end
+
+--- Select/clear engine version
+function Module.Lifecycle.setEngineVersion(versionOrMajor, minor, patch)
+  return Core.setEngineVersion( versionOrMajor, minor, patch )
+end
+
+--- Return configured layout overrides
+function Module.Lifecycle.getLayoutOverrides()
+  return Core.getLayoutOverrides()
+end
+
+--- Configure/clear layout overrides
+function Module.Lifecycle.setLayoutOverrides(overrides)
+  local result, layoutError = Core.setLayoutOverrides(overrides)
+  if result then Module.Objects.clearTypeLookupCache() end
+  return result, layoutError
+end
+
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// GUOBJECTARRAY ACCESS
 
@@ -915,21 +942,41 @@ local function readScriptArray(functionAddress, scriptOffset)
   }
 end
 
+-- @param address number @ target member address
+-- @return number|nil @ unsigned 16-bit value
+local function readUnsignedWord(address)
+  local value = readSmallInteger(address, false)
+  if type(value) ~= 'number' then return nil end
+  -- if value < 0 then value = value + 0x10000 end
+  return value & 0xFFFF
+end
+
 --- Resolve UStruct::Script
 -- @param functionAddress number @ UFunction UObject address
 -- @param definitions table @ current runtime definitions
 -- @return table|nil @ validated Script array metadata
 local function resolveScriptArray(functionAddress, definitions)
   local classLayout = definitions.UClass or {}
+  local structLayout = definitions.UStruct or {}
   local candidates = {}
   local seen = {}
 
+  local overrides = Core.getLayoutOverrides()
+  local explicitScriptOffset = overrides and ( overrides.UStruct and overrides.UStruct.Script or overrides.UClass and overrides.UClass.Script )
+
+  if type(explicitScriptOffset) == 'number' then
+    return readScriptArray( functionAddress, explicitScriptOffset )
+  end
+
   -- once a non-empty Script array established engine-wide member offset,
   -- later UFunctions need only one validated read, including native functions whose Script array is empty
-  if type(classLayout.Script) == 'number' then
-    local cachedScript = readScriptArray( functionAddress, classLayout.Script )
+  local configuredScriptOffset = structLayout.Script or classLayout.Script
+
+  if type(configuredScriptOffset) == 'number' then
+    local cachedScript = readScriptArray( functionAddress, configuredScriptOffset )
     if cachedScript then return cachedScript end
 
+    structLayout.Script = nil
     classLayout.Script = nil
   end
 
@@ -965,6 +1012,7 @@ local function resolveScriptArray(functionAddress, definitions)
 
     if script then
       if script.bytecodeSize > 0 then
+        structLayout.Script = scriptOffset
         classLayout.Script = scriptOffset
         return script
       end
@@ -978,13 +1026,13 @@ end
 
 --- Decode stable UFunction member group & inherited UStruct script array
 -- Candidate starts cover stock UE4/UE5 + shifted layouts
--- First candidate satisfying parameter bounds, return bounds and a readable thunk selected
+-- First candidate satisfying reflected parameter and return bounds is selected
 -- Deterministic
 -- @param functionAddress number @ UFunction UObject address
 -- @return table|nil @ function, bytecode and parameter metadata
 -- @return string|nil @ layout error
 function Module.Functions.functionMetadata(functionAddress)
-
+  -- UFunction::Func is decoded independently
   if not isValidAddress(functionAddress) or not objectHasMetaClass( functionAddress, 'Function' ) then
     return nil, 'Address is not a UFunction'
   end
@@ -992,6 +1040,7 @@ function Module.Functions.functionMetadata(functionAddress)
   local definitions = Core.definitions()
   local propertyLink = definitions.UClass and definitions.UClass.PropertyLink
   local expectedStart = type(propertyLink) == 'number' and propertyLink + (propertyLink >= 0x68 and 0x40 or 0x30) or nil
+  local configuredLayout = definitions.UFunction or {}
 
   local parameters, parameterError = Module.Reflection.properties(functionAddress)
   local reflectedParameterCount = 0
@@ -1013,94 +1062,133 @@ function Module.Functions.functionMetadata(functionAddress)
   end
 
   local starts = { 0xB0, 0xB8, 0xA0, 0x98, 0x88, 0xC0, 0xC8, expectedStart }
+  local candidateLayouts = {}
   local seen = {}
   local selected
+  local rejectedCandidates = {}
+
+  -- complete caller-supplied UFunction layout is tested before stock candidates
+  -- custom engine forks bypass the compact adjacency assumptions below
+  if type(configuredLayout.FunctionFlags) == 'number'
+     and type(configuredLayout.NumParms) == 'number'
+     and type(configuredLayout.ParmsSize) == 'number'
+     and type(configuredLayout.ReturnValueOffset) == 'number'
+     and type(configuredLayout.Func or configuredLayout.Function) == 'number'
+  then
+    candidateLayouts[ #candidateLayouts + 1 ] =
+    {
+      FunctionFlags = configuredLayout.FunctionFlags,
+      NumParms = configuredLayout.NumParms,
+      ParmsSize = configuredLayout.ParmsSize,
+      ReturnValueOffset = configuredLayout.ReturnValueOffset,
+      RPCId = configuredLayout.RPCId,
+      RPCResponseId = configuredLayout.RPCResponseId,
+      FirstPropertyToInit = configuredLayout.FirstPropertyToInit,
+      EventGraphFunction = configuredLayout.EventGraphFunction,
+      EventGraphCallOffset = configuredLayout.EventGraphCallOffset,
+      Func = configuredLayout.Func or configuredLayout.Function,
+    }
+  end
 
   for _, functionFlagsOffset in ipairs(starts) do
 
-    if type(functionFlagsOffset) == 'number' and not seen[ functionFlagsOffset ] then
-      seen[ functionFlagsOffset ] = true
+    if type(functionFlagsOffset) == 'number' and not seen[functionFlagsOffset] then
+      seen[functionFlagsOffset] = true
 
       for _, numParmsDelta in ipairs({ 4, 6, 8 }) do
-        local functionFlags = readInteger( functionAddress + functionFlagsOffset )
-        local numParms = readBytes( functionAddress + functionFlagsOffset + numParmsDelta, 1, false )
-        local parmsSize = readSmallInteger( functionAddress + functionFlagsOffset + numParmsDelta + 2 )
-        local returnValueOffset = readSmallInteger( functionAddress + functionFlagsOffset + numParmsDelta + 4 )
         local shiftedTail = numParmsDelta == 8
-        local firstPropertyDelta = shiftedTail and 0x18 or 0x10
-        local eventGraphDelta = shiftedTail and 0x20 or 0x18
-        local eventGraphCallDelta = shiftedTail and 0x28 or 0x20
-        local functionPointerDelta = shiftedTail and 0x30 or 0x28
-        local rpcIdDelta = shiftedTail and 0x12 or numParmsDelta + 6
-        local rpcResponseIdDelta = shiftedTail and 0x14 or numParmsDelta + 8
-        local functionPointer = readPointer( functionAddress + functionFlagsOffset + functionPointerDelta )
-        local functionPointerIsExecutable = isExecutableAddress(functionPointer)
-        local returnIsValid = returnValueOffset == 0xFFFF or returnValueOffset <= parmsSize
 
-        local reflectedReturnMatches
-
-        if reflectedReturnOffset then
-          reflectedReturnMatches = returnValueOffset == reflectedReturnOffset
-        else
-          reflectedReturnMatches = returnValueOffset == 0xFFFF
-        end
-
-        local parameterHeaderMatches = not parameters
-                                       or numParms == reflectedParameterCount
-                                       and parmsSize >= minimumParameterBufferSize
-                                       and reflectedReturnMatches
-
-        if functionFlags
-           and functionFlags ~= 0
-           and numParms
-           and numParms <= 0x80
-           and parmsSize
-           and parmsSize <= 0x8000
-           and returnValueOffset
-           and returnIsValid
-           and parameterHeaderMatches
-           and isValidAddress(functionPointer)
-           and readByte(functionPointer) ~= nil
-        then
-          selected =
-          {
-            address = functionAddress,
-            name = Module.Objects.objectName(functionAddress),
-            functionFlagsOffset = functionFlagsOffset,
-            functionFlags = functionFlags,
-            numParmsOffset = functionFlagsOffset + numParmsDelta,
-            parmsSizeOffset = functionFlagsOffset + numParmsDelta + 2,
-            returnValueOffsetOffset = functionFlagsOffset + numParmsDelta + 4,
-            rpcIdOffset = functionFlagsOffset + rpcIdDelta,
-            rpcResponseIdOffset = functionFlagsOffset + rpcResponseIdDelta,
-            firstPropertyToInitOffset = functionFlagsOffset + firstPropertyDelta,
-            eventGraphFunctionOffset = functionFlagsOffset + eventGraphDelta,
-            eventGraphCallOffsetOffset = functionFlagsOffset + eventGraphCallDelta,
-            functionPointerOffset = functionFlagsOffset + functionPointerDelta,
-            numParms = numParms,
-            parmsSize = parmsSize,
-            returnValueOffset = returnValueOffset,
-            rpcId = readSmallInteger( functionAddress + functionFlagsOffset + rpcIdDelta ),
-            rpcResponseId = readSmallInteger( functionAddress + functionFlagsOffset + rpcResponseIdDelta ),
-            firstPropertyToInit = readPointer( functionAddress + functionFlagsOffset + firstPropertyDelta ),
-            eventGraphFunction = readPointer( functionAddress + functionFlagsOffset + eventGraphDelta ),
-            eventGraphCallOffset = readInteger( functionAddress + functionFlagsOffset + eventGraphCallDelta ),
-            functionPointer = functionPointer,
-            functionPointerIsExecutable = functionPointerIsExecutable,
-            functionStorage = functionPointerIsExecutable and 'direct' or 'callable-wrapper',
-            native = functionFlags & 0x00000400 ~= 0,
-            blueprintCallable = functionFlags & 0x04000000 ~= 0,
-            blueprintEvent = functionFlags & 0x08000000 ~= 0,
-            blueprintPure = functionFlags & 0x10000000 ~= 0,
-          }
-          break
-        end
-
+        candidateLayouts[ #candidateLayouts + 1 ] =
+        {
+          FunctionFlags = functionFlagsOffset,
+          NumParms = functionFlagsOffset + numParmsDelta,
+          ParmsSize = functionFlagsOffset + numParmsDelta + 2,
+          ReturnValueOffset = functionFlagsOffset + numParmsDelta + 4,
+          RPCId = functionFlagsOffset + (shiftedTail and 0x12 or numParmsDelta + 6),
+          RPCResponseId = functionFlagsOffset + (shiftedTail and 0x14 or numParmsDelta + 8),
+          FirstPropertyToInit = functionFlagsOffset + (shiftedTail and 0x18 or 0x10),
+          EventGraphFunction = functionFlagsOffset + (shiftedTail and 0x20 or 0x18),
+          EventGraphCallOffset = functionFlagsOffset + (shiftedTail and 0x28 or 0x20),
+          Func = functionFlagsOffset + (shiftedTail and 0x30 or 0x28),
+        }
       end
+    end
+  end
 
+  for _, layout in ipairs(candidateLayouts) do
+    local functionFlags = readInteger( functionAddress + layout.FunctionFlags )
+    local numParms = readBytes( functionAddress + layout.NumParms, 1, false )
+    local parmsSize = readUnsignedWord( functionAddress + layout.ParmsSize )
+    local returnValueOffset = readUnsignedWord( functionAddress + layout.ReturnValueOffset )
+    local rawFunctionPointer = readPointer( functionAddress + layout.Func )
+    local functionPointerIsReadable = isValidAddress(rawFunctionPointer) and readByte(rawFunctionPointer) ~= nil
+    local functionPointer = functionPointerIsReadable and rawFunctionPointer or nil
+    local functionPointerIsExecutable = functionPointerIsReadable and isExecutableAddress(functionPointer)
+    local headerValuesReadable = type(numParms) == 'number' and type(parmsSize) == 'number' and type(returnValueOffset) == 'number'
+    local returnIsValid = headerValuesReadable and ( returnValueOffset == 0xFFFF or returnValueOffset <= parmsSize )
+    local reflectedReturnMatches = reflectedReturnOffset and returnValueOffset == reflectedReturnOffset or not reflectedReturnOffset and returnValueOffset == 0xFFFF
+    local parameterHeaderMatches = not parameters or headerValuesReadable and numParms == reflectedParameterCount and parmsSize >= minimumParameterBufferSize and reflectedReturnMatches
+
+    if type(functionFlags) == 'number'
+       and functionFlags ~= 0
+       and numParms
+       and numParms <= 0x80
+       and parmsSize
+       and parmsSize <= 0x8000
+       and returnValueOffset
+       and returnIsValid
+       and parameterHeaderMatches
+    then
+      selected =
+      {
+        address = functionAddress,
+        name = Module.Objects.objectName(functionAddress),
+        functionFlagsOffset = layout.FunctionFlags,
+        functionFlags = functionFlags,
+        numParmsOffset = layout.NumParms,
+        parmsSizeOffset = layout.ParmsSize,
+        returnValueOffsetOffset = layout.ReturnValueOffset,
+        rpcIdOffset = layout.RPCId,
+        rpcResponseIdOffset = layout.RPCResponseId,
+        firstPropertyToInitOffset = layout.FirstPropertyToInit,
+        eventGraphFunctionOffset = layout.EventGraphFunction,
+        eventGraphCallOffsetOffset = layout.EventGraphCallOffset,
+        functionPointerOffset = layout.Func,
+        numParms = numParms,
+        parmsSize = parmsSize,
+        returnValueOffset = returnValueOffset,
+        rpcId = layout.RPCId and readUnsignedWord( functionAddress + layout.RPCId ) or nil,
+        rpcResponseId = layout.RPCResponseId and readUnsignedWord( functionAddress + layout.RPCResponseId ) or nil,
+        firstPropertyToInit = layout.FirstPropertyToInit and readPointer( functionAddress + layout.FirstPropertyToInit ) or nil,
+        eventGraphFunction = layout.EventGraphFunction and readPointer( functionAddress + layout.EventGraphFunction ) or nil,
+        eventGraphCallOffset = layout.EventGraphCallOffset and readInteger( functionAddress + layout.EventGraphCallOffset ) or nil,
+        functionPointer = functionPointer,
+        rawFunctionPointer = rawFunctionPointer,
+        functionPointerIsReadable = functionPointerIsReadable,
+        functionPointerIsExecutable = functionPointerIsExecutable,
+        functionStorage = functionPointerIsExecutable and 'direct' or functionPointerIsReadable and 'callable-wrapper' or 'unavailable',
+        native = functionFlags & 0x00000400 ~= 0,
+        blueprintCallable = functionFlags & 0x04000000 ~= 0,
+        blueprintEvent = functionFlags & 0x08000000 ~= 0,
+        blueprintPure = functionFlags & 0x10000000 ~= 0,
+      }
+      break
     end
 
-    if selected then break end
+    if #rejectedCandidates < 8 then
+      rejectedCandidates[#rejectedCandidates + 1] =
+        ('flags+0x%X num+0x%X=%s size+0x%X=%s return+0x%X=%s func+0x%X=%s'):format(
+                                                                                    layout.FunctionFlags,
+                                                                                    layout.NumParms,
+                                                                                    tostring(numParms),
+                                                                                    layout.ParmsSize,
+                                                                                    tostring(parmsSize),
+                                                                                    layout.ReturnValueOffset,
+                                                                                    tostring(returnValueOffset),
+                                                                                    layout.Func,
+                                                                                    rawFunctionPointer and ('0x%X'):format(rawFunctionPointer) or 'nil'
+                                                                                  )
+    end
   end
 
   if not selected then
@@ -1108,8 +1196,22 @@ function Module.Functions.functionMetadata(functionAddress)
                              and ('reflected %d parameter(s), minimum buffer 0x%X'):format( reflectedParameterCount, minimumParameterBufferSize )
                              or ('parameter reflection unavailable: ' .. tostring(parameterError))
 
-    return nil, 'UFunction member layout was not recognized (' .. parameterSummary .. ')'
+    local candidateSummary = table.concat( rejectedCandidates, '; ' )
+    return nil, 'UFunction member layout was not recognized (' .. parameterSummary .. '); candidates: ' .. candidateSummary
   end
+
+  -- member group is engine-wide
+  definitions.UFunction = definitions.UFunction or {}
+  definitions.UFunction.FunctionFlags = selected.functionFlagsOffset
+  definitions.UFunction.NumParms = selected.numParmsOffset
+  definitions.UFunction.ParmsSize = selected.parmsSizeOffset
+  definitions.UFunction.ReturnValueOffset = selected.returnValueOffsetOffset
+  definitions.UFunction.RPCId = selected.rpcIdOffset
+  definitions.UFunction.RPCResponseId = selected.rpcResponseIdOffset
+  definitions.UFunction.FirstPropertyToInit = selected.firstPropertyToInitOffset
+  definitions.UFunction.EventGraphFunction = selected.eventGraphFunctionOffset
+  definitions.UFunction.EventGraphCallOffset = selected.eventGraphCallOffsetOffset
+  definitions.UFunction.Func = selected.functionPointerOffset
 
   local script = resolveScriptArray( functionAddress, definitions )
 
@@ -1168,6 +1270,10 @@ end
 function Module.Reflection.classHeaderLayout()
   local definitions = Core.definitions()
   local result = Module.Reflection.objectHeaderLayout()
+
+  for name, offset in pairs( definitions.UStruct or {} ) do
+    if type(offset) == 'number' then result[name] = offset end
+  end
 
   for name, offset in pairs( definitions.UClass or {} ) do
     if type(offset) == 'number' then result[name] = offset end
@@ -1905,6 +2011,11 @@ Module.configureSignatures = Module.Lifecycle.configureSignatures
 Module.wait = Module.Lifecycle.wait
 Module.status = Module.Lifecycle.status
 Module.clearSavedLayout = Module.Lifecycle.clearSavedLayout
+Module.detectEngineVersion = Module.Lifecycle.detectEngineVersion
+Module.getEngineVersion = Module.Lifecycle.getEngineVersion
+Module.setEngineVersion = Module.Lifecycle.setEngineVersion
+Module.getLayoutOverrides = Module.Lifecycle.getLayoutOverrides
+Module.setLayoutOverrides = Module.Lifecycle.setLayoutOverrides
 
 Module.objectCount = Module.Objects.objectCount
 Module.objectAt = Module.Objects.objectAt
