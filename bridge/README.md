@@ -1,4 +1,4 @@
-# ceUEDumper BP Hook bridge
+# ceUEDumper native hook and invocation bridge
 
 ## Build
 
@@ -24,3 +24,6 @@ Place in `\autorun\ceUEDumperModules`
 - scalar writes before/after call
 - conditional early return
 - graceful hook toggling/removal
+- queued `ProcessEvent` parameter buffers
+- game-thread `ProcessEvent` dispatch with finite repeat counts
+- queued invocation status, cancellation, result copying, explicit release

@@ -731,9 +731,19 @@ assert(restoredCount, restoreError)
 ### Invoking & argument passing
 
 #### `ue_callFunction(objectAddress, functionName, arguments, options)`
-  > UFunction invokation on the object with the following arguments (nil if void). Returns nil, errorMessage on some failure
+  > UFunction invocation on the object with the following arguments (nil if void). Returns nil, errorMessage on failure.
 
-    Notes: calls are synchronous and use CE calling API. Hance it doesn't call functions on the UE game thread. UFunction that requires game-thread context may spoil the day.
+    Calls are synchronous. Direct mode uses CE's remote calling thread.
+    Set `options.executionThread = 'game'` to register a function to run in the game thread
+
+    Returned table includes `functionAddress`, `processEventAddress`, `processEventSource`, `processEventVtableOffset`, `executionResult`, decoded output parameters
+    `options.processEventVtableOffset` selects an explicit byte offset in the target object's vtable
+    `options.processEventAddress` bypasses resolution with a known callable address
+    `options.processEventMode` can be `auto`, `vtable`, `signature`, `actor-signature`
+    `actor-signature` must only be used with an `AActor` instance
+
+    Object arguments are copied as pointers. The API doesnt construct/clone/add references/manage the pointed UObject
+    An FName string must already exist in the validated cached name pool
 
 Supported argumet types :
 
@@ -748,9 +758,31 @@ Supported argumet types :
 | POD `StructProperty`                                  | Table keyed by reflected member name; nested POD structs are recursive                 |
 
 
-Object arguments are copied as pointers. The API doesnt construct/clone/add references/manage the pointed UObject
+```lua
+-- scheduling to run the function in the game thread
+local options = 
+{
+  executionThread = 'game',
+  processEventMode = 'vtable',
+  processEventVtableOffset = 0x260,
+  timeout = 5000,
+}
 
-An FName string must already exist in the validated cached name pool:
+return ue_callFunction( player, 'I_Do_Mess_Up_Physics', nil, options )
+```
+Game-thread execution options:
+
+| Option | Meaning |
+| --- | --- |
+| `executionThread = 'game'` | Queue to run in the game-thread. Defaults to CE execution |
+| `gameThread = true` | Alias for `executionThread = 'game'` |
+| `runs = N` | Execute the function N times before returning; defaults to `1` |
+| `intervalDispatches = N` | Skip N in-game-thread `ProcessEvent` executions between runs |
+| `timeout = milliseconds` | Max time to wait for all requested runs |
+| `bridgePath = path` | Optional explicit bridge DLL path |
+
+The returned `executionResult` is the number of completed runs in game-thread mode.
+Output parameters and the return value are read after the last run.
 
 ```lua
 local arguments =
