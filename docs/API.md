@@ -8,6 +8,11 @@
 | `ue_isReady()`                                     | Get ready status                                       |
 | `ue_isNameReady()`                                 | Get cached names status                                |
 | `ue_getStatus()`                                   | Get verbose dumper state                               |
+| `ue_detectEngineVersion()`                         | Infer engine version and report evidence/confidence    |
+| `ue_getEngineVersion()`                            | Read explicit or last detected engine version          |
+| `ue_setEngineVersion(version)`                     | Select/clear engine version for the current script run  |
+| `ue_getLayoutOverrides()`                          | Read caller-supplied reflection layout offsets         |
+| `ue_setLayoutOverrides(layout)`                    | Supply/clear explicit reflection layout offsets        |
 | `ue_getConfig(key)`                                | Read persistent script configuration                   |
 | `ue_setConfig(key, value)`                         | Validate and persist one configuration value           |
 | `ue_resetConfig(key)`                              | Reset one or all configuration values                  |
@@ -67,6 +72,128 @@ local ready, err = ue_initDumper()
 assert(ready, err)
 ```
 
+### Engine version and layout fallback
+
+#### `ue_detectEngineVersion()`
+> Try to infer UE version
+
+```lua
+local version, err = ue_detectEngineVersion()
+assert(version, err)
+
+print( version.major, version.minor, version.patch )
+print( version.source, version.confidence, version.raw )
+```
+
+The result contains:
+
+| Field        | Description |
+| ------------ | ----------- |
+| `major`      | Unreal major version (`4` or `5`) |
+| `minor`      | Unreal minor version |
+| `patch`      | Patch version when available |
+| `source`     | `embedded-unreal-branch`, `file-product-version`, `file-version-text`, or `file-version-components` |
+| `raw`        | Original branch/version text |
+| `module`     | Executable module source |
+
+#### `ue_setEngineVersion(versionOrMajor, minor, patch)`
+> Select an explicit version for the current loaded script.
+
+```lua
+assert( ue_setEngineVersion('5.7.1') )
+assert( ue_setEngineVersion( { major = 4, minor = 24 } ) )
+assert( ue_setEngineVersion( 5, 3, 2 ) )
+
+-- clear the selection and expose the last detected value again
+assert( ue_setEngineVersion(nil) )
+```
+#### `ue_getEngineVersion()`
+> Return the explicit selection first, otherwise the last detection
+
+#### `ue_setLayoutOverrides(layout)`
+> Set known member offsets manually. Takes precedence over restored/inferred values
+
+    Notes:
+      - call it before `ue_initDumper()` to avoid inference
+      - partial tables are fine
+      -  ue_setLayoutOverrides(nil) disables manual values, needs rescan
+
+```lua
+local newLayout =
+{
+  UObject =
+  {
+    Class = 0x10,
+    Name = 0x18,
+  },
+
+  UStruct =
+  {
+    SuperStruct = 0x40,
+    Children = 0x48,
+    ChildProperties = 0x50,
+    PropertiesSize = 0x58,
+    MinAlignment = 0x5C,
+    Script = 0x60,
+  },
+
+  UClass =
+  {
+    SuperStruct = 0x40,
+    PropertyLink = 0x70,
+    PropertyLinkAlt = 0x50,
+  },
+
+  FFieldClass =
+  {
+    Name = 0,
+    SuperClass = 0x20,
+  },
+
+  FField =
+  {
+    Class = 0x8,
+    Owner = 0x10,
+    PropertyLinkNext = 0x20,
+    Name = 0x28,
+  },
+
+  FProperty =
+  {
+    Class = 0x8,
+    Owner = 0x10,
+    Name = 0x28,
+    Size = 0x3C,
+    Offset = 0x4C,
+    PropertyLinkNext = 0x58,
+  },
+
+  UFunction =
+  {
+    FunctionFlags = 0xB0,
+    NumParms = 0xB4,
+    ParmsSize = 0xB6,
+    ReturnValueOffset = 0xB8,
+    RPCId = 0xBA,
+    RPCResponseId = 0xBC,
+    FirstPropertyToInit = 0xC0,
+    EventGraphFunction = 0xC8,
+    EventGraphCallOffset = 0xD0,
+    Func = 0xD8,
+  },
+
+  ObjectArrayEntryStructSize = 0x18,
+  ObjectArrayObjectOffset = 0,
+}
+
+assert( ue_setLayoutOverrides( newLayout ) )
+
+assert( ue_initDumper() )
+```
+
+#### `ue_getLayoutOverrides()`
+> Return set layout
+
 ### Initialization status
 
 #### `ue_isReady()`
@@ -92,6 +219,8 @@ passed validation.
 | `namePoolDiscoveryMethod` | `string or nil` | How name pool was found                                                            |
 | `cachedNameCount`         | `number`        | Unique names cached                                                                |
 | `fnameToString`           | `number or nil` | ::ToString func resolved (dont bother for now)                                     |
+| `engineVersion`           | `table or nil`  | Explicit or last detected engine-version descriptor                                |
+| `layoutOverrides`         | `table or nil`  | Current caller-supplied layout overrides                                            |
 
 
 ## Properties and metadata
@@ -704,6 +833,7 @@ it must be of the same type or nullptr if overwritten
 ```lua
 local options =
 {
+  -- backend = 'auto', -- hooks BP VM dispatcher
   -- allInstances = true, -- to affect all instances
 
   -- every condition must match
@@ -761,6 +891,19 @@ deAlloc(enemyPointer)
 
 -- return ue_getBlueprintHooks()
 ```
+
+Backend:
+
+| `options.backend` | Behavior |
+|---|---|
+| `auto`/skipped | use `ProcessLocalScriptFunction` or `ProcessInternal` fallback |
+| `script` | require `ProcessLocalScriptFunction` or error |
+| `processInternal` | use `ProcessInternal` stored in `UFunction::Func` |
+| `func` | Per-function `UFunction::Func` swap |
+
+`scriptDispatcherAddress` can be used to pass a verified dispatcher
+`frameNodeOffset` defaults to `0x08` and identifies `FFrame::Node`
+`frameLocalsOffset` defaults to `0x20`
 
 Notes:
 
