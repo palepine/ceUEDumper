@@ -29,6 +29,16 @@ for name, parameter in pairs( info.parameters ) do
 end
 ```
 
+#### `ue_getNativeFunctionPointer(functionAddressOrType, functionName)`
+  > return the native callback stored by `UFunction::Func`
+
+```lua
+local functionAddress = assert( ue_findFunction('Character', 'Jump') )
+local nativePointer = assert( ue_getNativeFunctionPointer(functionAddress) )
+-- or 
+local nativePointer = assert( ue_getNativeFunctionPointer('Character', 'Jump') )
+```
+
 ### Blueprint bytecode pseudocode
 
 #### `ue_decompileFunction(functionAddress, options)`
@@ -135,5 +145,4 @@ local forFunction = ue_getFunctionPatches(functionAddress)
 local restoredCount, restoreError = ue_restoreAllFunctionPatches()
 assert(restoredCount, restoreError)
 ```
-
 

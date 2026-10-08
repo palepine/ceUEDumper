@@ -70,6 +70,8 @@
 
 `ue_getFunctionMetadata`
 
+`ue_getNativeFunctionPointer`
+
 `ue_decompileFunction`
 
 `ue_decompileClass`
