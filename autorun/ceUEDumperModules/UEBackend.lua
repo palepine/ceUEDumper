@@ -508,7 +508,14 @@ local function getTypeLookupState()
         ScriptStruct = {},
         Enum = {},
       },
+      slotsByKind =
+      {
+        Class = {},
+        ScriptStruct = {},
+        Enum = {},
+      },
       any = {},
+      anySlots = {},
       metaClassKinds = {},
     }
   else
@@ -566,14 +573,22 @@ end
 -- @param state table @ incremental lookup state
 -- @param typeAddress number @ UClass or UScriptStruct descriptor
 -- @param kind string @ Class, ScriptStruct or Enum
+-- @param objectIndex number @ current GUObjectArray slot
 -- @return string|nil @ reflected short name
-local function indexReflectedType(state, typeAddress, kind)
+local function indexReflectedType(state, typeAddress, kind, objectIndex)
   local name = Core.objectName(typeAddress)
   if not name then return nil end
 
   local kindIndex = state.byKind[kind]
-  if kindIndex[name] == nil then kindIndex[name] = typeAddress end
-  if state.any[name] == nil then state.any[name] = typeAddress end
+  if kindIndex[name] == nil then
+    kindIndex[name] = typeAddress
+    state.slotsByKind[kind][name] = objectIndex
+  end
+
+  if state.any[name] == nil then
+    state.any[name] = typeAddress
+    state.anySlots[name] = objectIndex
+  end
 
   local addresses = state.addressesByKind[kind]
   addresses[ #addresses + 1 ] = typeAddress
@@ -589,7 +604,8 @@ end
 local function indexNextReflectedType(state)
   if state.nextIndex >= state.view.count then return nil end
 
-  local objectAddress = Module.Objects.objectAtFromView( state.view, state.nextIndex )
+  local objectIndex = state.nextIndex
+  local objectAddress = Module.Objects.objectAtFromView( state.view, objectIndex )
   state.nextIndex = state.nextIndex + 1
 
   if not isValidAddress(objectAddress) then return nil end
@@ -600,7 +616,30 @@ local function indexNextReflectedType(state)
 
   if not detectedKind then return nil end
 
-  return objectAddress, detectedKind, indexReflectedType( state, objectAddress, detectedKind )
+  return objectAddress, detectedKind, indexReflectedType( state, objectAddress, detectedKind, objectIndex )
+end
+
+--- Check if indexed type still occupies its original object slot
+-- since BP classes may be destroyed
+-- @param state table @ incremental type-index state
+-- @param name string @ expected reflected short name
+-- @param kind string|nil @ expected reflected kind
+-- @param address number @ cached descriptor address
+-- @return boolean @ true while the cached descriptor remains current
+local function cachedTypeIsCurrent(state, name, kind, address)
+  local slot
+
+  if kind == nil then
+    slot = state.anySlots[name]
+  elseif state.slotsByKind[kind] then
+    slot = state.slotsByKind[kind][name]
+  end
+
+  if type(slot) ~= 'number' then return false end
+  if Module.Objects.objectAtFromView( state.view, slot ) ~= address then return false end
+  if Core.objectName(address) ~= name then return false end
+
+  return kind == nil or objectHasMetaClass(address, kind)
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// REFLECTED TYPE LOOKUP
@@ -616,13 +655,32 @@ function Module.Objects.findType(name, kind)
   if not state then return nil end
 
   local supportedKind = kind == nil or kind == 'Class' or kind == 'ScriptStruct' or kind == 'Enum'
+  local refreshOnMiss = supportedKind and state.nextIndex > 0
+  local rebuilt = false
   local requestedIndex
+
+  ::retryCurrentObjects::
+
+  requestedIndex = nil
 
   if kind == nil then         requestedIndex = state.any
   elseif supportedKind then   requestedIndex = state.byKind[kind]
   end
 
-  if requestedIndex and requestedIndex[name] then return requestedIndex[name] end
+  if requestedIndex and requestedIndex[name] then
+    local cachedAddress = requestedIndex[name]
+
+    if cachedTypeIsCurrent( state, name, kind, cachedAddress ) then return cachedAddress end
+
+    -- the descriptor was unloaded/reinstanced
+    -- rebuild from current GUObjectArray contents
+    -- so replacement with same reflected name can be discovered
+    typeLookupState = nil
+    state = getTypeLookupState()
+    if not state then return nil end
+    rebuilt = true
+    goto retryCurrentObjects
+  end
 
   -- keep support for undocumented metaclass names (avoid complicating Class/ScriptStruct index used by public API)
   if not supportedKind then
@@ -648,7 +706,17 @@ function Module.Objects.findType(name, kind)
     end
   end
 
-  return requestedIndex and requestedIndex[name] or nil
+  local result = requestedIndex and requestedIndex[name] or nil
+  if result or rebuilt or not refreshOnMiss then return result end
+
+  -- completed incremental index doesn't observe objects later inserted into an older/reused slot
+  -- retry once from slot zero after a miss after its package is loaded again
+  typeLookupState = nil
+  state = getTypeLookupState()
+  if not state then return nil end
+
+  rebuilt = true
+  goto retryCurrentObjects
 end
 
 --- Enumerate every reflected type of one supported kind

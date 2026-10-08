@@ -50,9 +50,10 @@ return ue_findClass('GameEngine')
 ```
 
 #### `ue_findObjectsOfClass(classNameOrAddress, options)`
+> Find runtime `UObject` instances using UClass. Exact-class query are default
 
-Find runtime `UObject` instances using UClass. Exact-class query are default
-Scans all objects on every call!
+    Scans all objects on every call!
+    Prefer class-name for long-running polling
 
 ```lua
 local objects, err, statistics = ue_findObjectsOfClass('GameInstance')
@@ -259,7 +260,6 @@ local offset, err = ue_getObjectPropertyOffset( worldAddr , 'OwningGameInstance'
 assert( offset, err )
 assert( ue_getObjectPropertyOffset( playerAddr, 'Settings.Cheats.GodMode' ) )
 ```
-
 
 
 

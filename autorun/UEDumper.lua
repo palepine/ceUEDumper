@@ -383,7 +383,7 @@ sharedResources.blueprintHooks = sharedResources.blueprintHooks or
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// HELPERS
 
---- Resolve and cache a reflected type address
+--- Resolve reflected type address through backend's self-validating index
 -- @param typeNameOrAddress string|number @ reflected name or address
 -- @param kind string|nil @ expected reflected metaclass name
 -- @return number|nil @ reflected type address
@@ -405,9 +405,7 @@ function Dumper.Helpers.resolveType(typeNameOrAddress, kind)
   end
 
   local cacheKey = (kind or '*') .. ':' .. typeNameOrAddress
-  if not typeCache[cacheKey] then
-    typeCache[cacheKey] = Backend.findType(typeNameOrAddress, kind)
-  end
+  typeCache[cacheKey] = Backend.findType(typeNameOrAddress, kind)
 
   return typeCache[cacheKey]
 end
