@@ -1168,6 +1168,97 @@ function Dumper.Reflection.ue_findStruct(structName)
   return Dumper.Helpers.resolveType( structName, 'ScriptStruct' )
 end
 
+--- Resolve components and display text of an FName
+-- @param value string|number|table @ name, comparison index, value descriptor, or address descriptor
+-- @param number number|nil @ optional stored FName Number override
+-- @return table|nil @ decoded FName information
+-- @return string|nil @ validation/lookup error
+function Dumper.Reflection.ue_getFNameInfo(value, number)
+  local status = Backend.status()
+  if not status or status.namesReady ~= true then return nil, 'Runtime FName cache is unavailable' end
+
+  local namesByIndex = Backend.namesByIndex()
+  if type(namesByIndex) ~= 'table' then return nil, 'Runtime FName cache is unavailable' end
+
+  local comparisonIndex
+  local storedNumber = number
+  local source
+  local address
+
+  if type(value) == 'string' then
+    comparisonIndex = Backend.nameIndex(value)
+    if comparisonIndex == nil then return nil, ('FName is absent from the cached name pool: %s'):format(value) end
+    source = 'name'
+  elseif type(value) == 'number' then
+    comparisonIndex = value
+    source = 'index'
+  elseif type(value) == 'table' then
+    if value.address ~= nil then
+      if type(value.address) ~= 'number' or value.address <= 0 or value.address % 1 ~= 0 then
+        return nil, 'FName address must be a positive integer'
+      end
+
+      address = value.address
+      comparisonIndex = readInteger(address)
+      local memoryNumber = readInteger(address + 4)
+
+      if comparisonIndex == nil or memoryNumber == nil then
+        return nil, ('FName is unreadable at 0x%X'):format(address)
+      end
+
+      comparisonIndex = comparisonIndex & 0xFFFFFFFF
+      if storedNumber == nil then storedNumber = memoryNumber & 0xFFFFFFFF end
+      source = 'memory'
+    else
+      comparisonIndex = value.comparisonIndex
+      if comparisonIndex == nil then comparisonIndex = value.index end
+
+      if comparisonIndex == nil and type(value.name) == 'string' then
+        comparisonIndex = Backend.nameIndex(value.name)
+        if comparisonIndex == nil then
+          return nil, ('FName is absent from the cached name pool: %s'):format(value.name)
+        end
+      end
+
+      if storedNumber == nil then storedNumber = value.number end
+      source = type(value.name) == 'string' and 'name' or 'value'
+    end
+  else
+    return nil, 'FName value must be a name, comparison index, or descriptor table'
+  end
+
+  if type(comparisonIndex) ~= 'number' or comparisonIndex < 0 or comparisonIndex % 1 ~= 0 then
+    return nil, 'FName comparison index must be a non-negative integer'
+  end
+
+  storedNumber = storedNumber or 0
+  if type(storedNumber) ~= 'number' or storedNumber < 0 or storedNumber % 1 ~= 0 then
+    return nil, 'FName Number must be a non-negative integer'
+  end
+
+  local baseName = namesByIndex[comparisonIndex]
+  if type(baseName) ~= 'string' then
+    return nil, ('FName comparison index 0x%X is absent from the cached name pool'):format(comparisonIndex)
+  end
+
+  local displayNumber = storedNumber > 0 and storedNumber - 1 or nil
+  local displayName = displayNumber and (baseName .. '_' .. tostring(displayNumber)) or baseName
+
+  return
+  {
+    comparisonIndex = comparisonIndex,
+    index = comparisonIndex,
+    number = storedNumber,
+    displayNumber = displayNumber,
+    baseName = baseName,
+    name = displayName,
+    displayName = displayName,
+    isNumbered = storedNumber > 0,
+    source = source,
+    address = address,
+  }
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// OBJECT & PROPERTY PATH QUERIES
 
 --- Enumerate properties using UObject addr
@@ -4966,6 +5057,7 @@ Dumper.API =
   ue_findObjectsOfClass = Dumper.Objects.ue_findObjectsOfClass,
   ue_findClassReferences = Dumper.References.ue_findClassReferences,
   ue_findStruct = Dumper.Reflection.ue_findStruct,
+  ue_getFNameInfo = Dumper.Reflection.ue_getFNameInfo,
   ue_enumFlattenedProperties = Dumper.Structures.ue_enumFlattenedProperties,
   ue_createStructureFromType = Dumper.Structures.ue_createStructureFromType,
   ue_createStructureFromObject = Dumper.Structures.ue_createStructureFromObject,
