@@ -3434,6 +3434,34 @@ function Dumper.Functions.ue_getFunctionMetadata(functionAddress)
   return Backend.functionMetadata(functionAddress)
 end
 
+--- Resolve native callback stored by UFunction::Func
+-- @param functionAddressOrType number|string @ UFunction or owning UClass/UStruct
+-- @param functionName string|nil @ required when first arg is an owning type
+-- @return number|nil @ executable native function pointer
+-- @return string|nil @ lookup, layout, or non-native error
+function Dumper.Functions.ue_getNativeFunctionPointer(functionAddressOrType, functionName)
+  local functionAddress
+
+  if functionName ~= nil then
+    assert( type(functionName) == 'string' and functionName ~= '', 'function name must be non-empty' )
+    local functionError
+    functionAddress, functionError = Dumper.Functions.ue_findFunction( functionAddressOrType, functionName )
+    if not functionAddress then return nil, functionError end
+  else
+    assert( type(functionAddressOrType) == 'number' and functionAddressOrType ~= 0, 'function address must be non-zero' )
+    functionAddress = functionAddressOrType
+  end
+
+  local metadata, metadataError = Backend.functionMetadata(functionAddress)
+  if not metadata then return nil, metadataError end
+  if not metadata.native then return nil, 'UFunction is not native' end
+  if not metadata.functionPointerIsExecutable or not metadata.functionPointer then
+    return nil, 'Executable native UFunction::Func pointer was not resolved'
+  end
+
+  return metadata.functionPointer
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// FUNCTION INVOCATION
 
 Dumper.Invocation.scalarSizes =
@@ -4951,6 +4979,7 @@ Dumper.API =
   ue_enumFunctions = Dumper.Functions.ue_enumFunctions,
   ue_findFunction = Dumper.Functions.ue_findFunction,
   ue_getFunctionMetadata = Dumper.Functions.ue_getFunctionMetadata,
+  ue_getNativeFunctionPointer = Dumper.Functions.ue_getNativeFunctionPointer,
   ue_decompileFunction = Dumper.Decompiler.ue_decompileFunction,
   ue_decompileClass = Dumper.Decompiler.ue_decompileClass,
   ue_patchFunction = Dumper.Patching.ue_patchFunction,
