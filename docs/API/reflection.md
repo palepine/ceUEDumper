@@ -169,6 +169,35 @@ Each returned record contains:
 return ue_findStruct('SomeGameStructure')
 ```
 
+#### `ue_getFNameInfo(value, number)`
+> Resolve FName 
+
+```lua
+local byName = assert( ue_getFNameInfo('Player') )
+print( byName.comparisonIndex, byName.name )
+
+local byIndex = assert( ue_getFNameInfo( byName.comparisonIndex, 2 ) )
+print( byIndex.baseName, byIndex.number, byIndex.displayName ) -- Player, 2, Player_1
+
+local fromValue = assert( ue_getFNameInfo { comparisonIndex = byName.comparisonIndex, number = 1, } )
+
+local fromMemory = assert( ue_getFNameInfo { address = objectAddress + nameOffset } )
+```
+
+Returns:
+
+| Field             | Description |
+| ----------------- | ----------- |
+| `comparisonIndex` | Runtime FName comparison index |
+| `index`            | `comparisonIndex` alias |
+| `number`           | Stored FName Number |
+| `displayNumber`    | Displayed numeric suffix; `nil` for an unnumbered name |
+| `baseName`         | Name-pool text before the numbered suffix |
+| `name`             | Complete displayed name |
+| `displayName`      | `name` alias |
+| `isNumbered`       | Stored `Number` nonzero? |
+| `source`           | `name`, `index`, `value`, `memory` |
+
 ### Bulk enumeration
 
 #### `ue_enumProperties( typeNameOrAddress )`
@@ -230,7 +259,6 @@ local offset, err = ue_getObjectPropertyOffset( worldAddr , 'OwningGameInstance'
 assert( offset, err )
 assert( ue_getObjectPropertyOffset( playerAddr, 'Settings.Cheats.GodMode' ) )
 ```
-
 
 
 

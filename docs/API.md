@@ -30,6 +30,8 @@
 
 `ue_findStruct`
 
+`ue_getFNameInfo`
+
 `ue_enumProperties`
 
 `ue_enumObjectProperties`
