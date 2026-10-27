@@ -3256,8 +3256,11 @@ end
 -- @param candidateItemSize number @ candidate FUObjectItem byte size
 -- @param objectPointerOffset number @ candidate FUObjectItem::Object member offset
 -- @return number @ number of coherent object/vtable/function chains
+-- @return number @ number whose UObject InternalIndex matches the slot
 function Core.Objects.ue_guessObjectItemStrideInternal(firstItemAddress, candidateItemSize, objectPointerOffset)
   local validObjectCount = 0
+  local matchingIndexCount = 0
+  local internalIndexOffsets = { 0xC, 0x8, 0x10, 0x14 }
 
   for objectIndex = 0, 31 do
     local itemAddress = firstItemAddress + objectIndex * candidateItemSize
@@ -3279,10 +3282,19 @@ function Core.Objects.ue_guessObjectItemStrideInternal(firstItemAddress, candida
 
     validObjectCount = validObjectCount + 1
 
+    for _, internalIndexOffset in ipairs(internalIndexOffsets) do
+
+      if readInteger( objectAddress + internalIndexOffset ) == objectIndex then
+        matchingIndexCount = matchingIndexCount + 1
+        break
+      end
+
+    end
+
     ::continue::
   end
 
-  return validObjectCount
+  return validObjectCount, matchingIndexCount
 end
 
 --- Infer FUObjectItem size from several known layout candidates
@@ -3295,33 +3307,49 @@ function Core.Objects.ue_inferObjectItemSizeInternal(firstItemAddress)
 
   local candidateItemSizes = { 0x18, 0x20, 0x10, 0x28, 0x30 }
   local candidateObjectPointerOffsets = { 0, 0x8 }
-  local bestItemSize, bestObjectPointerOffset, bestValidObjectCount = nil, nil, 0
+
+  local bestItemSize, bestObjectPointerOffset, bestValidObjectCount, bestMatchingIndexCount = nil, nil, 0, 0
+  local fallbackItemSize, fallbackObjectPointerOffset, fallbackValidObjectCount = nil, nil, 0
 
   for _, candidateItemSize in ipairs( candidateItemSizes ) do
     for _, objectPointerOffset in ipairs(candidateObjectPointerOffsets) do
       if objectPointerOffset >= candidateItemSize then goto continue end
 
-      local validObjectCount = guessObjectItemStride( firstItemAddress, candidateItemSize, objectPointerOffset )
+      local validObjectCount, matchingIndexCount = guessObjectItemStride( firstItemAddress, candidateItemSize, objectPointerOffset )
 
       writeLog(
-        ('Core.Objects.FindObjectArray: FUObjectItem stride 0x%X Object+0x%X scored %d/32')
-        :format( candidateItemSize, objectPointerOffset, validObjectCount )
+        ('Core.Objects.FindObjectArray: FUObjectItem stride 0x%X Object+0x%X scored %d/32 vtables, %d/32 matching indices')
+        :format( candidateItemSize, objectPointerOffset, validObjectCount, matchingIndexCount )
       )
 
-      if validObjectCount > bestValidObjectCount then
+      if matchingIndexCount > bestMatchingIndexCount or (matchingIndexCount == bestMatchingIndexCount and validObjectCount > bestValidObjectCount)
+      then
         bestItemSize = candidateItemSize
         bestObjectPointerOffset = objectPointerOffset
         bestValidObjectCount = validObjectCount
+        bestMatchingIndexCount = matchingIndexCount
+      end
+
+      if validObjectCount > fallbackValidObjectCount then
+        fallbackItemSize = candidateItemSize
+        fallbackObjectPointerOffset = objectPointerOffset
+        fallbackValidObjectCount = validObjectCount
       end
 
       ::continue::
     end
   end
 
+  if bestMatchingIndexCount < 2 then
+    bestItemSize = fallbackItemSize
+    bestObjectPointerOffset = fallbackObjectPointerOffset
+    bestValidObjectCount = fallbackValidObjectCount
+  end
+
   if bestValidObjectCount >= 2 then
     writeLog(
-      ('Core.Objects.FindObjectArray: selected FUObjectItem stride 0x%X Object+0x%X')
-      :format( bestItemSize, bestObjectPointerOffset )
+      ('Core.Objects.FindObjectArray: selected FUObjectItem stride 0x%X Object+0x%X (%s)')
+      :format( bestItemSize, bestObjectPointerOffset, bestMatchingIndexCount >= 2 and (tostring(bestMatchingIndexCount) .. ' matching indices') or 'vtable fallback' )
     )
     return bestItemSize, bestObjectPointerOffset
   end
@@ -3639,6 +3667,51 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// GOBJECT STORAGE LAYOUT
 
+--- Get FUObjectArray/TUObjectArray member layouts
+-- @return table[] @ ordered layout descriptors
+function Core.Objects.getObjectArrayLayouts()
+  local legacy =
+  {
+    label = 'UE4-UE5.7',
+    storage = 0x10,
+    numElements = 0x24,
+    maxElements = 0x20,
+    numChunks = 0x2C,
+    maxChunks = 0x28,
+    preAllocatedObjects = 0x18,
+  }
+
+  -- UE 5.8 moved ObjObjects to the start of FUObjectArray and reordered the count fields inside TUObjectArray
+  local ue58 =
+  {
+    label = 'UE5.8+',
+    storage = 0x0,
+    numElements = 0x8,
+    maxElements = 0xC,
+    numChunks = 0x10,
+    maxChunks = 0x14,
+    preAllocatedObjects = 0x18,
+  }
+
+  local version = CUEDEFS and CUEDEFS.EngineVersion or Core.EngineVersion.get()
+  local prefersUE58 = version and version.major == 5 and version.minor >= 8
+
+  return prefersUE58 and { ue58, legacy } or { legacy, ue58 }
+end
+
+--- Publish selected FUObjectArray member offsets
+-- @param layout table @ validated layout descriptor
+-- @return nil
+function Core.Objects.applyObjectArrayLayout(layout)
+  CUEDEFS.ObjectArrayStorageOffset = layout.storage
+  CUEDEFS.ObjectArrayNumElementsOffset = layout.numElements
+  CUEDEFS.ObjectArrayMaxElementsOffset = layout.maxElements
+  CUEDEFS.ObjectArrayNumChunksOffset = layout.numChunks
+  CUEDEFS.ObjectArrayMaxChunksOffset = layout.maxChunks
+  CUEDEFS.ObjectArrayPreAllocatedObjectsOffset = layout.preAllocatedObjects
+  CUEDEFS.ObjectArrayLayout = layout.label
+end
+
 --- Test possible single chunk through its first object's virtual functions
 -- @param chunkAddress number|nil @ candidate chunk address
 -- @return boolean @ true when its first three virtual functions are executable
@@ -3681,7 +3754,8 @@ end
 function Core.Objects.resolveObjectItemStorage(arrayAddress)
   --get the first block
   --test what type of list this is. pointer list, or a (huge) list of ObjectArray entries
-  local storageAddress = readPointer( arrayAddress + 0x10 )
+  local storageOffset = CUEDEFS.ObjectArrayStorageOffset or 0x10
+  local storageAddress = readPointer( arrayAddress + storageOffset )
   if not storageAddress or storageAddress == 0 then return nil, nil, 'Object array storage is unreadable' end
 
   local firstPointer = readPointer(storageAddress)
@@ -4173,6 +4247,16 @@ function Core.Objects.FindObjectArray(cancellationThread)
   local arrayAddress, arrayError, candidates = Core.Objects.locateObjectArray( cancellationThread )
   if not arrayAddress then return false, arrayError, candidates end
   CUEDEFS.ObjectArray = arrayAddress -- addr of the global FUObjectArray header
+
+  if type(CUEDEFS.ObjectArrayStorageOffset) ~= 'number' then
+
+    local objectArrayLayout = Core.Signatures.ue_validateObjectArrayInternal( arrayAddress )
+    if not objectArrayLayout then return false, 'FUObjectArray member layout was not recognized' end
+
+    Core.Objects.applyObjectArrayLayout( objectArrayLayout )
+
+    Core.Runtime.log( ('Core.Objects.FindObjectArray: selected %s object-array members'):format( objectArrayLayout.label ) )
+  end
 
   local firstItemAddress, storageType, storageError = Core.Objects.resolveObjectItemStorage( arrayAddress )
   if not firstItemAddress then return false, storageError end
@@ -5406,8 +5490,10 @@ function Core.Signatures.ue_objectMatchesArrayIndexInternal(object)
     return false
   end
 
-  local objects = readPointer( CUEDEFS.ObjectArray + 0x10 )
-  local count = readInteger( CUEDEFS.ObjectArray + 0x24 )
+  local storageOffset = CUEDEFS.ObjectArrayStorageOffset or 0x10
+  local countOffset = CUEDEFS.ObjectArrayNumElementsOffset or 0x24
+  local objects = readPointer( CUEDEFS.ObjectArray + storageOffset )
+  local count = readInteger( CUEDEFS.ObjectArray + countOffset )
 
   if not objects or objects == 0 or not count or count <= 0 then return false end
 
@@ -6028,43 +6114,49 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// GOBJECTS SIGNATURE RESOLUTION
 
---- Validate common x64 FUObjectArray/chunked-array layout
+--- Validate supported x64 FUObjectArray/chunked-array layouts
 -- @param address number @ candidate FUObjectArray base
--- @return boolean @ true when counts and first object pointers are coherent
+-- @return table|nil @ matching object-array layout descriptor
 function Core.Signatures.ue_validateObjectArrayInternal(address)
-  if not address or address <= 0 then return false end
+  if not address or address <= 0 then return nil end
 
-  local objects = readPointer(address + 0x10)
-  local maxElements = readInteger(address + 0x20)
-  local numElements = readInteger(address + 0x24)
-  local maxChunks = readInteger(address + 0x28)
-  local numChunks = readInteger(address + 0x2C)
+  for _, layout in ipairs( Core.Objects.getObjectArrayLayouts() ) do
 
-  if not objects or objects == 0 or not maxElements or not numElements or not maxChunks or not numChunks then return false end
+    local objects = readPointer( address + layout.storage )
+    local maxElements = readInteger( address + layout.maxElements )
+    local numElements = readInteger( address + layout.numElements )
+    local maxChunks = readInteger( address + layout.maxChunks )
+    local numChunks = readInteger( address + layout.numChunks )
 
-  if numElements < 1 or maxElements < numElements or maxElements > 0x10000000 then return false end
+    if not objects or objects == 0 or not maxElements or not numElements or not maxChunks or not numChunks then goto continueLayout end
+    if numElements < 1 or maxElements < numElements or maxElements > 0x10000000 then goto continueLayout end
+    if numChunks < 1 or maxChunks < numChunks or maxChunks > 0x10000 then goto continueLayout end
 
-  if numChunks < 1 or maxChunks < numChunks or maxChunks > 0x10000 then return false end
+    local firstChunk = readPointer( objects )
+    if not firstChunk or firstChunk == 0 then goto continueLayout end
 
-  local firstChunk = readPointer(objects)
+    -- UE5.7 moved FUObjectItem::Object from +0x0 to +0x8
+    -- FUObjectItem layout is selected independently after the array header
+    for _, objectPointerOffset in ipairs({ 0, 0x8 }) do
 
-  if not firstChunk or firstChunk == 0 then return false end
+      local firstObject = readPointer( firstChunk + objectPointerOffset )
+      if not firstObject or firstObject == 0 then goto continueObject end
 
-  -- UE5.7 moved FUObjectItem::Object from +0x0 to +0x8, FlagsAndRefCount go first
-  -- layout is selected later
-  for _, objectPointerOffset in ipairs({ 0, 0x8 }) do
-    local firstObject = readPointer( firstChunk + objectPointerOffset )
-    if not firstObject or firstObject == 0 then goto continue end
+      firstObject = firstObject & 0xFFFFFFFFFFFFFFF8
+      local firstVtable = readPointer( firstObject )
+      local firstFunction = firstVtable and readPointer( firstVtable )
 
-    local firstVtable = readPointer(firstObject)
-    local firstFunction = firstVtable and readPointer(firstVtable)
+      if firstFunction and readByte(firstFunction) ~= nil then
+        return layout
+      end
 
-    if firstFunction and readByte(firstFunction) ~= nil then return true end
+      ::continueObject::
+    end
 
-    ::continue::
+    ::continueLayout::
   end
 
-  return false
+  return nil
 end
 
 --- Normalize RIP target referencing GUObjectArray or an embedded field
@@ -6095,7 +6187,14 @@ function Core.Signatures.ue_normalizeObjectArrayInternal(address)
     if candidate > 0 and not seenAddr[candidate] then
       seenAddr[candidate] = true
 
-      if Core.Signatures.ue_validateObjectArrayInternal(candidate) then return candidate end
+      local layout = Core.Signatures.ue_validateObjectArrayInternal(candidate)
+
+      if layout then
+        Core.Objects.applyObjectArrayLayout(layout)
+        Core.Runtime.log( ('SIG: selected %s GUObjectArray layout at 0x%X'):format(layout.label, candidate) )
+        return candidate
+      end
+      
     end
 
   end
@@ -6582,24 +6681,26 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// EXECUTABLE IDENTITY
 
---- Generate exe identifier used for persisted layouts
+--- Generate executable identifier used by the established layout-key path
+-- Keep the historical header hash for compatibility. Stale or otherwise
+-- invalid saved layouts are detected and discarded by UEInfoScanner.
 -- @return string|nil @ executable version identifier
 function Core.Persistence.getVersionIdentifier()
   local versionIdentifier
-
-  --get the md5 from the first bytes of the file. That's enough to see if anything changed (pe crc field)
-  --'some' games get the loaded memory PE file tampered with (prefered image base gets set) so prefer the file for this
   local fileBinStream
 
   pcall(function()
-    fileBinStream = createFileStream( enumModules()[1].PathToFile, fmOpenRead or fmShareDenyNone )
+    local mainModule = Core.EngineVersion.getMainModule()
+    local executablePath = mainModule and mainModule.PathToFile
+    if not executablePath or executablePath == '' then return end
 
+    fileBinStream = createFileStream( executablePath, fmOpenRead or fmShareDenyNone )
     local executableHeaderBytes = fileBinStream.read(1024)
+
     fileBinStream.destroy()
     fileBinStream = nil
 
-    local executableHeaderText = byteTableToString(executableHeaderBytes)
-    versionIdentifier = stringToMD5String(executableHeaderText)
+    versionIdentifier = stringToMD5String( byteTableToString(executableHeaderBytes) )
   end)
 
   if fileBinStream then --in case read fails, then fs is still valid
@@ -6607,10 +6708,27 @@ function Core.Persistence.getVersionIdentifier()
   end
 
   if versionIdentifier == nil then
-    versionIdentifier = md5memory( getAddressSafe(process), 4096 )
+    local processAddress = getAddressSafe(process)
+    if processAddress then versionIdentifier = md5memory( processAddress, 4096 ) end
   end
 
   return versionIdentifier
+end
+
+--- Remove every value from target-specific Settings object
+-- @param savedSettings table|userdata @ settings destination
+-- @return number @ removed value count
+function Core.Persistence.clearSettingsValues(savedSettings)
+  local getValueList = savedSettings and savedSettings.getValueList
+  local savedValues = type(getValueList) == 'function' and getValueList() or savedSettings or {}
+  local removedCount = 0
+
+  for valueName in pairs(savedValues) do
+    savedSettings[valueName] = nil
+    removedCount = removedCount + 1
+  end
+
+  return removedCount
 end
 
 --- Build settings key used by the current executable version's layout
@@ -6640,13 +6758,7 @@ function Core.Persistence.clearCurrentLayout()
   if not settingsKey then return nil, keyError end
 
   local savedSettings = getSettings( settingsKey, true )
-  local savedValues = savedSettings.getValueList() or {}
-  local removedCount = 0
-
-  for valueName in pairs(savedValues) do
-    savedSettings[valueName] = nil
-    removedCount = removedCount + 1
-  end
+  local removedCount = Core.Persistence.clearSettingsValues(savedSettings)
 
   return true, removedCount, settingsKey
 end
@@ -6686,7 +6798,7 @@ function Core.Persistence.restoreDefinitions(savedSettings)
 
 end
 
---- Restore saved global addresses and relocatable engine/world symbols
+--- Restore saved global addresses
 -- @param savedSettings table|userdata @ persisted scanner settings
 -- @param cancellationThread userdata|nil @ scanner worker
 -- @return boolean|nil @ true when restoration remains current
@@ -6701,32 +6813,6 @@ function Core.Persistence.restoreGlobalAddresses(savedSettings, cancellationThre
     local sourceModule = Core.Modules.ue_getAddressModuleInternal(CUEDEFS.NamePoolData)
     CUEDEFS.NamePoolSourceModule = sourceModule and extractFileName( sourceModule.PathToFile or '' ) or nil
     CUEDEFS.NamePoolScanMethod = 'saved-layout'
-  end
-
-  if CUEDEFS.GEngine then
-    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
-    if cancellationError then return nil, cancellationError end
-    local symbolName = getNameFromAddress( CUEDEFS.GEngine, true, false, false )
-    local run = Core.Scanner.getRun(cancellationThread)
-    local processName = extractFileNameWithoutExt( run and run.processName or process )
-
-    if symbolName:find( processName, nil, true ) then
-      local published, publishError = Core.Scanner.publishSymbol( 'pGEngine', symbolName, cancellationThread )
-      if not published then return nil, publishError end
-    end
-  end
-
-  if CUEDEFS.GWorld then
-    local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
-    if cancellationError then return nil, cancellationError end
-    local symbolName = getNameFromAddress( CUEDEFS.GWorld, true, false, false )
-    local run = Core.Scanner.getRun(cancellationThread)
-    local processName = extractFileNameWithoutExt( run and run.processName or process )
-
-    if symbolName:find( processName, nil, true ) then
-      local published, publishError = Core.Scanner.publishSymbol( 'pGWorld', symbolName, cancellationThread )
-      if not published then return nil, publishError end
-    end
   end
 
   return true
@@ -6790,6 +6876,18 @@ function Core.Persistence.saveLayout(savedSettings)
 
   savedSettings['CUEDEFS.ObjectArrayObjectOffset'] = CUEDEFS.ObjectArrayObjectOffset
 
+  savedSettings['CUEDEFS.ObjectArrayStorageOffset'] = CUEDEFS.ObjectArrayStorageOffset
+
+  savedSettings['CUEDEFS.ObjectArrayNumElementsOffset'] = CUEDEFS.ObjectArrayNumElementsOffset
+
+  savedSettings['CUEDEFS.ObjectArrayMaxElementsOffset'] = CUEDEFS.ObjectArrayMaxElementsOffset
+
+  savedSettings['CUEDEFS.ObjectArrayNumChunksOffset'] = CUEDEFS.ObjectArrayNumChunksOffset
+
+  savedSettings['CUEDEFS.ObjectArrayMaxChunksOffset'] = CUEDEFS.ObjectArrayMaxChunksOffset
+
+  savedSettings['CUEDEFS.ObjectArrayPreAllocatedObjectsOffset'] = CUEDEFS.ObjectArrayPreAllocatedObjectsOffset
+
   savedSettings['CUEDEFS.NamePoolData_old'] = CUEDEFS.NamePoolData_old
 
   savedSettings.fullyParsed = true
@@ -6802,8 +6900,9 @@ end
 
 --- Configure the worker & reset definitions when the attached process changes
 -- @param cancellationThread table|nil @ scan worker
+-- @param forceReset boolean|nil @ discard current-process runtime definitions
 -- @return nil
-function Core.Scanner.initializeScannerState(cancellationThread)
+function Core.Scanner.initializeScannerState(cancellationThread, forceReset)
   
   --get data from the registry if available
   if cancellationThread then
@@ -6818,7 +6917,7 @@ function Core.Scanner.initializeScannerState(cancellationThread)
   local run = Core.Scanner.getRun(cancellationThread)
   local processId = run and run.processId or getOpenedProcessID()
 
-  if CUEDEFS and CUEDEFS.processid == processId then return true end
+  if not forceReset and CUEDEFS and CUEDEFS.processid == processId then return true end
 
   --start from scratch
   Core.Runtime.onMainThread(
@@ -6891,6 +6990,43 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// COMPLETED-LAYOUT RESTORATION
 
+--- Validate & publish saved UObject global
+-- @param definitionName string @ CUEDEFS member containing the global address
+-- @param symbolName string @ public CE symbol to publish after validation
+-- @param expectedClassName string|nil @ optional exact reflected class name
+-- @param cancellationThread table|nil @ scanner worker
+-- @return boolean|nil @ true when restored global is live, false when absent/rejected
+-- @return number|nil @ live UObject instance
+-- @return string|nil @ cancellation/publication error
+function Core.Scanner.validateRestoredUObjectGlobal(definitionName, symbolName, expectedClassName, cancellationThread)
+  
+  local globalAddress = CUEDEFS[ definitionName ]
+  if not globalAddress or globalAddress == 0 then return false end
+
+  local instanceAddress = Core.Signatures.ue_validateUObjectGlobalInternal( globalAddress, expectedClassName )
+
+  if not instanceAddress then
+    Core.Runtime.log(
+      ('Saved %s at %s was rejected by live UObject/GUObjectArray validation; rescanning')
+      :format( definitionName, getNameFromAddress( globalAddress, true, false, false ) or ('0x%X'):format( globalAddress ) )
+    )
+
+    CUEDEFS[ definitionName ] = nil
+    if definitionName == 'GEngine' then CUEDEFS.UGameEngine = nil end
+    return false
+  end
+
+  local cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+  if cancellationError then return nil, nil, cancellationError end
+
+  local relocatableAddress = getNameFromAddress( globalAddress, true, false, false ) or globalAddress
+  local published, publishError = Core.Scanner.publishSymbol( symbolName, relocatableAddress, cancellationThread )
+  if not published then return nil, nil, publishError end
+
+  Core.Runtime.log( ('Restored %s validated at %s'):format( definitionName, relocatableAddress ) )
+  return true, instanceAddress
+end
+
 --- Restore a completed layout and rebuild its runtime name cache
 -- @param savedSettings table|userdata @ persisted scanner settings
 -- @param cancellationThread table|nil @ scan worker
@@ -6946,6 +7082,21 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
     local layoutReady, layoutError = Core.Objects.findUObjectLayout( firstItemAddress, itemSize, itemOffsets, objectPointerOffset )
 
     if not layoutReady then return nil, layoutError end
+  end
+
+  local restoredEngine, restoredEngineInstance, restoredGlobalError = Core.Scanner.validateRestoredUObjectGlobal( 'GEngine', 'pGEngine', nil, cancellationThread )
+
+  if restoredGlobalError then return nil, restoredGlobalError end
+
+  local _, _, restoredWorldError = Core.Scanner.validateRestoredUObjectGlobal( 'GWorld', 'pGWorld', 'World', cancellationThread )
+
+  if restoredWorldError then return nil, restoredWorldError end
+
+  if restoredEngine then
+    CUEDEFS.UGameEngine = restoredEngineInstance
+  else
+    local engineReady, engineError = Core.Scanner.findScannerEngine( savedSettings, cancellationThread )
+    if not engineReady then return nil, engineError end
   end
 
   if CUEDEFS.GEngine and CUEDEFS.UObject and type(CUEDEFS.UObject.Class) == 'number' then
@@ -7457,6 +7608,10 @@ function Core.Scanner.UEInfoScanner(cancellationThread)
 
   Core.Runtime.log( 'Settings key: ' .. settingsKey)
 
+  local getSavedValueList = savedSettings and savedSettings.getValueList
+  local savedValueList = type(getSavedValueList) == 'function' and getSavedValueList() or savedSettings or {}
+  local hadSavedLayout = next(savedValueList) ~= nil
+
   local initialized, stateError = Core.Scanner.initializeScannerState(cancellationThread)
   if not initialized then return nil, stateError end
 
@@ -7472,6 +7627,47 @@ function Core.Scanner.UEInfoScanner(cancellationThread)
     ready, initializationError = Core.Scanner.restoreScannerRuntime( savedSettings, cancellationThread )
   else
     ready, initializationError = Core.Scanner.findIncompleteScannerRuntime( savedSettings, cancellationThread )
+  end
+
+  if not ready and hadSavedLayout then
+    cancellationError = Core.Scanner.getCancellationError(cancellationThread)
+    if cancellationError then return nil, cancellationError end
+
+    Core.Runtime.log( 'Persisted layout failed live initialization; clearing this process layout and retrying discovery once: ' .. tostring(initializationError) )
+
+    local cleared, clearError = Core.Runtime.onMainThread(
+      function()
+        local currentError = Core.Scanner.getCancellationError(cancellationThread)
+        if currentError then return nil, currentError end
+
+        return Core.Persistence.clearSettingsValues(persistentSettings)
+      end
+    )
+
+    if cleared == nil then return nil, clearError end
+
+    if run then
+      run.pendingSettings = {}
+      run.settingsSnapshot = {}
+      savedSettings = run.settingsSnapshot
+    else
+      savedSettings = persistentSettings
+    end
+
+    local reset, resetError = Core.Scanner.initializeScannerState( cancellationThread, true )
+    if not reset then return nil, resetError end
+
+    ready, initializationError = Core.Scanner.findIncompleteScannerRuntime( savedSettings, cancellationThread )
+
+    if not ready then
+      -- Synchronous scans stage directly into the Settings object. Do not
+      -- retain another partial layout after the clean retry also failed.
+      Core.Runtime.onMainThread(function()
+        Core.Persistence.clearSettingsValues(persistentSettings)
+      end)
+
+      return ready, 'Fresh discovery after clearing the persisted layout failed: ' .. tostring(initializationError)
+    end
   end
 
   if not ready then return ready, initializationError end

@@ -322,6 +322,8 @@ function Module.Objects.createObjectArrayView(refresh)
   local objectArrayAddress = definitions.ObjectArray
   local itemSize = definitions.ObjectArrayEntryStructSize
   local objectPointerOffset = definitions.ObjectArrayObjectOffset or 0
+  local storageOffset = definitions.ObjectArrayStorageOffset or 0x10
+  local countOffset = definitions.ObjectArrayNumElementsOffset or 0x24
   local chunked = definitions.ObjectArrayListType == 0
 
   if not isValidAddress( objectArrayAddress ) then return nil end
@@ -333,12 +335,14 @@ function Module.Objects.createObjectArrayView(refresh)
                    cachedObjectArrayView.objectArrayAddress == objectArrayAddress and
                    cachedObjectArrayView.itemSize == itemSize and
                    cachedObjectArrayView.objectPointerOffset == objectPointerOffset and
+                   cachedObjectArrayView.storageOffset == storageOffset and
+                   cachedObjectArrayView.countOffset == countOffset and
                    cachedObjectArrayView.chunked == chunked
 
   if reusable and not refresh then return cachedObjectArrayView end
 
-  local objectsAddress = readPointer( objectArrayAddress + 0x10 )
-  local count = readInteger( objectArrayAddress + 0x24 )
+  local objectsAddress = readPointer( objectArrayAddress + storageOffset )
+  local count = readInteger( objectArrayAddress + countOffset )
 
   if not isValidAddress(objectsAddress) then return nil end
   if type(count) ~= 'number' or count < 0 or count > MAX_OBJECTS then return nil end
@@ -355,6 +359,8 @@ function Module.Objects.createObjectArrayView(refresh)
     objectsAddress = objectsAddress,
     itemSize = itemSize,
     objectPointerOffset = objectPointerOffset,
+    storageOffset = storageOffset,
+    countOffset = countOffset,
     count = count,
     chunked = chunked,
     cachedChunkIndex = nil,
