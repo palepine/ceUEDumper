@@ -69,6 +69,7 @@ local function loadCore()
   local dependencies =
   {
     UESignatures = require('ceUEDumperModules.UESignatures'),
+    UEVersionLayouts = require('ceUEDumperModules.UEVersionLayouts'),
     ceUEDumperResources = resources,
     ceUEDumperRegisterSymbol = function(name, address)
       return Module.Resources.registerSymbol( name, address )
@@ -247,6 +248,15 @@ end
 --- Select/clear engine version
 function Module.Lifecycle.setEngineVersion(versionOrMajor, minor, patch)
   return Core.setEngineVersion( versionOrMajor, minor, patch )
+end
+
+--- Configure version-layout selection
+function Module.Lifecycle.setVersionLayoutMode(mode)
+  return Core.setVersionLayoutMode(mode)
+end
+
+function Module.Lifecycle.getVersionLayoutMode()
+  return Core.getVersionLayoutMode()
 end
 
 --- Return configured layout overrides
@@ -1827,11 +1837,25 @@ function Module.Reflection.propertyStruct(propertyAddress)
   local configured = definitions.FStructProperty and definitions.FStructProperty.Struct
   local candidates = {}
   local selected
-  local firstOffset, lastOffset = 0x60, 0xB0
+  local offsets = {}
+  local seenOffsets = {}
 
-  if type(configured) == 'number' then firstOffset, lastOffset = configured, configured end
+  local function addOffset(offset)
+    if type(offset) == 'number' and not seenOffsets[offset] then
+      seenOffsets[ offset ] = true
+      offsets[ #offsets + 1 ] = offset
+    end
+  end
 
-  for offset = firstOffset, lastOffset, 8 do
+  addOffset( configured )
+
+  if type(configured) ~= 'number' or definitions.VersionLayoutProfile then
+    for offset = 0x60, 0xB0, 8 do
+      addOffset(offset)
+    end
+  end
+
+  for _, offset in ipairs(offsets) do
     local address = readPointer( propertyAddress + offset )
 
     if isValidAddress(address) and not candidates[address] then
@@ -1862,6 +1886,8 @@ function Module.Reflection.propertyStruct(propertyAddress)
       end
 
     end
+
+    if selected and offset == configured then return selected end
 
   end
 
@@ -1936,10 +1962,24 @@ end
 --- Candidate offsets for the first subtype pointer in container property
 -- @param configuredOffset number|nil @ previously discovered exact member offset
 -- @return number[] @ ordered offsets, most common UE4/UE5 layouts first
-local function containerMemberOffsets(configuredOffset)
-  if type(configuredOffset) == 'number' then return { configuredOffset } end
+local function containerMemberOffsets(configuredOffset, allowFallback)
+  local offsets = {}
+  local seen = {}
 
-  return { 0x70, 0x78, 0x80, 0x68, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0x60 }
+  local function add(offset)
+    if type(offset) == 'number' and not seen[offset] then
+      seen[offset] = true
+      offsets[#offsets + 1] = offset
+    end
+  end
+
+  add(configuredOffset)
+
+  if type(configuredOffset) ~= 'number' or allowFallback then
+    for _, offset in ipairs( { 0x70, 0x78, 0x80, 0x68, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0x60 } ) do add(offset) end
+  end
+
+  return offsets
 end
 
 --- Resolve and decode FArrayProperty::Inner
@@ -1952,7 +1992,7 @@ function Module.Reflection.propertyArrayInner(propertyAddress)
   -- first structurally valid zero-offset property is selected
   local definitions = Core.definitions()
   local configuredOffset = definitions.FArrayProperty and definitions.FArrayProperty.Inner
-  local candidateOffsets = containerMemberOffsets(configuredOffset)
+  local candidateOffsets = containerMemberOffsets( configuredOffset, definitions.VersionLayoutProfile ~= nil )
   local excludedPointers = containerExcludedPointers(propertyAddress)
 
   for _, memberOffset in ipairs(candidateOffsets) do
@@ -1977,7 +2017,7 @@ function Module.Reflection.propertySetElement(propertyAddress)
   local configuredOffset = definitions.FSetProperty and definitions.FSetProperty.ElementProp
   local excludedPointers = containerExcludedPointers(propertyAddress)
 
-  for _, memberOffset in ipairs( containerMemberOffsets(configuredOffset) ) do
+  for _, memberOffset in ipairs( containerMemberOffsets( configuredOffset, definitions.VersionLayoutProfile ~= nil ) ) do
     local elementProperty = containerPropertyAt( propertyAddress, memberOffset, excludedPointers, true )
 
     if elementProperty then
@@ -2002,7 +2042,7 @@ function Module.Reflection.propertyMapMembers(propertyAddress)
   local definitions = Core.definitions()
   local mapLayout = definitions.FMapProperty or {}
   local excludedPointers = containerExcludedPointers(propertyAddress)
-  local candidateOffsets = containerMemberOffsets(mapLayout.KeyProp)
+  local candidateOffsets = containerMemberOffsets( mapLayout.KeyProp, definitions.VersionLayoutProfile ~= nil )
 
   for _, keyOffset in ipairs(candidateOffsets) do
     local valueOffset = type(mapLayout.ValueProp) == 'number' and mapLayout.ValueProp or keyOffset + PTR_SIZE
@@ -2161,6 +2201,8 @@ Module.clearSavedLayout = Module.Lifecycle.clearSavedLayout
 Module.detectEngineVersion = Module.Lifecycle.detectEngineVersion
 Module.getEngineVersion = Module.Lifecycle.getEngineVersion
 Module.setEngineVersion = Module.Lifecycle.setEngineVersion
+Module.setVersionLayoutMode = Module.Lifecycle.setVersionLayoutMode
+Module.getVersionLayoutMode = Module.Lifecycle.getVersionLayoutMode
 Module.getLayoutOverrides = Module.Lifecycle.getLayoutOverrides
 Module.setLayoutOverrides = Module.Lifecycle.setLayoutOverrides
 

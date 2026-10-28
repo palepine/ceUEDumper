@@ -24,6 +24,7 @@ assert( ue_resetConfig() )
 | `maxSetElements` | integer `0..65536` | `256` | Maximum occupied `TSet` entries created |
 | `maxDelegateElements` | integer `0..65536` | `256` | Maximum multicast-delegate invocation entries created |
 | `decompileUbergraphs` | boolean | `false` | Default Ubergraph behavior for `ue_dumpTypes`; an explicit call option overrides it |
+| `versionLayoutMode` | `'auto'`, `'force'` or `'off'` | `'auto'` | hardcoded version-layout policy used by the next initialization; prefer `ue_setVersionLayoutMode` when changing it at runtime |
 
 ## Persistent layout
 #### `ue_clearSavedLayout()`

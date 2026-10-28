@@ -79,6 +79,7 @@ local CONFIG_DEFINITIONS =
   maxSetElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
   maxDelegateElements = { default = 256, kind = 'integer', minimum = 0, maximum = 0x10000 },
   decompileUbergraphs = { default = false, kind = 'boolean' },
+  versionLayoutMode = { default = 'auto', kind = 'enum', values = { auto = true, force = true, off = true } },
 }
 
 local PORTABLE_FILES =
@@ -89,6 +90,7 @@ local PORTABLE_FILES =
   { name = 'ceUEDumper.UEHookBridge', path = [[autorun\ceUEDumperModules\UEHookBridge.lua]] },
   { name = 'ceUEDumper.UEDumperCore', path = [[autorun\ceUEDumperModules\UEDumperCore.lua]] },
   { name = 'ceUEDumper.UESignatures', path = [[autorun\ceUEDumperModules\UESignatures.lua]] },
+  { name = 'ceUEDumper.UEVersionLayouts', path = [[autorun\ceUEDumperModules\UEVersionLayouts.lua]] },
   {
     name = 'ceUEDumper.ceUEDumperBridge.dll',
     path = [[autorun\ceUEDumperModules\ceUEDumperBridge.dll]],
@@ -122,6 +124,12 @@ function Dumper.Configuration.normalize(key, value)
     if value == 'true' or value == '1' or value == 1 then return true end
     if value == 'false' or value == '0' or value == 0 then return false end
     return nil, key .. ' must be a boolean'
+  end
+
+
+  if definition.kind == 'enum' then
+    if definition.values[value] then return value end
+    return nil, key .. ' must be one of: auto, force, off'
   end
 
   local numericValue = type(value) == 'number' and value or tonumber(value)
@@ -185,6 +193,17 @@ function Dumper.Configuration.ue_setConfig(key, value)
   local normalized, validationError = Dumper.Configuration.normalize( key, value )
   if normalized == nil then return nil, validationError end
 
+  if key == 'versionLayoutMode' then
+    local backend = package.loaded[ 'ceUEDumperModules.UEBackend' ]
+
+    if backend and type(backend.setVersionLayoutMode) == 'function' then
+
+      local selected, modeError = backend.setVersionLayoutMode( normalized )
+      if not selected then return nil, modeError end
+    end
+
+  end
+
   local persisted, persistenceError = pcall( Dumper.Configuration.persist, { [key] = normalized } )
   if not persisted then return nil, 'Failed persisting ceUEDumper configuration: ' .. tostring(persistenceError) end
 
@@ -212,6 +231,15 @@ function Dumper.Configuration.ue_resetConfig(key)
   if not persisted then return nil, 'Failed persisting ceUEDumper configuration: ' .. tostring(persistenceError) end
 
   for configKey, value in pairs(defaults) do Dumper.State.config[configKey] = value end
+
+  if defaults.versionLayoutMode then
+    local backend = package.loaded['ceUEDumperModules.UEBackend']
+
+    if backend and type(backend.setVersionLayoutMode) == 'function' then
+      backend.setVersionLayoutMode( defaults.versionLayoutMode )
+    end
+  end
+
   if key ~= nil then return true, Dumper.State.config[key] end
   return true, Dumper.Configuration.ue_getConfig()
 end
@@ -360,10 +388,14 @@ Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEBackend', 'UEBacken
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEBytecode', 'UEBytecode.lua', 'ceUEDumper.UEBytecode' )
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEHookBridge', 'UEHookBridge.lua', 'ceUEDumper.UEHookBridge' )
 Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UESignatures', 'UESignatures.lua', 'ceUEDumper.UESignatures' )
+Dumper.Portable.registerModuleResolver( 'ceUEDumperModules.UEVersionLayouts', 'UEVersionLayouts.lua', 'ceUEDumper.UEVersionLayouts' )
 
 local Backend = require('ceUEDumperModules.UEBackend')
 local Bytecode = require('ceUEDumperModules.UEBytecode')
 local HookBridge = require('ceUEDumperModules.UEHookBridge')
+
+assert( Backend.setVersionLayoutMode( Dumper.State.config.versionLayoutMode or 'auto' ) )
+
 local sharedResources = package.loaded['ceUEDumper.resources']
 
 sharedResources.structureDissectCallbacks = sharedResources.structureDissectCallbacks or {}
@@ -1021,6 +1053,26 @@ function Dumper.Lifecycle.ue_setEngineVersion(versionOrMajor, minor, patch)
   return Backend.setEngineVersion( versionOrMajor, minor, patch )
 end
 
+--- Select how hardcoded version layouts participate in scanning
+-- auto (default): explicit version evidence;
+-- force: any known version;
+-- off: inference only
+-- The choice is persisted and takes effect on the next initialization.
+function Dumper.Lifecycle.ue_setVersionLayoutMode(mode)
+  
+  local selected, modeError = Backend.setVersionLayoutMode(mode)
+  if not selected then return nil, modeError end
+
+  local persisted, persistenceResult = Dumper.Configuration.ue_setConfig( 'versionLayoutMode', mode )
+  if not persisted then return nil, persistenceResult end
+
+  return selected
+end
+
+function Dumper.Lifecycle.ue_getVersionLayoutMode()
+  return Backend.getVersionLayoutMode()
+end
+
 --- Return configured layout offsets
 -- @return table|nil @ independent CUEDEFS-shaped override table
 function Dumper.Lifecycle.ue_getLayoutOverrides()
@@ -1098,6 +1150,11 @@ function Dumper.Lifecycle.ue_initDumper(config)
   assert( type(config) == 'table', 'config must be a table or nil' )
 
   Backend.configureSignatures( config.signatureSelection or 'first' )
+
+  local versionLayoutMode = config.versionLayoutMode or Dumper.State.config.versionLayoutMode or 'auto'
+  
+  local selectedMode, modeError = Backend.setVersionLayoutMode( versionLayoutMode )
+  if not selectedMode then return false, modeError end
 
   -- clear names
   Dumper.Lifecycle.ue_clearCache()
@@ -5043,6 +5100,8 @@ Dumper.API =
   ue_detectEngineVersion = Dumper.Lifecycle.ue_detectEngineVersion,
   ue_getEngineVersion = Dumper.Lifecycle.ue_getEngineVersion,
   ue_setEngineVersion = Dumper.Lifecycle.ue_setEngineVersion,
+  ue_getVersionLayoutMode = Dumper.Lifecycle.ue_getVersionLayoutMode,
+  ue_setVersionLayoutMode = Dumper.Lifecycle.ue_setVersionLayoutMode,
   ue_getLayoutOverrides = Dumper.Lifecycle.ue_getLayoutOverrides,
   ue_setLayoutOverrides = Dumper.Lifecycle.ue_setLayoutOverrides,
   ue_attachToTable = Dumper.Portable.ue_attachToTable,

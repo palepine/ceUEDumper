@@ -46,6 +46,7 @@
 
 local dependencies = ... or {}
 local UESignatures = dependencies.UESignatures
+local UEVersionLayouts = dependencies.UEVersionLayouts
 local ceUEDumperResources = dependencies.ceUEDumperResources
 local ceUEDumperRegisterSymbol = dependencies.ceUEDumperRegisterSymbol
 
@@ -84,6 +85,8 @@ Core.State.scannerRuns = setmetatable( {}, { __mode = 'k' } )
 Core.State.detectedEngineVersion = nil
 Core.State.engineVersionOverride = nil
 Core.State.layoutOverrides = nil
+Core.State.versionLayoutMode = 'auto'
+Core.State.versionLayoutCandidates = nil
 
 local CUEDEFS -- UEDEFS
 
@@ -556,6 +559,7 @@ function Core.EngineVersion.detect()
   version.overridden = false
   version.processId = getOpenedProcessID()
   Core.State.detectedEngineVersion = version
+  Core.State.versionLayoutCandidates = nil
 
   if CUEDEFS then CUEDEFS.EngineVersion = Core.EngineVersion.get() end
   return Core.EngineVersion.copy(version)
@@ -572,6 +576,7 @@ function Core.EngineVersion.set(versionOrMajor, minor, patch)
 
   if versionOrMajor == nil then
     Core.State.engineVersionOverride = nil
+    Core.State.versionLayoutCandidates = nil
 
     if CUEDEFS then CUEDEFS.EngineVersion = Core.EngineVersion.get() end
     return true
@@ -585,6 +590,7 @@ function Core.EngineVersion.set(versionOrMajor, minor, patch)
   version.overridden = true
   version.processId = getOpenedProcessID()
   Core.State.engineVersionOverride = version
+  Core.State.versionLayoutCandidates = nil
 
   if CUEDEFS then CUEDEFS.EngineVersion = Core.EngineVersion.copy(version) end
   return Core.EngineVersion.copy(version)
@@ -642,6 +648,126 @@ local OVERRIDABLE_LAYOUT_VALUES =
   FNameHeaderShift = true,
   VFTableInExecutableMemoryMethod = true,
 }
+
+local VERSION_LAYOUT_MODES =
+{
+  auto = true,
+  off = true,
+  force = true
+}
+
+--- Check if the engine-version evidence is eligible for hardcoded layouts
+-- auto - accepts valid only via traits
+-- force - accepts any traits
+function Core.Layout.shouldUseVersionProfiles()
+  local mode = Core.State.versionLayoutMode
+  if mode == 'off' then return false end
+
+  local version = Core.EngineVersion.get()
+  if not version then return false end
+  
+  if mode == 'force' then return true end
+
+  return version.confidence == 'explicit' or version.confidence == 'high' or version.confidence == 'medium'
+end
+
+--- Refresh ordered layout candidates for the selected engine version
+-- @return table[] @ independent candidate descriptors
+function Core.Layout.refreshVersionCandidates()
+  Core.State.versionLayoutCandidates = nil
+
+  if not Core.Layout.shouldUseVersionProfiles() or type(UEVersionLayouts) ~= 'table' then return {} end
+  if type(UEVersionLayouts.getCandidates) ~= 'function' then return {} end
+
+  local candidates = UEVersionLayouts.getCandidates( Core.EngineVersion.get() ) or {}
+  Core.State.versionLayoutCandidates = candidates
+  return Core.Layout.copy(candidates)
+end
+
+--- Return active hardcoded layout candidates, refreshing them when needed
+function Core.Layout.getVersionCandidates()
+  if type(Core.State.versionLayoutCandidates) ~= 'table' then
+    return Core.Layout.refreshVersionCandidates()
+  end
+
+  return Core.Layout.copy( Core.State.versionLayoutCandidates )
+end
+
+--- Configure version-layout selection
+-- auto (default): explicit/UE-specific branch/version evidence
+-- force: any detected/selected version
+-- off: inference only
+function Core.Layout.setVersionProfileMode(mode)
+  if Core.State.scannerRunning then return nil, 'Cannot change version-layout mode while reflection scan is running' end
+  if not VERSION_LAYOUT_MODES[mode] then return nil, 'Version-layout mode must be auto, force, or off' end
+
+  Core.State.versionLayoutMode = mode
+  Core.State.versionLayoutCandidates = nil
+  if CUEDEFS then CUEDEFS.VersionLayoutMode = mode end
+  return mode
+end
+
+function Core.Layout.getVersionProfileMode()
+  return Core.State.versionLayoutMode
+end
+
+--- Merge layout into current definitions
+-- @param layout table @ CUEDEFS-shaped offsets
+-- @param overwrite boolean @ replace existing values when true
+function Core.Layout.mergeIntoDefinitions(layout, overwrite)
+  if type(CUEDEFS) ~= 'table' or type(layout) ~= 'table' then return false end
+
+  for layoutName, members in pairs(layout) do
+
+    if OVERRIDABLE_LAYOUT_TABLES[ layoutName ] and type(members) == 'table' then
+      CUEDEFS[ layoutName ] = CUEDEFS[ layoutName ] or {}
+
+      for memberName, offset in pairs(members) do
+        if overwrite or CUEDEFS[ layoutName ][ memberName ] == nil then
+          CUEDEFS[ layoutName ][ memberName ] = offset
+        end
+      end
+
+    elseif OVERRIDABLE_LAYOUT_VALUES[ layoutName ] and (overwrite or CUEDEFS[ layoutName ] == nil) then
+      CUEDEFS[ layoutName ] = members
+    end
+  end
+
+  return true
+end
+
+--- Return explicit override first, otherwise first version-profile value
+-- Version values are validated by their consumers
+function Core.Layout.getPreferredSection(sectionName)
+  local configured = Core.Layout.getConfiguredSection(sectionName)
+  local candidates = Core.Layout.getVersionCandidates()
+  
+  local first = candidates[1]
+  
+  local versionValue = first and type(first.layout) == 'table' and first.layout[sectionName] or nil
+
+  if configured ~= nil then
+
+    if type(configured) == 'table' and type(versionValue) == 'table' then
+
+      local combined = Core.Layout.copy(versionValue)
+
+      for memberName, offset in pairs(configured) do
+        combined[ memberName ] = offset
+      end
+
+      return combined, 'explicit', first
+    end
+
+    return configured, 'explicit'
+  end
+
+  if versionValue ~= nil then
+    return versionValue, 'version', first
+  end
+
+  return nil
+end
 
 --- Recursively copy a table
 function Core.Layout.copy(value)
@@ -754,24 +880,26 @@ function Core.Layout.getConfiguredSection(sectionName)
   return overrides[sectionName]
 end
 
---- Validate configured field layout against known UClass
--- @param classAddress number @ known UClass used as the validation anchor
--- @return boolean|nil @ true when a complete supplied layout enumerates fields
--- @return string|nil @ validation error; nil when no complete override exists
-function Core.Layout.validateConfiguredPropertyLayout(classAddress)
-  local overrides = Core.State.layoutOverrides
+--- Validate and publish field-layout candidate against a known UClass
+-- candidate values are rolled back when they dont enumerate named fields.
+function Core.Layout.validatePropertyLayoutCandidate(classAddress, overrides, label)
   if type(overrides) ~= 'table' then return nil end
 
   local classLayout = {}
-  for memberName, offset in pairs(overrides.UStruct or {}) do classLayout[memberName] = offset end
-  for memberName, offset in pairs(overrides.UClass or {}) do classLayout[memberName] = offset end
+
+  for memberName, offset in pairs( overrides.UStruct or {} ) do
+    classLayout[ memberName ] = offset
+  end
+
+  for memberName, offset in pairs( overrides.UClass or {} ) do
+    classLayout[ memberName ] = offset
+  end
+
   local propertyLayout = overrides.FProperty
   local fieldClassLayout = overrides.FFieldClass
   local fieldLayout = overrides.FField
 
-  if type(classLayout) ~= 'table' or type(propertyLayout) ~= 'table' or type(fieldClassLayout) ~= 'table' then
-    return nil
-  end
+  if type(classLayout) ~= 'table' or type(propertyLayout) ~= 'table' or type(fieldClassLayout) ~= 'table' then return nil end
 
   local superStructOffset = classLayout.SuperStruct
   local primaryRootOffset = classLayout.PropertyLink
@@ -789,36 +917,106 @@ function Core.Layout.validateConfiguredPropertyLayout(classAddress)
   local hasAlternateChain = type(alternateRootOffset) == 'number' and type( alternateNextOffset or primaryNextOffset ) == 'number'
 
   if not hasCommonMembers or (not hasPrimaryChain and not hasAlternateChain) then return nil end
-  if not classAddress or classAddress == 0 then return nil, 'A known UClass is required to validate layout overrides' end
+  if not classAddress or classAddress == 0 then return nil, 'A known UClass is required to validate ' .. label end
 
-  Core.Layout.applyConfiguredOverrides()
-  CUEDEFS.UClass = CUEDEFS.UClass or {}
-  CUEDEFS.UClass.SuperStruct = superStructOffset
-  if primaryRootOffset ~= nil then CUEDEFS.UClass.PropertyLink = primaryRootOffset end
-  if alternateRootOffset ~= nil then CUEDEFS.UClass.PropertyLinkAlt = alternateRootOffset end
+  local previous = {}
+  local previouslyPresent = {}
+
+  for sectionName in pairs(overrides) do
+
+    if OVERRIDABLE_LAYOUT_TABLES[ sectionName ] or OVERRIDABLE_LAYOUT_VALUES[ sectionName ] then
+      previouslyPresent[ sectionName ] = CUEDEFS[ sectionName ] ~= nil
+      previous[ sectionName ] = Core.Layout.copy( CUEDEFS[ sectionName ] )
+    end
+  end
+
+  local function rollback()
+
+    for sectionName in pairs( previouslyPresent ) do
+      CUEDEFS[ sectionName ] = previouslyPresent[ sectionName ] and previous[ sectionName ] or nil
+    end
+
+  end
+
+  Core.Layout.mergeIntoDefinitions( overrides, true )
 
   local enumProperties = Core.Reflection and Core.Reflection.UClass_enumProperties
-  if type(enumProperties) ~= 'function' then return nil, 'Property enumerator is unavailable' end
+
+  if type(enumProperties) ~= 'function' then
+    rollback()
+    return nil, 'Property enumerator is unavailable'
+  end
 
   local validationErrors = {}
 
   for _, useAlternateChain in ipairs( { false, true } ) do
 
     if ( not useAlternateChain and hasPrimaryChain ) or ( useAlternateChain and hasAlternateChain ) then
+
       local properties, enumerationError = enumProperties( classAddress, useAlternateChain )
 
       if properties and next(properties) ~= nil then
         local chainName = useAlternateChain and 'alternate' or 'primary'
-        Core.Runtime.log( 'Layout overrides: validated supplied reflection layout through the ' .. chainName .. ' property chain' )
-        CUEDEFS.ProbedPropertyLayout = 'caller-supplied'
+        Core.Runtime.log( label .. ': validated reflection layout through the ' .. chainName .. ' property chain' )
+        CUEDEFS.ProbedPropertyLayout = label
         return true
       end
 
-      validationErrors[#validationErrors + 1] = enumerationError or 'property chain yielded no named fields'
+      validationErrors[ #validationErrors + 1 ] = enumerationError or 'property chain yielded no named fields'
     end
   end
 
-  return nil, 'Supplied reflection layout did not enumerate fields: ' .. table.concat(validationErrors, '; ')
+  rollback()
+  return nil, label .. ' did not enumerate fields: ' .. table.concat(validationErrors, '; ')
+end
+
+--- Validate explicit field layout
+function Core.Layout.validateConfiguredPropertyLayout(classAddress)
+  local overrides = Core.State.layoutOverrides
+
+  if type(overrides) ~= 'table' then return nil end
+
+  return Core.Layout.validatePropertyLayoutCandidate( classAddress, overrides, 'Layout overrides' )
+end
+
+--- Try hardcoded layouts for the selected engine version
+-- @return boolean|nil @ true when a profile validates; nil when unavailable/invalid
+-- @return string|nil @ combined validation feedback
+function Core.Layout.validateVersionPropertyLayout(classAddress)
+  local errors = {}
+
+  for _, candidate in ipairs( Core.Layout.getVersionCandidates() ) do
+    local effectiveLayout = Core.Layout.copy( candidate.layout )
+
+    for sectionName, values in pairs( Core.State.layoutOverrides or {} ) do
+      
+      if type(values) == 'table' then
+        effectiveLayout[ sectionName ] = effectiveLayout[ sectionName ] or {}
+
+        for memberName, offset in pairs(values) do
+          effectiveLayout[ sectionName ][ memberName ] = offset
+        end
+
+      else
+        effectiveLayout[ sectionName ] = values
+      end
+
+    end
+
+    local ready, validationError = Core.Layout.validatePropertyLayoutCandidate( classAddress, effectiveLayout, 'Version profile ' .. candidate.id )
+
+    if ready then
+      CUEDEFS.VersionLayoutProfile = candidate.id
+      CUEDEFS.VersionLayoutSource = candidate.source
+      Core.Layout.applyConfiguredOverrides()
+      return true
+    end
+
+    if validationError then errors[ #errors + 1 ] = validationError end
+  end
+
+  if #errors > 0 then return nil, table.concat(errors, '; ') end
+  return nil
 end
 
 
@@ -3650,7 +3848,19 @@ function Core.Objects.locateObjectArray(cancellationThread)
 
     if not candidates then return nil, scanError end
 
-    candidates = Core.Objects.refineObjectArrayHeaders(candidates)
+    local normalizedCandidates = {}
+    local seenCandidates = {}
+
+    for _, candidate in ipairs(candidates) do
+      local normalized = Core.Signatures.ue_normalizeObjectArrayInternal(candidate)
+
+      if normalized and not seenCandidates[normalized] then
+        seenCandidates[normalized] = true
+        normalizedCandidates[#normalizedCandidates + 1] = normalized
+      end
+    end
+
+    candidates = normalizedCandidates
 
     if #candidates > 1 then return nil, 'Needs more refining', candidates end
 
@@ -3670,6 +3880,95 @@ end
 --- Get FUObjectArray/TUObjectArray member layouts
 -- @return table[] @ ordered layout descriptors
 function Core.Objects.getObjectArrayLayouts()
+  local layouts = {}
+  local seen = {}
+
+  local function add(layout)
+    if not layout then return end
+
+    local key = table.concat( { layout.storage, layout.numElements, layout.maxElements, layout.numChunks, layout.maxChunks }, ':' )
+
+    if seen[key] then return end
+
+    seen[key] = true
+
+    layouts[ #layouts + 1 ] = layout
+  end
+
+  local configuredArray = Core.Layout.getConfiguredSection('FUObjectArray')
+  local configuredStorage = Core.Layout.getConfiguredSection('TUObjectArray')
+  local versionCandidates = Core.Layout.getVersionCandidates()
+
+  if type(configuredArray) == 'table' or type(configuredStorage) == 'table' then
+
+    local baseLayout = versionCandidates[1] and versionCandidates[1].layout or {}
+
+    local combinedArray = Core.Layout.copy( baseLayout.FUObjectArray or {} )
+    local combinedStorage = Core.Layout.copy( baseLayout.TUObjectArray or {} )
+
+    for memberName, offset in pairs( configuredArray or {} ) do
+      combinedArray[ memberName ] = offset
+    end
+
+    for memberName, offset in pairs( configuredStorage or {} ) do
+      combinedStorage[ memberName ] = offset
+    end
+
+    configuredArray, configuredStorage = combinedArray, combinedStorage
+  end
+
+  if configuredArray
+     and configuredStorage
+     and configuredArray.ObjObjects ~= nil
+     and configuredStorage.Objects ~= nil
+     and configuredStorage.NumElements ~= nil
+     and configuredStorage.MaxElements ~= nil
+     and configuredStorage.NumChunks ~= nil
+     and configuredStorage.MaxChunks ~= nil
+  then
+    add(
+      {
+        label = 'caller-supplied object-array layout',
+        storage = configuredArray.ObjObjects + configuredStorage.Objects,
+        numElements = configuredArray.ObjObjects + configuredStorage.NumElements,
+        maxElements = configuredArray.ObjObjects + configuredStorage.MaxElements,
+        numChunks = configuredArray.ObjObjects + configuredStorage.NumChunks,
+        maxChunks = configuredArray.ObjObjects + configuredStorage.MaxChunks,
+        preAllocatedObjects = configuredStorage.PreAllocatedObjects and configuredArray.ObjObjects + configuredStorage.PreAllocatedObjects or nil,
+      }
+    )
+  end
+
+  for _, candidate in ipairs(versionCandidates) do
+
+    local array = candidate.layout.FUObjectArray
+    local storage = candidate.layout.TUObjectArray
+
+    if array
+       and storage
+       and array.ObjObjects ~= nil
+       and storage.Objects ~= nil
+       and storage.NumElements ~= nil
+       and storage.MaxElements ~= nil
+       and storage.NumChunks ~= nil
+       and storage.MaxChunks ~= nil
+    then
+      add(
+        {
+          label = candidate.id .. ' version profile',
+          profileId = candidate.id,
+          storage = array.ObjObjects + storage.Objects,
+          numElements = array.ObjObjects + storage.NumElements,
+          maxElements = array.ObjObjects + storage.MaxElements,
+          numChunks = array.ObjObjects + storage.NumChunks,
+          maxChunks = array.ObjObjects + storage.MaxChunks,
+          preAllocatedObjects = storage.PreAllocatedObjects and array.ObjObjects + storage.PreAllocatedObjects or nil,
+        }
+      )
+    end
+
+  end
+
   local legacy =
   {
     label = 'UE4-UE5.7',
@@ -3696,7 +3995,15 @@ function Core.Objects.getObjectArrayLayouts()
   local version = CUEDEFS and CUEDEFS.EngineVersion or Core.EngineVersion.get()
   local prefersUE58 = version and version.major == 5 and version.minor >= 8
 
-  return prefersUE58 and { ue58, legacy } or { legacy, ue58 }
+  if prefersUE58 then
+    add(ue58)
+    add(legacy)
+  else
+    add(legacy)
+    add(ue58)
+  end
+
+  return layouts
 end
 
 --- Publish selected FUObjectArray member offsets
@@ -3710,6 +4017,10 @@ function Core.Objects.applyObjectArrayLayout(layout)
   CUEDEFS.ObjectArrayMaxChunksOffset = layout.maxChunks
   CUEDEFS.ObjectArrayPreAllocatedObjectsOffset = layout.preAllocatedObjects
   CUEDEFS.ObjectArrayLayout = layout.label
+
+  if layout.profileId then
+    CUEDEFS.VersionObjectArrayProfile = layout.profileId
+  end
 end
 
 --- Test possible single chunk through its first object's virtual functions
@@ -3830,8 +4141,9 @@ end
 -- @return string|nil @ error
 function Core.Objects.findObjectItemStride(firstItemAddress)
 
-  local configuredItemSize = Core.Layout.getConfiguredSection('ObjectArrayEntryStructSize')
-  local configuredObjectOffset = Core.Layout.getConfiguredSection('ObjectArrayObjectOffset')
+  local configuredItemSize, itemSizeSource = Core.Layout.getPreferredSection( 'ObjectArrayEntryStructSize' )
+  local configuredObjectOffset, objectOffsetSource = Core.Layout.getPreferredSection( 'ObjectArrayObjectOffset' )
+  local candidateSource = itemSizeSource or objectOffsetSource
 
   if configuredItemSize ~= nil or configuredObjectOffset ~= nil then
 
@@ -3847,7 +4159,8 @@ function Core.Objects.findObjectItemStride(firstItemAddress)
           local validCount = Core.Objects.ue_guessObjectItemStrideInternal( firstItemAddress, candidateSize, candidateOffset )
 
           Core.Runtime.log(
-            ('Layout overrides: FUObjectItem stride 0x%X Object+0x%X validated %d/32 object slot(s)'):format( candidateSize, candidateOffset, validCount )
+            ('%s layout: FUObjectItem stride 0x%X Object+0x%X validated %d/32 object slot(s)')
+            :format( candidateSource or 'candidate', candidateSize, candidateOffset, validCount )
           )
 
           if validCount > highestValidCount then
@@ -3858,10 +4171,17 @@ function Core.Objects.findObjectItemStride(firstItemAddress)
     end
 
     if highestValidCount < 2 then
-      return nil, nil, nil, 'Supplied FUObjectItem layout did not validate against runtime object slots'
-    end
 
-    return selectedSize, { selectedOffset, selectedOffset + selectedSize }, selectedOffset
+      if candidateSource == 'explicit' then return nil, nil, nil, 'Supplied FUObjectItem layout did not validate against runtime object slots' end
+
+      Core.Runtime.log( 'Version layout: FUObjectItem candidate did not validate; using stride inference' )
+    else
+      if candidateSource == 'version' then
+        CUEDEFS.VersionObjectItemLayout = true
+      end
+
+      return selectedSize, { selectedOffset , selectedOffset + selectedSize } , selectedOffset
+    end
   end
 
   local inferredSize, objectPointerOffset = Core.Objects.ue_inferObjectItemSizeInternal(firstItemAddress)
@@ -3891,8 +4211,8 @@ end
 -- @return boolean|nil @ true when an object-pointer offset is available
 -- @return string|nil @ inference error
 function Core.Objects.ensureObjectItemPointerOffset()
-  local configuredItemSize = Core.Layout.getConfiguredSection('ObjectArrayEntryStructSize')
-  local configuredObjectOffset = Core.Layout.getConfiguredSection('ObjectArrayObjectOffset')
+  local configuredItemSize = Core.Layout.getPreferredSection( 'ObjectArrayEntryStructSize' )
+  local configuredObjectOffset = Core.Layout.getPreferredSection( 'ObjectArrayObjectOffset' )
 
   if configuredItemSize ~= nil or configuredObjectOffset ~= nil then
     if not CUEDEFS.ObjectArray then return nil, 'Saved object array is unavailable for override validation' end
@@ -4063,7 +4383,7 @@ end
 -- @return boolean @ true when both required offsets were found
 -- @return string|nil @ error
 function Core.Objects.findUObjectLayout(firstItemAddress, itemSize, itemOffsets, objectPointerOffset)
-  local configuredLayout = Core.Layout.getConfiguredSection('UObject')
+  local configuredLayout, layoutSource, profile = Core.Layout.getPreferredSection('UObject')
 
   if type(configuredLayout) == 'table' and type(configuredLayout.Class) == 'number' and type(configuredLayout.Name) == 'number' then
     
@@ -4085,15 +4405,28 @@ function Core.Objects.findUObjectLayout(firstItemAddress, itemSize, itemOffsets,
     local minimumClassConfidence = minimumMatches * 4
 
     if classConfidence < minimumClassConfidence or nameMatchCount < minimumMatches then
-      return false, ('Supplied UObject layout failed validation (Class confidence %d/%d, Name matches %d/%d)')
-                    :format( classConfidence, minimumClassConfidence, nameMatchCount, #objectAddresses )
-    end
 
-    CUEDEFS.UObject = CUEDEFS.UObject or {}
-    CUEDEFS.UObject.Class = configuredLayout.Class
-    CUEDEFS.UObject.Name = configuredLayout.Name
-    Core.Runtime.log( ('Layout overrides: validated UObject Class=0x%X Name=0x%X'):format( configuredLayout.Class, configuredLayout.Name ) )
-    return true
+      local validationError = ('Supplied UObject layout failed validation (Class confidence %d/%d, Name matches %d/%d)')
+                              :format( classConfidence, minimumClassConfidence, nameMatchCount, #objectAddresses )
+
+      if layoutSource == 'explicit' then return false, validationError end
+
+      Core.Runtime.log( 'Version layout: ' .. validationError .. '; using UObject inference' )
+
+    else
+      CUEDEFS.UObject = CUEDEFS.UObject or {}
+      CUEDEFS.UObject.Class = configuredLayout.Class
+      CUEDEFS.UObject.Name = configuredLayout.Name
+
+      if layoutSource == 'version' then
+        CUEDEFS.VersionUObjectProfile = profile and profile.id or true
+        Core.Runtime.log( ('Version layout: validated UObject Class=0x%X Name=0x%X'):format( configuredLayout.Class, configuredLayout.Name ) )
+      else
+        Core.Runtime.log( ('Layout overrides: validated UObject Class=0x%X Name=0x%X'):format( configuredLayout.Class, configuredLayout.Name ) )
+      end
+
+      return true
+    end
   end
   
   local classOffset, nameOffset = Core.Objects.ue_inferUObjectOffsetsInternal( firstItemAddress, itemSize, objectPointerOffset )
@@ -6165,19 +6498,20 @@ end
 function Core.Signatures.ue_normalizeObjectArrayInternal(address)
   if not address or address <= 0 then return nil end
 
-  local candidates =
-  {
-    address,
-    address - 0x10,
-    address - 0x24
-  }
+  -- sigs may hit FUObjectArray itself, ObjObjects, one of the adjacent count fields
+  local memberOffsets = { 0, 0x8, 0xC, 0x10, 0x14, 0x18, 0x20, 0x24, 0x28, 0x2C }
+  local candidates = {}
+
+  for _, memberOffset in ipairs(memberOffsets) do
+    candidates[#candidates + 1] = address - memberOffset
+  end
 
   local indirect = readPointer(address)
 
   if indirect and indirect > 0 then
-    candidates[ #candidates + 1 ] = indirect
-    candidates[ #candidates + 1 ] = indirect - 0x10
-    candidates[ #candidates + 1 ] = indirect - 0x24
+    for _, memberOffset in ipairs(memberOffsets) do
+      candidates[#candidates + 1] = indirect - memberOffset
+    end
   end
 
   local seenAddr = {}
@@ -6861,6 +7195,23 @@ function Core.Persistence.saveLayout(savedSettings)
     'FProperty',
     'FFieldClass',
     'FField',
+    'FUObjectItem',
+    'FUObjectArray',
+    'TUObjectArray',
+    'FObjectPropertyBase',
+    'FStructProperty',
+    'FArrayProperty',
+    'FMapProperty',
+    'FSetProperty',
+    'FBoolProperty',
+    'FByteProperty',
+    'FEnumProperty',
+    'FClassProperty',
+    'FSoftClassProperty',
+    'FDelegateProperty',
+    'FMulticastDelegateProperty',
+    'FInterfaceProperty',
+    'FFieldPathProperty',
   }
 
   for _, tableName in ipairs(UE_DEFINITION_TABLE) do
@@ -6931,7 +7282,29 @@ function Core.Scanner.initializeScannerState(cancellationThread, forceReset)
 
   CUEDEFS = {}
   CUEDEFS.processid = processId
-  CUEDEFS.EngineVersion = Core.EngineVersion.get()
+  local engineVersion = Core.EngineVersion.get()
+
+  if not engineVersion and Core.State.versionLayoutMode ~= 'off' then
+    engineVersion = Core.EngineVersion.detect()
+  end
+
+  CUEDEFS.EngineVersion = engineVersion
+  CUEDEFS.VersionLayoutMode = Core.State.versionLayoutMode
+  local versionCandidates = Core.Layout.refreshVersionCandidates()
+
+  if #versionCandidates > 0 then
+    Core.Runtime.log(
+                      ('Version layout: queued %d candidate(s) for UE %d.%d (%s)')
+                      :format( #versionCandidates, engineVersion.major, engineVersion.minor, Core.State.versionLayoutMode )
+                    )
+
+  elseif engineVersion and Core.State.versionLayoutMode ~= 'off' then
+    Core.Runtime.log(
+                      ('Version layout: no automatic candidate selected for UE %d.%d confidence=%s mode=%s; inference remains active')
+                      :format( engineVersion.major, engineVersion.minor, tostring(engineVersion.confidence), Core.State.versionLayoutMode )
+                    )
+  end
+
   Core.Layout.applyConfiguredOverrides()
   Core.Menu.createUEMenu( true, cancellationThread )
   return true
@@ -7049,6 +7422,15 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
   local restored, restoreError = Core.Persistence.restoreGlobalAddresses( savedSettings, cancellationThread )
   if not restored then return nil, restoreError end
 
+  if CUEDEFS.ObjectArray then
+    local restoredObjectArrayLayout = Core.Signatures.ue_validateObjectArrayInternal( CUEDEFS.ObjectArray )
+
+    if restoredObjectArrayLayout then
+      Core.Objects.applyObjectArrayLayout( restoredObjectArrayLayout )
+      Core.Runtime.log( 'Restored layout: revalidated ' .. restoredObjectArrayLayout.label .. ' object-array members' )
+    end
+  end
+
   local objectLayoutReady, objectLayoutError = Core.Objects.ensureObjectItemPointerOffset()
   if not objectLayoutReady then return nil, objectLayoutError end
 
@@ -7069,7 +7451,7 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
   local ready, cacheError = Core.Scanner.cacheScannerNames(cancellationThread)
   if not ready then return nil, cacheError end
 
-  local configuredUObject = Core.Layout.getConfiguredSection('UObject')
+  local configuredUObject = Core.Layout.getPreferredSection('UObject')
 
   if type(configuredUObject) == 'table' and type(configuredUObject.Class) == 'number' and type(configuredUObject.Name) == 'number' then
 
@@ -7105,6 +7487,12 @@ function Core.Scanner.restoreScannerRuntime(savedSettings, cancellationThread)
     local overrideReady, overrideError = Core.Layout.validateConfiguredPropertyLayout(engineClassAddress)
 
     if overrideError then return nil, overrideError end
+
+    if not overrideReady then
+      local versionReady, versionError = Core.Layout.validateVersionPropertyLayout( engineClassAddress )
+
+      if not versionReady and versionError then Core.Runtime.log( 'Restored layout: version profile rejected; retaining validated saved offsets: ' .. versionError ) end
+    end
   end
 
   cancellationError = Core.Scanner.getCancellationError(cancellationThread)
@@ -7420,11 +7808,9 @@ end
 -- @return string|nil @ error
 function Core.Scanner.findScannerSuperStruct()
 
-  CUEDEFS.UStruct =
-  {
-    Name = CUEDEFS.UObject.Name,
-    Class = CUEDEFS.UObject.Class,
-  }
+  CUEDEFS.UStruct = CUEDEFS.UStruct or {}
+  CUEDEFS.UStruct.Name = CUEDEFS.UObject.Name
+  CUEDEFS.UStruct.Class = CUEDEFS.UObject.Class
 
   --gather more info in case it was missed earlier (some paths don't need it yet)
 
@@ -7434,11 +7820,31 @@ function Core.Scanner.findScannerSuperStruct()
   --if the game uses an inherited class onject, like OakEngine, then first comes GameEngine (or whatever comes first)
   --the superlist will end with Engine->Objec
 
-  CUEDEFS.UClass = CUEDEFS.UClass or
-  {
-    Name = CUEDEFS.UObject.Name,
-    Class = CUEDEFS.UObject.Class,
-  }
+  CUEDEFS.UClass = CUEDEFS.UClass or {}
+  CUEDEFS.UClass.Name = CUEDEFS.UObject.Name
+  CUEDEFS.UClass.Class = CUEDEFS.UObject.Class
+
+  if CUEDEFS.UClass.SuperStruct == nil then
+    local classPointerOffset = CUEDEFS.UObject.Class
+    local expectedMetaClass = readPointer( CUEDEFS.GameEngineClass + classPointerOffset )
+
+    for _, candidate in ipairs( Core.Layout.getVersionCandidates() ) do
+
+      local structLayout = candidate.layout.UStruct
+      local superStructOffset = structLayout and structLayout.SuperStruct
+      local depth = superStructOffset and Core.Reflection.probeSuperclassDepth( CUEDEFS.GameEngineClass, superStructOffset, classPointerOffset, expectedMetaClass ) or 0
+
+      if depth > 0 then
+        CUEDEFS.UClass.SuperStruct = superStructOffset
+        CUEDEFS.UStruct.SuperStruct = superStructOffset
+        CUEDEFS.VersionSuperStructProfile = candidate.id
+        Core.Runtime.log( ('Version layout: %s validated SuperStruct=0x%X through %d superclass(es)'):format( candidate.id, superStructOffset, depth ) )
+        break
+      end
+
+    end
+
+  end
 
   if CUEDEFS.UClass.SuperStruct then --already obtained earlier
     CUEDEFS.UStruct.SuperStruct = CUEDEFS.UClass.SuperStruct
@@ -7506,6 +7912,11 @@ function Core.Scanner.findScannerPropertyLayout(cancellationThread)
   local overrideReady, overrideError = Core.Layout.validateConfiguredPropertyLayout( CUEDEFS.GameEngineClass )
   if overrideReady then return true end
   if overrideError then return nil, overrideError end
+
+  local versionReady, versionError = Core.Layout.validateVersionPropertyLayout( CUEDEFS.GameEngineClass )
+  if versionReady then return true end
+
+  if versionError then Core.Runtime.log( 'Version layout candidates rejected; falling back to reflection probes: ' .. versionError ) end
 
   local ready, layoutError = Core.PropertyLayout.findGameInstanceFPropertyAndFields(cancellationThread)
 
@@ -8047,6 +8458,9 @@ function Core.API.ue_getScannerStatusInternal()
     cachedNameCount = type(CUEDEFS) == 'table' and CUEDEFS.CachedNameCount or 0,
     fnameToString = type(CUEDEFS) == 'table' and CUEDEFS.FNameToString or nil,
     engineVersion = Core.EngineVersion.get(),
+    versionLayoutMode = Core.Layout.getVersionProfileMode(),
+    versionLayoutProfile = type(CUEDEFS) == 'table' and CUEDEFS.VersionLayoutProfile or nil,
+    versionObjectArrayProfile = type(CUEDEFS) == 'table' and CUEDEFS.VersionObjectArrayProfile or nil,
     layoutOverrides = Core.Layout.get(),
   }
 
@@ -8081,6 +8495,8 @@ Core.API.clearSavedLayout = Core.Persistence.clearCurrentLayout
 Core.API.detectEngineVersion = Core.EngineVersion.detect
 Core.API.getEngineVersion = Core.EngineVersion.get
 Core.API.setEngineVersion = Core.EngineVersion.set
+Core.API.setVersionLayoutMode = Core.Layout.setVersionProfileMode
+Core.API.getVersionLayoutMode = Core.Layout.getVersionProfileMode
 Core.API.getLayoutOverrides = Core.Layout.get
 Core.API.setLayoutOverrides = Core.Layout.set
 Core.API.subsystems = Core

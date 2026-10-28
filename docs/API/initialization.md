@@ -56,13 +56,36 @@ assert( ue_setEngineVersion(nil) )
 #### `ue_getEngineVersion()`
 > Return the explicit selection first, otherwise the last detection
 
+#### `ue_setVersionLayoutMode(mode)`
+> Select layout selection mode
+
+    Notes:
+      - the setting is persistent
+      - the layout is validated at runtime
+
+| Mode | Behavior |
+| ---- | -------- |
+| `'auto'` | Default. Use hardcoded versioned layouts. |
+| `'force'` | Use the matching versioned layout even when version inference is vague. |
+| `'off'` | Use restored/inferred offsets only. |
+
+```lua
+-- When the engine version is known:
+assert( ue_setEngineVersion('5.7') )
+assert( ue_setVersionLayoutMode('auto') )
+assert( ue_initDumper() )
+
+-- Per-call override without changing the persistent setting:
+assert( ue_initDumper( { versionLayoutMode = 'off' } ) )
+```
+
 #### `ue_setLayoutOverrides(layout)`
 > Set known member offsets manually. Takes precedence over restored/inferred values
 
     Notes:
-      - call it before `ue_initDumper()` to avoid inference
+      - call it before ue_initDumper() to avoid inference
       - partial tables are fine
-      -  ue_setLayoutOverrides(nil) disables manual values, needs rescan
+      - ue_setLayoutOverrides(nil) disables manual values, needs rescan
 
 ```lua
 local newLayout =
@@ -166,7 +189,9 @@ passed validation.
 | `cachedNameCount`         | `number`        | Unique names cached                                                                |
 | `fnameToString`           | `number or nil` | ::ToString func resolved (dont bother for now)                                     |
 | `engineVersion`           | `table or nil`  | Explicit or last detected engine-version descriptor                                |
-| `layoutOverrides`         | `table or nil`  | Current caller-supplied layout overrides                                            |
-
+| `versionLayoutMode`       | `string`        | Current `auto`, `force` or `off` selection                                         |
+| `versionLayoutProfile`    | `string or nil` | reflection profile that passed runtime validation                                  |
+| `versionObjectArrayProfile` | `string or nil` | object-array profile that passed runtime validation                              |
+| `layoutOverrides`         | `table or nil`  | Current layout overrides                                                           |
 
 

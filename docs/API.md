@@ -10,6 +10,10 @@
 
 `ue_getEngineVersion`
 
+`ue_setVersionLayoutMode`
+
+`ue_getVersionLayoutMode`
+
 `ue_setLayoutOverrides`
 
 `ue_getLayoutOverrides`

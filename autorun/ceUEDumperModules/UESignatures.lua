@@ -79,6 +79,7 @@ Module.GNames =
 
 Module.GObjects =
 {
+  "48 8D 0D * * * * 48 8B D8 8B 50 0C 48 8B 68 40 E8 * * * * 4C 8B 00 49 C1 F8 20", -- UE5.8 FUObjectArray::IndexToObject caller. LEA addresses GUObjectArray directly
   "48 8D * * * * * E8 * * * * 89 * * 48 83 * * 5B C3 C7 * * * * * C7 * * * * * * 48 83 * * 5B C3",
   "48 8D * * * * * 33 * 48 89 * 48 89 * * 45 8B * 41 B9 * * * * 48 8B * 44 89",
   "3B * * * * * 7D * 8B * 99 0F * * 03 * 8B * 0F * * 2B * 48 98 C1 * * 48 63 * 48 8D",
