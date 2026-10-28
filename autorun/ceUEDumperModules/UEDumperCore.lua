@@ -463,6 +463,141 @@ function Core.EngineVersion.scanModulePattern(module, pattern)
   return addresses
 end
 
+--- Read x64 PE exception directory (for native function bounds)
+-- @param module table @ main-module descriptor
+-- @return table|nil @ sorted RUNTIME_FUNCTION directory descriptor
+-- @return string|nil @ parse error
+function Core.Modules.getRuntimeFunctionDirectory(module)
+  if type(module) ~= 'table' or type(module.Address) ~= 'number' then return nil, 'Main module is unavailable' end
+
+  local dosMagic = readSmallInteger( module.Address )
+  local ntOffset = readInteger( module.Address + 0x3C )
+
+  if dosMagic ~= 0x5A4D or type(ntOffset) ~= 'number' then return nil, 'Invalid DOS header' end
+
+  ntOffset = ntOffset & 0xFFFFFFFF
+  local ntAddress = module.Address + ntOffset
+
+  if readInteger(ntAddress) ~= 0x4550 then return nil, 'Invalid PE header' end
+
+  local optionalHeader = ntAddress + 0x18
+  if readSmallInteger(optionalHeader) ~= 0x20B then return nil, 'Target module is not PE32+' end
+
+  -- PE32+ OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION]
+  local exceptionRva = readInteger( optionalHeader + 0x70 + 3 * 8 )
+  local exceptionSize = readInteger( optionalHeader + 0x70 + 3 * 8 + 4 )
+
+  if type(exceptionRva) ~= 'number' or type(exceptionSize) ~= 'number' then return nil, 'PE exception directory is unreadable' end
+
+  exceptionRva = exceptionRva & 0xFFFFFFFF
+  exceptionSize = exceptionSize & 0xFFFFFFFF
+
+  if exceptionRva == 0 or exceptionSize < 12 then return nil, 'PE exception directory is empty' end
+
+  return
+  {
+    moduleBase = module.Address,
+    address = module.Address + exceptionRva,
+    count = math.floor(exceptionSize / 12),
+  }
+end
+
+--- Find native function containing an executable address through .pdata
+-- @param directory table @ descriptor from getRuntimeFunctionDirectory
+-- @param address number @ executable address
+-- @return number|nil @ inclusive function start
+-- @return number|nil @ exclusive function end
+-- @return number|nil @ UNWIND_INFO address
+function Core.Modules.findRuntimeFunctionRange(directory, address)
+  if type(directory) ~= 'table' or type(address) ~= 'number' then return nil end
+
+  local relativeAddress = address - directory.moduleBase
+  if relativeAddress < 0 or relativeAddress > 0xFFFFFFFF then return nil end
+
+  local low = 0
+  local high = directory.count - 1
+
+  while low <= high do
+    local middle = math.floor((low + high) / 2)
+    local entry = directory.address + middle * 12
+    local beginRva = readInteger(entry)
+    local endRva = readInteger( entry + 4 )
+
+    if type(beginRva) ~= 'number' or type(endRva) ~= 'number' then return nil end
+
+    beginRva = beginRva & 0xFFFFFFFF
+    endRva = endRva & 0xFFFFFFFF
+
+    if relativeAddress < beginRva then
+      high = middle - 1
+    elseif relativeAddress >= endRva then
+      low = middle + 1
+    else
+      local unwindRva = readInteger( entry + 8 )
+      if type(unwindRva) ~= 'number' then return nil end
+
+      return directory.moduleBase + beginRva, directory.moduleBase + endRva, directory.moduleBase + (unwindRva & 0xFFFFFFFF)
+    end
+  end
+
+  return nil
+end
+
+--- Find root native function containing an executable address
+-- @param directory table @ descriptor from getRuntimeFunctionDirectory
+-- @param address number @ executable address inside a function or funclet
+-- @return number|nil @ inclusive root-function start
+-- @return number|nil @ exclusive root-function end
+function Core.Modules.findRootRuntimeFunctionRange(directory, address)
+  -- x64 PE exception data may describe a cold funclet with UNW_FLAG_CHAININFO
+  local functionStart, functionEnd, unwindAddress = Core.Modules.findRuntimeFunctionRange( directory, address )
+  if not functionStart then return nil end
+
+  local visited = {}
+
+  for _ = 1, 16 do
+    if not unwindAddress or visited[ unwindAddress ] then
+      return functionStart, functionEnd
+    end
+
+    visited[ unwindAddress ] = true
+
+    local versionAndFlags = readByte(unwindAddress)
+    local unwindCodeCount = readByte( unwindAddress + 2 )
+    if type(versionAndFlags) ~= 'number' or type(unwindCodeCount) ~= 'number' then
+      return functionStart, functionEnd
+    end
+
+    -- UNW_FLAG_CHAININFO is flag value 4 in bits 3..7
+    if (versionAndFlags >> 3) ~= 4 then
+      return functionStart, functionEnd
+    end
+
+    local chainedEntry = unwindAddress + 4 + unwindCodeCount * 2
+    chainedEntry = (chainedEntry + 3) & ~3
+
+    local chainedBeginRva = readInteger(chainedEntry)
+    local chainedEndRva = readInteger( chainedEntry + 4 )
+    local chainedUnwindRva = readInteger( chainedEntry + 8 )
+
+    if type(chainedBeginRva) ~= 'number' or type(chainedEndRva) ~= 'number' or type(chainedUnwindRva) ~= 'number' then
+      return functionStart, functionEnd
+    end
+
+    chainedBeginRva = chainedBeginRva & 0xFFFFFFFF
+    chainedEndRva = chainedEndRva & 0xFFFFFFFF
+    if chainedBeginRva >= chainedEndRva then
+      return functionStart, functionEnd
+    end
+
+    functionStart = directory.moduleBase + chainedBeginRva
+    functionEnd = directory.moduleBase + chainedEndRva
+    unwindAddress = directory.moduleBase + (chainedUnwindRva & 0xFFFFFFFF)
+  end
+
+  return functionStart, functionEnd
+end
+
 --- Search main module for embedded UE release-branch string
 -- @param module table @ main-module descriptor
 -- @return table|nil @ detected version descriptor
@@ -484,7 +619,7 @@ function Core.EngineVersion.detectEmbeddedBranch(module)
     local addresses = Core.EngineVersion.scanModulePattern( module, pattern )
 
     for _, address in ipairs(addresses) do
-      local branch = readWideString( address, 160 )
+      local branch = readString( address, 160, true)
       local version = Core.EngineVersion.parseUnrealVersionText(branch)
 
       if version then
@@ -495,6 +630,7 @@ function Core.EngineVersion.detectEmbeddedBranch(module)
   end
 
   local selected
+
   for _, candidate in pairs(candidates) do
     if selected then return nil end -- conflicting embedded engine branches are ambiguous
     selected = candidate
@@ -622,6 +758,7 @@ local OVERRIDABLE_LAYOUT_TABLES =
   FField = true,
   FProperty = true,
   UFunction = true,
+  UEngine = true,
   FUObjectItem = true,
   FUObjectArray = true,
   TUObjectArray = true,
@@ -1125,8 +1262,9 @@ function Core.Reflection.UObject_getName(UObjectAddress)
   local number = value >> 32
   local name = CUEDEFS.IndexToName[index]
 
-  if name and number > 0 then
-    name = name .. '_' .. number
+  -- With UE_FNAME_OUTLINE_NUMBER the comparison id selects a numbered FNamePool entry
+  if name and not CUEDEFS.FNameOutlineNumber and number > 0 then
+    name = name .. '_' .. (number - 1)
   end
 
   return name
@@ -2932,6 +3070,238 @@ end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// CORE.ENGINE
 
+--- Find native root functions containing RIP-relative LEA references
+-- @param module table @ executable module descriptor
+-- @param targetAddresses table<number, boolean> @ referenced addresses
+-- @param runtimeFunctions table @ parsed PE exception directory
+-- @return table<number, boolean>|nil @ unique native root-function addresses
+-- @return string|nil @ scan error
+function Core.Engine.findRipReferenceRoots(module, targetAddresses, runtimeFunctions)
+  local roots = {}
+
+  -- PatternSleuth scans all encodings of LEA r64,[rip+disp32]
+  -- use 2 scans to cover them
+  for _, rex in ipairs({ 0x48, 0x4C }) do
+    local memoryScan = createMemScan()
+    memoryScan.VarType = vtByteArray
+    memoryScan.ScanValue = ('%02X 8D * * * * *'):format(rex)
+    memoryScan.Startaddress = module.Address
+    memoryScan.Stopaddress = module.Address + module.Size - 1
+    memoryScan.Fastscanmethod = fsmNotAligned
+    memoryScan.ScanWritable = 'scanExclude'
+    memoryScan.ScanExecutable = 'scanInclude'
+    memoryScan.ScanCopyOnWrite = 'scanExclude'
+    memoryScan.scan()
+    memoryScan.waitTillDone()
+
+    local results = memoryScan.Results
+    local scanError = memoryScan.ErrorString
+
+    if results then
+
+      for index = 1, #results do
+
+        local instructionAddress = getAddressSafe( results[ index ] )
+        if not instructionAddress then goto continue end
+
+        local modrm = readByte( instructionAddress + 2 )
+        if not modrm or (modrm & 0xC7) ~= 0x05 then goto continue end
+
+        local displacement = readInteger( instructionAddress + 3 )
+        if type(displacement) ~= 'number' then goto continue end
+
+        displacement = displacement & 0xFFFFFFFF
+        if displacement >= 0x80000000 then
+          displacement = displacement - 0x100000000
+        end
+
+        local targetAddress = instructionAddress + 7 + displacement
+        if not targetAddresses[ targetAddress ] then goto continue end
+
+        local functionStart = Core.Modules.findRootRuntimeFunctionRange( runtimeFunctions, instructionAddress )
+        
+        if functionStart then
+          roots[ functionStart ] = true
+        end
+
+        ::continue::
+      end
+    end
+
+    memoryScan.destroy()
+    if scanError and scanError ~= '' then return nil, scanError end
+  end
+
+  return roots
+end
+
+--- Follow simple compiler/linker jump thunks before inspecting a function body
+-- vtable entry is hooked, the resolved target is for inspection
+-- @param address number @ vtable function entry
+-- @return number @ final directly reachable code address
+function Core.Engine.followJumpThunks(address)
+  local current = address
+  local visited = {}
+
+  for _ = 1, 8 do
+
+    if visited[ current ] then break end
+    visited[ current ] = true
+
+    local opcode = readByte(current)
+
+    if opcode == 0xE9 then
+      local displacement = readInteger( current + 1 )
+      if type(displacement) ~= 'number' then break end
+
+      displacement = displacement & 0xFFFFFFFF
+
+      if displacement >= 0x80000000 then
+        displacement = displacement - 0x100000000
+      end
+
+      current = current + 5 + displacement
+
+    elseif opcode == 0xEB then
+
+      local displacement = readByte( current + 1 )
+
+      if type(displacement) ~= 'number' then break end
+
+      if displacement >= 0x80 then
+        displacement = displacement - 0x100
+      end
+
+      current = current + 2 + displacement
+
+    elseif opcode == 0xFF and readByte( current + 1 ) == 0x25 then
+
+      local displacement = readInteger( current + 2 )
+
+      if type(displacement) ~= 'number' then break end
+
+      displacement = displacement & 0xFFFFFFFF
+
+      if displacement >= 0x80000000 then
+        displacement = displacement - 0x100000000
+      end
+
+      local target = readPointer( current + 6 + displacement )
+
+      if type(target) ~= 'number' or target == 0 then break end
+
+      current = target
+
+    else
+      break
+    end
+  end
+
+  return current
+end
+
+--- Resolve UGameEngine::Tick semantically from its native command reference
+-- @return number|nil @ executable UGameEngine::Tick entry
+-- @return string|nil @ resolution error
+-- @return number|nil @ selected vtable byte offset
+function Core.Engine.resolveGameEngineTick()
+  -- PatternSleuth/UE4SS solution: identify the native root function from references to the built-in "causeevent=" console command
+
+  local engineAddress = CUEDEFS.UGameEngine
+
+  local vtableAddress = type(engineAddress) == 'number' and readPointer(engineAddress) or nil
+  if not vtableAddress or vtableAddress == 0 then return nil, 'GEngine instance/vtable is unavailable' end
+
+  local module = Core.EngineVersion.getMainModule()
+  if not module then return nil, 'Main module is unavailable' end
+
+  local runtimeFunctions, directoryError = Core.Modules.getRuntimeFunctionDirectory( module )
+  if not runtimeFunctions then return nil, directoryError end
+
+  if type(CUEDEFS.UEngineTick) == 'number' and readByte(CUEDEFS.UEngineTick) ~= nil then
+    local cachedAddress = CUEDEFS.UEngineTick
+    local rootAddress = Core.Modules.findRootRuntimeFunctionRange( runtimeFunctions, cachedAddress ) or cachedAddress
+
+    if rootAddress ~= cachedAddress then
+      Core.Runtime.log( ('UGameEngine::Tick corrected chained funclet 0x%X to root 0x%X'):format(cachedAddress, rootAddress) )
+      CUEDEFS.UEngineTick = rootAddress
+      CUEDEFS.UEngineTickVTableOffset = nil
+      if CUEDEFS.UEngine then CUEDEFS.UEngine.TickVTableOffset = nil end
+    end
+
+    return rootAddress, nil, CUEDEFS.UEngineTickVTableOffset
+  end
+
+  local anchorAddresses = {}
+  local anchorCount = 0
+
+  for _, text in ipairs({ 'causeevent=', 'CAUSEEVENT ' }) do
+
+    local pattern = Core.EngineVersion.utf16Pattern(text) .. ' 00 00'
+
+    for _, address in ipairs( Core.EngineVersion.scanModulePattern( module, pattern ) ) do
+
+      if not anchorAddresses[address] then
+        anchorAddresses[address] = true
+        anchorCount = anchorCount + 1
+      end
+
+    end
+
+  end
+
+  if anchorCount == 0 then return nil, 'UGameEngine::Tick anchor strings were not found' end
+
+  Core.Runtime.log( ('UGameEngine::Tick: found %d command anchor(s); scanning executable references'):format(anchorCount) )
+
+  local roots, referenceError = Core.Engine.findRipReferenceRoots( module, anchorAddresses, runtimeFunctions )
+  if not roots then return nil, referenceError end
+
+  local selectedAddress
+  local rootCount = 0
+
+  for rootAddress in pairs(roots) do
+    selectedAddress = rootAddress
+    rootCount = rootCount + 1
+  end
+
+  Core.Runtime.log( ('UGameEngine::Tick: command references resolved to %d native root function(s)'):format(rootCount) )
+
+  if rootCount == 0 then return nil, 'No code reference to the UGameEngine::Tick anchor strings was found' end
+  if rootCount > 1 then return nil, ('UGameEngine::Tick anchor resolved to %d native root functions'):format(rootCount) end
+
+  -- vtable lookup is retained only to report/cache a slot when this build exposes the same body directly
+  local selectedOffset
+
+  for vtableOffset = 0, 0x800, PTR_SIZE do
+
+    local virtualFunction = readPointer( vtableAddress + vtableOffset )
+
+    local inspectedFunction = type(virtualFunction) == 'number' and Core.Engine.followJumpThunks(virtualFunction) or nil
+
+    local functionStart = inspectedFunction and Core.Modules.findRootRuntimeFunctionRange( runtimeFunctions, inspectedFunction ) or nil
+
+    if virtualFunction == selectedAddress or inspectedFunction == selectedAddress or functionStart == selectedAddress then
+      selectedOffset = vtableOffset
+      break
+    end
+
+  end
+
+  CUEDEFS.UEngineTick = selectedAddress
+  CUEDEFS.UEngineTickVTableOffset = selectedOffset
+
+  if selectedOffset then
+    CUEDEFS.UEngine = CUEDEFS.UEngine or {}
+    CUEDEFS.UEngine.TickVTableOffset = selectedOffset
+    Core.Runtime.log( ('UGameEngine::Tick resolved semantically at 0x%X (vtable +0x%X)'):format(selectedAddress, selectedOffset) )
+  else
+    Core.Runtime.log( ('UGameEngine::Tick resolved semantically at 0x%X (not directly exposed by the live vtable)'):format(selectedAddress) )
+  end
+
+  return selectedAddress, nil, selectedOffset
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--/// ENGINE-OBJECT GROUP SCAN
 
 --- Scan writable memory for a grouped Unreal object pattern
@@ -2988,11 +3358,18 @@ function Core.Engine.filterNumberedEngineInstances(addresses)
   local nameNumberOffset = CUEDEFS.UObject.Name + 4
 
   for _, address in ipairs(addresses) do
-    --the instantiated GEngine has a number for the name
-    local nameNumber = readInteger( address + nameNumberOffset )
+    local isInstance
 
-    if nameNumber ~= nil and nameNumber ~= 0 then
-      instanceAddresses[#instanceAddresses + 1] = address
+    if CUEDEFS.FNameOutlineNumber then
+      local objectName = Core.Reflection.UObject_getName(address)
+      isInstance = type(objectName) == 'string' and objectName:find( 'GameEngine', 1, true ) == 1
+    else
+      local nameNumber = readInteger( address + nameNumberOffset )
+      isInstance = nameNumber ~= nil and nameNumber ~= 0
+    end
+
+    if isInstance then
+      instanceAddresses[ #instanceAddresses + 1 ] = address
     end
 
   end
@@ -3331,8 +3708,8 @@ function Core.CustomTypes.fnameBytesToValue(b1, b2, b3, b4, b5, b6, b7, b8, addr
       resolvedName = '<noname>'
     end
 
-    if nameNumber > 0 then
-      return string.format( "%s_%d", resolvedName, nameNumber )
+    if not CUEDEFS.FNameOutlineNumber and nameNumber > 0 then
+      return string.format( "%s_%d", resolvedName, nameNumber - 1 )
     else
       return resolvedName
     end
@@ -4793,25 +5170,44 @@ function Core.Names.decodeNamePoolBlock(blockStream, blockIndex, nameMaps, valid
     local isWideName = (entryHeader & 1) == 1
     local nameLength = entryHeader >> headerShift
 
-    if nameLength == 0 then break end
-
-    local payloadSize = isWideName and nameLength * 2 or nameLength
-
-    -- CurrentBlock is only initialized through CurrentByteCursor
-    -- reject a truncated or garbage header instead of asking the CE stream to overread
-    if blockStream.Position + payloadSize > blockLimit then break end
-
     local decodedName
+    local nameIndex = blockNameIndex + entryOffset
 
-    if isWideName then  decodedName = blockStream.readWideString(nameLength)
-    else                decodedName = blockStream.readString(nameLength)
+    if nameLength == 0 then
+      -- UE_FNAME_OUTLINE_NUMBER removes Number from FName storing numbered names as special pool entries:
+      --   Header(Len=0), unaligned FNameEntryId base, uint32 internal number
+      if blockStream.Position + 8 > blockLimit then break end
+
+      local baseNameIndex = blockStream.readDword()
+      local internalNumber = blockStream.readDword()
+      local baseName = baseNameIndex and nameMaps.indexToName[ baseNameIndex & 0x1FFFFFFF ]
+
+      if not baseName or not internalNumber or internalNumber == 0 or internalNumber >= 0x80000000 then break end
+
+      decodedName = baseName .. '_' .. tostring(internalNumber - 1)
+
+      CUEDEFS.FNameOutlineNumber = true
+      
+      nameMaps.outlineInfo[ nameIndex ] =
+      {
+        baseIndex = baseNameIndex & 0x1FFFFFFF,
+        number = internalNumber,
+      }
+    else
+      local payloadSize = isWideName and nameLength * 2 or nameLength
+
+      -- CurrentBlock is only initialized through CurrentByteCursor.
+      if blockStream.Position + payloadSize > blockLimit then break end
+
+      if isWideName then  decodedName = blockStream.readWideString(nameLength)
+      else                decodedName = blockStream.readString(nameLength)
+      end
+
     end
 
     if decodedName ~= nil then
-      local nameIndex = blockNameIndex + entryOffset
-
-      nameMaps.nameToIndex[decodedName] = nameIndex
-      nameMaps.indexToName[nameIndex] = decodedName
+      nameMaps.nameToIndex[ decodedName ] = nameIndex
+      nameMaps.indexToName[ nameIndex ] = decodedName
       decodedCount = decodedCount + 1
     end
 
@@ -4945,6 +5341,7 @@ function Core.Names.publishNamePoolMaps(nameMaps)
 
   CUEDEFS.NameToIndex = nameToIndex
   CUEDEFS.IndexToName = nameMaps.indexToName
+  CUEDEFS.FNameOutlineInfo = nameMaps.outlineInfo
   CUEDEFS.CachedNameCount = uniqueNameCount
   CUEDEFS.NamePoolValidated = uniqueNameCount > 355 and nameToIndex.Class ~= nil and nameToIndex.Object ~= nil -- heuristic validation
 
@@ -4955,8 +5352,8 @@ function Core.Names.publishNamePoolMaps(nameMaps)
                     )
   else
     Core.Runtime.log(
-                      ('Core.Names.CacheNamePool: cached %d names with header shift %d; GameEngine=%s')
-                      :format( uniqueNameCount, CUEDEFS.FNameHeaderShift or 6, tostring( nameToIndex['GameEngine'] ~= nil ) )
+                      ('Core.Names.CacheNamePool: cached %d names with header shift %d; outlineNumber=%s GameEngine=%s')
+                      :format( uniqueNameCount, CUEDEFS.FNameHeaderShift or 6, tostring(CUEDEFS.FNameOutlineNumber == true), tostring( nameToIndex['GameEngine'] ~= nil ) )
                     )
   end
 end
@@ -4970,6 +5367,9 @@ end
 function Core.Names.CacheNamePool_old()
   Core.Runtime.log('Core.Names.CacheNamePool_old')
   if CUEDEFS.NamePoolData == nil then return nil, 'CUEDEFS.NamePoolData not defined yet' end
+  
+  CUEDEFS.FNameOutlineNumber = false
+  CUEDEFS.FNameOutlineInfo = nil
   --[[
     Each entry-pointer chunk is 0x20000 bytes
     0x20000 / 8-byte pointer = 16384 FNameEntry pointers
@@ -5021,7 +5421,13 @@ function Core.Names.CacheNamePool(cancellationThread)
   Core.Runtime.log('Core.Names.CacheNamePool')
 
   if CUEDEFS.NamePoolData == nil then return false, 'Core.Names.CacheNamePool: CUEDEFS.NamePoolData is still undefined' end
-  if CUEDEFS.NamePoolData_old then    return Core.Names.CacheNamePool_old(cancellationThread)   end
+  
+  if CUEDEFS.NamePoolData_old then
+    return Core.Names.CacheNamePool_old(cancellationThread)
+  end
+
+  CUEDEFS.FNameOutlineNumber = false
+  CUEDEFS.FNameOutlineInfo = nil
 
   --[[ read & validate the modern name allocator's block state
     FNameEntryAllocator
@@ -5069,7 +5475,12 @@ function Core.Names.CacheNamePool(cancellationThread)
   
   local initializedBlockCount = currentBlockIndex + 1
   Core.Runtime.log( ('Core.Names.CacheNamePool: parsing %d inited blocks; Block=%d ByteCursor=0x%X'):format( initializedBlockCount, currentBlockIndex, currentBlockByteCursor ) )
-  local nameMaps = {   nameToIndex = {}, indexToName = {},   }
+  local nameMaps =
+  {
+    nameToIndex = {},
+    indexToName = {},
+    outlineInfo = {}
+  }
 
   --[[
       readNamePoolMaps
@@ -7192,6 +7603,7 @@ function Core.Persistence.saveLayout(savedSettings)
     'UStruct',
     'UClass',
     'UFunction',
+    'UEngine',
     'FProperty',
     'FFieldClass',
     'FField',
@@ -8456,7 +8868,10 @@ function Core.API.ue_getScannerStatusInternal()
     namePoolSourceModule = type(CUEDEFS) == 'table' and CUEDEFS.NamePoolSourceModule or nil,
     namePoolScanMethod = type(CUEDEFS) == 'table' and CUEDEFS.NamePoolScanMethod or nil,
     cachedNameCount = type(CUEDEFS) == 'table' and CUEDEFS.CachedNameCount or 0,
+    fnameOutlineNumber = type(CUEDEFS) == 'table' and CUEDEFS.FNameOutlineNumber == true,
     fnameToString = type(CUEDEFS) == 'table' and CUEDEFS.FNameToString or nil,
+    engineTick = type(CUEDEFS) == 'table' and CUEDEFS.UEngineTick or nil,
+    engineTickVtableOffset = type(CUEDEFS) == 'table' and CUEDEFS.UEngineTickVTableOffset or nil,
     engineVersion = Core.EngineVersion.get(),
     versionLayoutMode = Core.Layout.getVersionProfileMode(),
     versionLayoutProfile = type(CUEDEFS) == 'table' and CUEDEFS.VersionLayoutProfile or nil,
@@ -8489,6 +8904,7 @@ Core.API.findContainingObject = Core.Objects.findContainingObject
 Core.API.status = Core.API.ue_getScannerStatusInternal
 Core.API.processEvent = Core.Signatures.resolveProcessEvent
 Core.API.actorProcessEvent = Core.Signatures.resolveActorProcessEvent
+Core.API.engineTick = Core.Engine.resolveGameEngineTick
 Core.API.setMenuVisible = Core.Menu.setMenuVisible
 Core.API.isMenuVisible = Core.Menu.isMenuVisible
 Core.API.clearSavedLayout = Core.Persistence.clearCurrentLayout
@@ -8497,6 +8913,7 @@ Core.API.getEngineVersion = Core.EngineVersion.get
 Core.API.setEngineVersion = Core.EngineVersion.set
 Core.API.setVersionLayoutMode = Core.Layout.setVersionProfileMode
 Core.API.getVersionLayoutMode = Core.Layout.getVersionProfileMode
+Core.API.getVersionLayoutCandidates = Core.Layout.getVersionCandidates
 Core.API.getLayoutOverrides = Core.Layout.get
 Core.API.setLayoutOverrides = Core.Layout.set
 Core.API.subsystems = Core

@@ -140,35 +140,22 @@ CEUE_API std::uint32_t ceue_bridge_version();
 CEUE_API std::uint32_t ceue_bridge_abi();
 
 // 3-stage: create/configure/enable
-CEUE_API void *ceue_create_bp_hook(
-                                    void *ufunction,
-                                    std::uint32_t function_pointer_offset,
-                                    void *expected_original,
-                                    void **object_pointer,
-                                    std::uint32_t flags
-                                  );
+CEUE_API void* ceue_create_bp_hook( void* ufunction, std::uint32_t function_pointer_offset, void* expected_original, void** object_pointer, std::uint32_t flags );
 
 // Install/configure the one process-wide Blueprint VM detour. The target must
 // have the ProcessLocalScriptFunction-compatible signature:
 // void(UObject* Context, FFrame& Stack, void* Result).
-CEUE_API std::uint32_t ceue_configure_script_dispatcher(
-                                                          void *dispatcher,
-                                                          std::uint32_t frame_node_offset
-                                                        );
+CEUE_API std::uint32_t ceue_configure_script_dispatcher( void* dispatcher, std::uint32_t frame_node_offset );
 
 // Create a per-UFunction record consumed by the process-wide script detour.
 // Configuration is completed with the same condition/write functions used by
 // ceue_create_bp_hook before the record is enabled.
-CEUE_API void *ceue_create_script_hook(
-                                          void *ufunction,
-                                          void **object_pointer,
-                                          std::uint32_t flags
-                                        );
+CEUE_API void* ceue_create_script_hook( void* ufunction, void** object_pointer, std::uint32_t flags );
 
-CEUE_API std::uint32_t ceue_set_frame_locals_offset( void *handle, std::uint32_t frame_locals_offset );
+CEUE_API std::uint32_t ceue_set_frame_locals_offset( void* handle, std::uint32_t frame_locals_offset );
 
 CEUE_API std::uint32_t ceue_add_condition(
-                                            void *handle,
+                                            void* handle,
                                             std::uint32_t source,
                                             std::uint32_t value_type,
                                             std::uint32_t operation,
@@ -178,7 +165,7 @@ CEUE_API std::uint32_t ceue_add_condition(
                                           );
 
 CEUE_API std::uint32_t ceue_add_write(
-                                        void *handle,
+                                        void* handle,
                                         std::uint32_t phase,
                                         std::uint32_t source,
                                         std::uint32_t value_type,
@@ -187,43 +174,50 @@ CEUE_API std::uint32_t ceue_add_write(
                                         std::uint64_t mask_bits
                                       );
 
-CEUE_API std::uint32_t ceue_enable_bp_hook( void *handle, std::uint32_t enabled );
+CEUE_API std::uint32_t ceue_enable_bp_hook( void* handle, std::uint32_t enabled );
 
-CEUE_API std::uint32_t ceue_remove_bp_hook( void *handle );
+CEUE_API std::uint32_t ceue_remove_bp_hook( void* handle );
 
 CEUE_API std::uint32_t ceue_remove_all_bp_hooks();
 
 CEUE_API std::uint32_t ceue_get_hook_count();
 
-CEUE_API std::uint64_t ceue_get_hook_hit_count(void *handle);
+CEUE_API std::uint64_t ceue_get_hook_hit_count(void* handle);
 
-// Install UObject::ProcessEvent detour for queued calls on the process's oldest (packaged-game main/game) thread
-// ProcessEvent calls made by other target threads never drain the queue
-CEUE_API std::uint32_t ceue_configure_process_event_dispatcher( void *process_event );
+// Configure the callable UObject::ProcessEvent target and ProcessEvent-based
+// fallback scheduler. EngineTick scheduling can subsequently replace the
+// fallback without changing the function used for queued invocations.
+CEUE_API std::uint32_t ceue_configure_process_event_dispatcher( void* process_event );
+
+// Install UEngine::Tick as the preferred once-per-frame game-thread scheduler.
+// Queued ProcessEvent calls still execute through the separately configured
+// ProcessEvent trampoline.
+CEUE_API std::uint32_t ceue_configure_engine_tick_dispatcher( void* engine_tick );
 
 // Copy parameter buffer into bridge-owned storage and enqueue ProcessEvent
 // runs at least once
-// interval_dispatches counts ProcessEvent dispatcher visits between repeated executions (zero executes every visit)
-CEUE_API void *ceue_queue_process_event(
-                                        void *object,
-                                        void *ufunction,
-                                        const void *parameters,
+// interval_dispatches counts scheduler visits between repeated executions
+// (zero executes every EngineTick/ProcessEvent visit)
+CEUE_API void* ceue_queue_process_event(
+                                        void* object,
+                                        void* ufunction,
+                                        const void* parameters,
                                         std::uint32_t parameter_size,
                                         std::uint32_t runs,
                                         std::uint32_t interval_dispatches
                                       );
 
-CEUE_API std::uint32_t ceue_get_invocation_status( void *handle );
+CEUE_API std::uint32_t ceue_get_invocation_status( void* handle );
 
-CEUE_API std::uint32_t ceue_get_invocation_completed_runs( void *handle );
+CEUE_API std::uint32_t ceue_get_invocation_completed_runs( void* handle );
 
-CEUE_API std::uint32_t ceue_copy_invocation_parameters( void *handle, void *destination, std::uint32_t capacity );
+CEUE_API std::uint32_t ceue_copy_invocation_parameters( void* handle, void* destination, std::uint32_t capacity );
 
-CEUE_API std::uint32_t ceue_cancel_invocation( void *handle );
+CEUE_API std::uint32_t ceue_cancel_invocation( void* handle );
 
-CEUE_API std::uint32_t ceue_abandon_invocation( void *handle );
+CEUE_API std::uint32_t ceue_abandon_invocation( void* handle );
 
-CEUE_API std::uint32_t ceue_release_invocation( void *handle );
+CEUE_API std::uint32_t ceue_release_invocation( void* handle );
 
 CEUE_API std::uint32_t ceue_get_pending_invocation_count();
 
@@ -231,4 +225,4 @@ CEUE_API std::uint32_t ceue_get_scheduler_thread_id();
 
 // returns required byte count including trailing NUL
 // passing a buffer copies as much as fits and always NUL-terminates it
-CEUE_API std::uint32_t ceue_get_last_error( char *buffer, std::uint32_t capacity );
+CEUE_API std::uint32_t ceue_get_last_error( char* buffer, std::uint32_t capacity );

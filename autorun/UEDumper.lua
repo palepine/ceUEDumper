@@ -13,6 +13,28 @@
 
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+    MIT License
+
+    Copyright (c) 2022 Narknon
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is furnished
+    to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
 ]]
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--///--/// GLOBALS CONSTANTS
@@ -1234,6 +1256,7 @@ function Dumper.Reflection.ue_getFNameInfo(value, number)
 
   local namesByIndex = Backend.namesByIndex()
   if type(namesByIndex) ~= 'table' then return nil, 'Runtime FName cache is unavailable' end
+  local outlineNumber = Backend.usesOutlineFNameNumber()
 
   local comparisonIndex
   local storedNumber = number
@@ -1255,14 +1278,19 @@ function Dumper.Reflection.ue_getFNameInfo(value, number)
 
       address = value.address
       comparisonIndex = readInteger(address)
-      local memoryNumber = readInteger(address + 4)
 
-      if comparisonIndex == nil or memoryNumber == nil then
-        return nil, ('FName is unreadable at 0x%X'):format(address)
-      end
+      if comparisonIndex == nil then return nil, ('FName is unreadable at 0x%X'):format(address) end
 
       comparisonIndex = comparisonIndex & 0xFFFFFFFF
-      if storedNumber == nil then storedNumber = memoryNumber & 0xFFFFFFFF end
+
+      if not outlineNumber and storedNumber == nil then
+
+        local memoryNumber = readInteger( address + 4 )
+        if memoryNumber == nil then return nil, ('FName Number is unreadable at 0x%X'):format( address + 4 ) end
+
+        storedNumber = memoryNumber & 0xFFFFFFFF
+      end
+
       source = 'memory'
     else
       comparisonIndex = value.comparisonIndex
@@ -1291,13 +1319,41 @@ function Dumper.Reflection.ue_getFNameInfo(value, number)
     return nil, 'FName Number must be a non-negative integer'
   end
 
-  local baseName = namesByIndex[comparisonIndex]
+  -- outline-number builds may still provide {c omparisonIndex=base , number=N } form.
+  -- convert it to the pool id which represents that complete numbered name.
+  if outlineNumber and storedNumber > 0 and source ~= 'memory' and not Backend.fnameOutlineInfo(comparisonIndex) then
+    local suppliedBaseName = namesByIndex[ comparisonIndex ]
+    if not suppliedBaseName then return nil, ('FName comparison index 0x%X is absent from the cached name pool'):format( comparisonIndex ) end
+
+    local numberedIndex = Backend.nameIndex( suppliedBaseName .. '_' .. tostring(storedNumber - 1) )
+    if not numberedIndex then return nil, 'Numbered FName is absent from the cached outline-number pool' end
+    
+    comparisonIndex = numberedIndex
+  end
+
+  local baseName = namesByIndex[ comparisonIndex ]
+
   if type(baseName) ~= 'string' then
     return nil, ('FName comparison index 0x%X is absent from the cached name pool'):format(comparisonIndex)
   end
 
-  local displayNumber = storedNumber > 0 and storedNumber - 1 or nil
-  local displayName = displayNumber and (baseName .. '_' .. tostring(displayNumber)) or baseName
+  local displayName = baseName
+  local displayNumber
+
+  if outlineNumber then
+    local outlineInfo = Backend.fnameOutlineInfo( comparisonIndex )
+
+    if outlineInfo then
+      storedNumber = outlineInfo.number
+      displayNumber = storedNumber - 1
+      baseName = namesByIndex[outlineInfo.baseIndex] or baseName
+    else
+      storedNumber = 0
+    end
+  elseif storedNumber > 0 then
+    displayNumber = storedNumber - 1
+    displayName = baseName .. '_' .. tostring(displayNumber)
+  end
 
   return
   {
@@ -1309,6 +1365,7 @@ function Dumper.Reflection.ue_getFNameInfo(value, number)
     name = displayName,
     displayName = displayName,
     isNumbered = storedNumber > 0,
+    outlineNumber = outlineNumber,
     source = source,
     address = address,
   }
@@ -3764,9 +3821,11 @@ Dumper.Invocation.registerValueHandlers(
 
 Dumper.Invocation.registerValueHandlers(
   { 'NameProperty' },
+
   function(valueAddress, property, value)
     local comparisonIndex
     local number = 0
+    local outlineNumber = Backend.usesOutlineFNameNumber()
 
     if type(value) == 'string' then
       comparisonIndex = Backend.nameIndex(value)
@@ -3780,15 +3839,36 @@ Dumper.Invocation.registerValueHandlers(
 
     if type(comparisonIndex) ~= 'number' then return nil, 'NameProperty requires a string, index, or FName table' end
 
+    if outlineNumber and number > 0 then
+      local baseName = (Backend.namesByIndex() or {})[ comparisonIndex ]
+      
+      local numberedIndex = baseName and Backend.nameIndex( baseName .. '_' .. tostring(number - 1) )
+      if not numberedIndex then return nil, 'Numbered FName is absent from the cached outline-number pool' end
+
+      comparisonIndex = numberedIndex
+    end
+
     writeInteger(valueAddress, comparisonIndex)
-    writeInteger(valueAddress + 4, number)
+    if not outlineNumber then writeInteger(valueAddress + 4, number) end
     return true
   end,
+  
   function(valueAddress)
+    local comparisonIndex = readInteger( valueAddress )
+    local outlineNumber = Backend.usesOutlineFNameNumber()
+    local outlineInfo = outlineNumber and Backend.fnameOutlineInfo( comparisonIndex )
+    local number = 0
+
+    if outlineInfo then
+      number = outlineInfo.number
+    elseif not outlineNumber then
+      number = readInteger(valueAddress + 4)
+    end
+
     return
     {
-      comparisonIndex = readInteger(valueAddress),
-      number = readInteger(valueAddress + 4),
+      comparisonIndex = comparisonIndex,
+      number = number,
     }
   end
 )
@@ -3945,6 +4025,12 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
     return nil, "options.executionThread must be 'remote' or 'game'"
   end
 
+  local requestedScheduler = options.gameThreadScheduler or 'auto'
+
+  if requestedScheduler ~= 'auto' and requestedScheduler ~= 'engine-tick' and requestedScheduler ~= 'process-event' then
+    return nil, "options.gameThreadScheduler must be 'auto', 'engine-tick', or 'process-event'"
+  end
+
   local useGameThread = options.executionThread == 'game' or options.gameThread == true
   local requestedRuns = options.runs or 1
   local intervalDispatches = options.intervalDispatches or 0
@@ -4014,6 +4100,12 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
 
   local callResult
   local invocationHandle
+  local gameThreadScheduler
+  local schedulerAddress
+  local schedulerSource
+  local schedulerVtableOffset
+  local schedulerFallbackError
+
   local succeeded, invocationError = xpcall(
     function()
       -- should be zero, but let's keep it
@@ -4043,6 +4135,39 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
 
         local configured, configureError = HookBridge.configureProcessEventDispatcher(processEventAddress)
         if not configured then error( configureError, 0 ) end
+
+        gameThreadScheduler = 'process-event'
+        schedulerAddress = processEventAddress
+        schedulerSource = processEventSource
+        schedulerVtableOffset = processEventVtableOffset
+
+        if requestedScheduler ~= 'process-event' then
+
+          local engineTickAddress, engineTickError, engineTickSource, engineTickVtableOffset = Backend.engineTick( options.engineTickVtableOffset, options.engineTickAddress )
+
+          if engineTickAddress then
+
+            local tickConfigured, tickConfigureError = HookBridge.configureEngineTickDispatcher( engineTickAddress )
+
+            if tickConfigured then
+              gameThreadScheduler = 'engine-tick'
+              schedulerAddress = engineTickAddress
+              schedulerSource = engineTickSource
+              schedulerVtableOffset = engineTickVtableOffset
+            else
+              engineTickError = tickConfigureError
+            end
+
+          end
+
+          if gameThreadScheduler ~= 'engine-tick' then
+
+            if requestedScheduler == 'engine-tick' then error( engineTickError or 'UEngine::Tick scheduler was not configured', 0 ) end
+            schedulerFallbackError = engineTickError
+
+          end
+
+        end
 
         invocationHandle, configureError = HookBridge.queueProcessEvent(
                                                                           objectAddress,
@@ -4077,10 +4202,21 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
               invocationHandle = nil
             end
 
+            local schedulerDescription = gameThreadScheduler
+            
+            if schedulerSource then
+              schedulerDescription = schedulerDescription .. '/' .. schedulerSource
+            end
+
+            if schedulerVtableOffset then
+              schedulerDescription = schedulerDescription .. (' vtable+0x%X'):format(schedulerVtableOffset)
+            end
+
             error(
-                    cancelled
-                    and ('Game-thread ProcessEvent invocation at 0x%X timed out before execution'):format(processEventAddress)
-                    or ('Game-thread ProcessEvent invocation at 0x%X timed out while running'):format(processEventAddress),
+                    cancelled and ('Game-thread ProcessEvent invocation at 0x%X timed out before execution (scheduler=%s at 0x%X)')
+                                  :format( processEventAddress, schedulerDescription, schedulerAddress )
+                              or ('Game-thread ProcessEvent invocation at 0x%X timed out while running (scheduler=%s at 0x%X)')
+                                 :format( processEventAddress, schedulerDescription, schedulerAddress ),
                     0
                   )
           end
@@ -4092,8 +4228,11 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
         if not copied then error( copyError, 0 ) end
 
         executionResult = HookBridge.invocationCompletedRuns( invocationHandle )
+
         local released, releaseError = HookBridge.releaseInvocation( invocationHandle )
+
         invocationHandle = nil
+
         if not released then error( releaseError, 0 ) end
       else
         local integerArgumentType = 0
@@ -4119,6 +4258,11 @@ function Dumper.Invocation.ue_callFunction(objectAddress, functionName, argument
         processEventVtableOffset = processEventVtableOffset,
         executionResult = executionResult,
         executionThread = useGameThread and 'game' or 'remote',
+        gameThreadScheduler = gameThreadScheduler,
+        schedulerAddress = schedulerAddress,
+        schedulerSource = schedulerSource,
+        schedulerVtableOffset = schedulerVtableOffset,
+        schedulerFallbackError = schedulerFallbackError,
         outParameters = {},
       }
 

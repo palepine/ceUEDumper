@@ -197,6 +197,7 @@ Returns:
 | `name`             | Complete displayed name |
 | `displayName`      | `name` alias |
 | `isNumbered`       | Stored `Number` nonzero? |
+| `outlineNumber`    | `true` when this runtime stores numbered FNames as dedicated pool entries |
 | `source`           | `name`, `index`, `value`, `memory` |
 
 ### Bulk enumeration

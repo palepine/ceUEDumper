@@ -6,9 +6,8 @@
   > UFunction invocation on the object with the following arguments (nil if void). Returns nil, errorMessage on failure.
 
     Calls are synchronous. Direct mode uses CE's remote calling thread.
-    Set `options.executionThread = 'game'` to register a function to run in the game thread
+    Set options.executionThread = 'game' to queue on the game thread.
 
-    Returned table includes `functionAddress`, `processEventAddress`, `processEventSource`, `processEventVtableOffset`, `executionResult`, decoded output parameters
     `options.processEventVtableOffset` selects an explicit byte offset in the target object's vtable
     `options.processEventAddress` bypasses resolution with a known callable address
     `options.processEventMode` can be `auto`, `vtable`, `signature`, `actor-signature`
@@ -49,12 +48,14 @@ Game-thread execution options:
 | `executionThread = 'game'` | Queue to run in the game-thread. Defaults to CE execution |
 | `gameThread = true` | Alias for `executionThread = 'game'` |
 | `runs = N` | Execute the function N times before returning; defaults to `1` |
-| `intervalDispatches = N` | Skip N in-game-thread `ProcessEvent` executions between runs |
+| `intervalDispatches = N` | Skip N scheduler visits between runs |
 | `timeout = milliseconds` | Max time to wait for all requested runs |
 | `bridgePath = path` | Optional explicit bridge DLL path |
-
-The returned `executionResult` is the number of completed runs in game-thread mode.
-Output parameters and the return value are read after the last run.
+| `gameThreadScheduler = 'auto'` | Default. `UEngine::Tick`, fall back to `ProcessEvent` |
+| `gameThreadScheduler = 'engine-tick'` | `UEngine::Tick`; return an error instead of falling back |
+| `gameThreadScheduler = 'process-event'` | Use `ProcessEvent` to schedule |
+| `engineTickVtableOffset = offset` | Override automatic `UGameEngine::Tick` resolution with a vtable byte offset |
+| `engineTickAddress = address` | `UEngine::Tick` address |
 
 ```lua
 local arguments =

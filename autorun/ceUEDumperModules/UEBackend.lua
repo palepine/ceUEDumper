@@ -989,14 +989,18 @@ function Module.Functions.functionForObject(objectAddress, functionName)
   return nil, 'UFunction was not found: ' .. functionName
 end
 
--- UObject vtable byte offsets from UE's versioned UObject layouts
-local PROCESS_EVENT_VTABLE_OFFSETS =
-{
-  [5] =
-  {
-    [7] = 0x260,
-  },
-}
+local function versionVirtualOffset(name)
+  local candidates = Core.getVersionLayoutCandidates and Core.getVersionLayoutCandidates() or {}
+  local layout = candidates[1] and candidates[1].layout
+
+  if name == 'ProcessEvent' then
+    return layout and layout.UObject and layout.UObject.ProcessEventVTableOffset
+  end
+
+  if name == 'EngineTick' then
+    return layout and layout.UEngine and layout.UEngine.TickVTableOffset
+  end
+end
 
 --- Resolve UObject::ProcessEvent for UObject
 -- @param objectAddress number|nil @ target UObject used for virtual dispatch
@@ -1028,9 +1032,8 @@ function Module.Functions.processEvent(objectAddress, requestedVtableOffset, mod
 
   local definitions = Core.definitions()
   local configuredOffset = definitions and definitions.UObject and definitions.UObject.ProcessEventVTableOffset
-  local version = Core.getEngineVersion()
-  local versionOffsets = version and PROCESS_EVENT_VTABLE_OFFSETS[version.major]
-  local versionOffset = versionOffsets and versionOffsets[version.minor]
+
+  local versionOffset = versionVirtualOffset('ProcessEvent')
   local vtableOffset = type(requestedVtableOffset) == 'number' and requestedVtableOffset or type(configuredOffset) == 'number' and configuredOffset or versionOffset
 
   if mode ~= 'signature' and isValidAddress(objectAddress) and type(vtableOffset) == 'number' then
@@ -1049,6 +1052,56 @@ function Module.Functions.processEvent(objectAddress, requestedVtableOffset, mod
   local signatureAddress, signatureError = Core.processEvent()
   if signatureAddress then return signatureAddress, nil, 'signature' end
   return nil, signatureError or 'UObject::ProcessEvent was not resolved'
+end
+
+--- Resolve UEngine::Tick
+-- @param requestedVtableOffset number|nil @ explicit UEngine::Tick slot
+-- @param explicitAddress number|nil @ known executable UEngine::Tick address
+-- @return number|nil @ executable UEngine::Tick address
+-- @return string|nil @ resolution error
+-- @return string|nil @ explicit, semantic-vtable, or vtable
+-- @return number|nil @ selected vtable byte offset
+function Module.Functions.engineTick(requestedVtableOffset, explicitAddress)
+  
+  if explicitAddress ~= nil then
+    if not isExecutableAddress(explicitAddress) then return nil, 'Explicit UEngine::Tick address is not executable' end
+    return explicitAddress, nil, 'explicit'
+  end
+
+  local definitions = Core.definitions()
+  local engineAddress = definitions and definitions.UGameEngine
+  local semanticError
+
+  -- Explicit offsets remains
+  -- otherwise, prefer semantic resolution
+  if type(requestedVtableOffset) ~= 'number' and Core.engineTick then
+    local scannedAddress, scanError, scannedOffset = Core.engineTick()
+
+    if scannedAddress then return scannedAddress, nil, 'semantic-vtable', scannedOffset end
+    semanticError = scanError
+  end
+
+  local configuredOffset = definitions and definitions.UEngine and definitions.UEngine.TickVTableOffset
+
+  local vtableOffset = type(requestedVtableOffset) == 'number'
+                       and requestedVtableOffset
+                       or type(configuredOffset) == 'number'
+                       and configuredOffset
+                       or versionVirtualOffset('EngineTick')
+
+  if not isValidAddress(engineAddress) then return nil, 'GEngine instance is unavailable for UEngine::Tick resolution' end
+
+  if type(vtableOffset) ~= 'number' then
+    return nil, semanticError or 'UEngine::Tick vtable offset is unavailable for the selected engine version'
+  end
+
+  local vtableAddress = readPointer( engineAddress )
+  
+  local virtualFunction = isValidAddress( vtableAddress ) and readPointer( vtableAddress + vtableOffset ) or nil
+
+  if not isExecutableAddress(virtualFunction) then return nil, ('UEngine::Tick was not resolved from vtable offset 0x%X'):format(vtableOffset) end
+
+  return virtualFunction, nil, 'vtable', vtableOffset
 end
 
 --- Read and validate one possible UStruct::Script TArray<uint8>
@@ -1402,6 +1455,21 @@ end
 function Module.Reflection.namesByIndex()
   local definitions = Core.definitions()
   return definitions.IndexToName
+end
+
+--- Are FName instance numbers represented by pool entries?
+-- @return boolean @ true for UE_FNAME_OUTLINE_NUMBER layouts
+function Module.Reflection.usesOutlineFNameNumber()
+  local definitions = Core.definitions()
+  return definitions.FNameOutlineNumber == true
+end
+
+--- Return decoded outline-number metadata for comparison id
+-- @param comparisonIndex number @ runtime FNameEntryId
+-- @return table|nil @ baseIndex and internal number
+function Module.Reflection.fnameOutlineInfo(comparisonIndex)
+  local definitions = Core.definitions()
+  return definitions.FNameOutlineInfo and definitions.FNameOutlineInfo[comparisonIndex] or nil
 end
 
 --- Get found UObject header offsets without exposing mutable core state
@@ -2221,10 +2289,13 @@ Module.findContainingObject = Module.Objects.findContainingObject
 Module.functions = Module.Functions.functions
 Module.functionForObject = Module.Functions.functionForObject
 Module.processEvent = Module.Functions.processEvent
+Module.engineTick = Module.Functions.engineTick
 Module.functionMetadata = Module.Functions.functionMetadata
 
 Module.nameIndex = Module.Reflection.nameIndex
 Module.namesByIndex = Module.Reflection.namesByIndex
+Module.usesOutlineFNameNumber = Module.Reflection.usesOutlineFNameNumber
+Module.fnameOutlineInfo = Module.Reflection.fnameOutlineInfo
 Module.objectHeaderLayout = Module.Reflection.objectHeaderLayout
 Module.classHeaderLayout = Module.Reflection.classHeaderLayout
 Module.propertyHeaderLayout = Module.Reflection.propertyHeaderLayout

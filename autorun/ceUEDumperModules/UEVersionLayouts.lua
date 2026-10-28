@@ -1,5 +1,20 @@
 --[[
   Versioned UE layouts
+  
+  ceUEDumper — a Cheat Engine Unreal Engine Dumper — Copyright (C) 2026 palepine
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   UE4SS Copyright (c) 2022 Narknon
 
@@ -168,6 +183,177 @@ local function commonObject(casePreserving)
     Outer = casePreserving and 0x28 or 0x20,
     UEP_TotalSize = casePreserving and 0x30 or 0x28,
   }
+end
+
+-- Byte offsets
+-- from UE4SS VTableLayout templates
+local VIRTUAL_OFFSETS =
+{
+  [4] =
+  {
+    [7]  =
+    {
+      ProcessEvent = 0x1A0,
+      EngineTick = 0x218
+    },
+    [8]  =
+    {
+      ProcessEvent = 0x188,
+      EngineTick = 0x200
+    },
+    [9]  =
+    {
+      ProcessEvent = 0x1A0,
+      EngineTick = 0x218
+    },
+    [10] =
+    {
+      ProcessEvent = 0x1A0,
+      EngineTick = 0x218
+    },
+    [11] =
+    {
+      ProcessEvent = 0x1B8,
+      EngineTick = 0x228
+    },
+    [12] =
+    {
+      ProcessEvent = 0x1B8,
+      EngineTick = 0x228
+    },
+    [13] =
+    {
+      ProcessEvent = 0x1B8,
+      EngineTick = 0x230
+    },
+    [14] =
+    {
+      ProcessEvent = 0x1D8,
+      EngineTick = 0x250
+    },
+    [15] =
+    {
+      ProcessEvent = 0x1E0,
+      EngineTick = 0x258
+    },
+    [16] =
+    {
+      ProcessEvent = 0x200,
+      EngineTick = 0x278
+    },
+    [17] =
+    {
+      ProcessEvent = 0x208,
+      EngineTick = 0x280
+    },
+    [18] =
+    {
+      ProcessEvent = 0x208,
+      EngineTick = 0x280
+    },
+    [19] =
+    {
+      ProcessEvent = 0x208,
+      EngineTick = 0x280
+    },
+    [20] =
+    {
+      ProcessEvent = 0x218,
+      EngineTick = 0x290
+    },
+    [21] =
+    {
+      ProcessEvent = 0x210,
+      EngineTick = 0x288
+    },
+    [22] =
+    {
+      ProcessEvent = 0x210,
+      EngineTick = 0x288
+    },
+    [23] =
+    {
+      ProcessEvent = 0x220,
+      EngineTick = 0x298
+    },
+    [24] =
+    {
+      ProcessEvent = 0x220,
+      EngineTick = 0x2A0
+    },
+    [25] =
+    {
+      ProcessEvent = 0x220,
+      EngineTick = 0x2B8
+    },
+    [26] =
+    {
+      ProcessEvent = 0x228,
+      EngineTick = 0x2C0
+    },
+    [27] =
+    {
+      ProcessEvent = 0x230,
+      EngineTick = 0x2C8
+    },
+  },
+  [5] =
+  {
+    [0] =
+    {
+      ProcessEvent = 0x268,
+      EngineTick = 0x300
+    },
+    [1] =
+    {
+      ProcessEvent = 0x270,
+      EngineTick = 0x308
+    },
+    [2] =
+    {
+      ProcessEvent = 0x278,
+      EngineTick = 0x310
+    },
+    [3] =
+    {
+      ProcessEvent = 0x278,
+      EngineTick = 0x310
+    },
+    [4] =
+    {
+      ProcessEvent = 0x278,
+      EngineTick = 0x310
+    },
+    [5] =
+    {
+      ProcessEvent = 0x288,
+      EngineTick = 0x320
+    },
+    [6] =
+    {
+      ProcessEvent = 0x270,
+      EngineTick = 0x308
+    },
+    [7] =
+    {
+      ProcessEvent = 0x270,
+      EngineTick = 0x308
+    },
+    [8] =
+    {
+      ProcessEvent = 0x260,
+      EngineTick = 0x2F8
+    },
+  },
+}
+
+local function applyVirtualOffsets(profile, major, minor)
+  local versionOffsets = VIRTUAL_OFFSETS[major] and VIRTUAL_OFFSETS[major][minor]
+  if not versionOffsets then return profile end
+
+  profile.UObject.ProcessEventVTableOffset = versionOffsets.ProcessEvent
+  profile.UEngine = { TickVTableOffset = versionOffsets.EngineTick }
+  return profile
 end
 
 local function legacyProfile(minor)
@@ -383,7 +569,7 @@ local function legacyProfile(minor)
     }
   end
 
-  return profile
+  return applyVirtualOffsets( profile, 4, minor )
 end
 
 local function modernProfile(major, minor, casePreserving)
@@ -571,7 +757,8 @@ local function modernProfile(major, minor, casePreserving)
   local arrayInner = major == 5 and minor >= 3 and typeBase + 0x8 or typeBase
 
   merge( profile, propertyTypes( typeBase, arrayInner ) )
-  return profile
+
+  return applyVirtualOffsets( profile, major, minor )
 end
 
 --- Return ordered layout candidates for an engine version.

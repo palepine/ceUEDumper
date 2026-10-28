@@ -188,6 +188,8 @@ passed validation.
 | `namePoolDiscoveryMethod` | `string or nil` | How name pool was found                                                            |
 | `cachedNameCount`         | `number`        | Unique names cached                                                                |
 | `fnameToString`           | `number or nil` | ::ToString func resolved (dont bother for now)                                     |
+| `engineTick`              | `number or nil` | Resolved `UGameEngine::Tick` hook target after first scheduled call                |
+| `engineTickVtableOffset`  | `number or nil` | Runtime `UGameEngine` vtable slot selected for the Tick target                     |
 | `engineVersion`           | `table or nil`  | Explicit or last detected engine-version descriptor                                |
 | `versionLayoutMode`       | `string`        | Current `auto`, `force` or `off` selection                                         |
 | `versionLayoutProfile`    | `string or nil` | reflection profile that passed runtime validation                                  |

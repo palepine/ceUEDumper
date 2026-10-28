@@ -13,6 +13,27 @@
 
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+  
+  UE4SS Copyright (c) 2022 Narknon
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
 ]]
 
 local Module =
@@ -101,6 +122,7 @@ local EXPORT_NAMES =
   'ceue_get_hook_count',
   'ceue_get_hook_hit_count',
   'ceue_configure_process_event_dispatcher',
+  'ceue_configure_engine_tick_dispatcher',
   'ceue_queue_process_event',
   'ceue_get_invocation_status',
   'ceue_get_invocation_completed_runs',
@@ -410,6 +432,12 @@ end
 
 function Module.configureProcessEventDispatcher(processEventAddress)
   local result, callError = Module.callExport( 'ceue_configure_process_event_dispatcher', processEventAddress )
+  if result ~= 1 then return nil, callError or Module.lastError() end
+  return true
+end
+
+function Module.configureEngineTickDispatcher(engineTickAddress)
+  local result, callError = Module.callExport( 'ceue_configure_engine_tick_dispatcher', engineTickAddress )
   if result ~= 1 then return nil, callError or Module.lastError() end
   return true
 end
